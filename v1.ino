@@ -76,7 +76,6 @@ namespace cfgHouse {
   constexpr float MIN_FREQ         = 28.0f;
   constexpr float MAX_FREQ         = 50.0f;
   constexpr float SHUTDOWN_FREQ    = 34.0f;
-  constexpr float START_BOOST_FREQ = 38.0f;
   
   // Защиты по току
   constexpr float CURRENT_NORMAL_MIN  = 0.6f;
@@ -87,6 +86,7 @@ namespace cfgHouse {
   
   constexpr unsigned long OVERLOAD_DELAY_MS = 5000UL;
   constexpr unsigned long DRY_DELAY_MS = 8000UL;
+  constexpr unsigned long START_CURRENT_IGNORE_MS = 2000UL;
   
   // Защита по сухому ходу по давлению
   constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;  // 10 секунд для старта
@@ -191,6 +191,7 @@ struct HouseState {
   unsigned long lastFreqChange = 0;
   unsigned long overloadStart = 0;
   unsigned long dryStart = 0;
+  unsigned long startCurrentIgnoreUntil = 0;
   
   // Защита по сухому ходу по давлению
   unsigned long dryPressureStart = 0;        // Таймер сухого хода по давлению
@@ -345,6 +346,14 @@ void readHouseSensors() {
 
 // Защиты домашнего насоса по току
 void applyHouseProtections(unsigned long now) {
+  bool ignoreCurrentProtection = hs.running && (now < hs.startCurrentIgnoreUntil);
+
+  if (ignoreCurrentProtection) {
+    hs.overloadStart = 0;
+    hs.dryStart = 0;
+    return;
+  }
+
   // Аварийная перегрузка (1.5А)
   if (hs.current >= cfgHouse::CURRENT_EMERGENCY) {
     hs.blocked = hs.alarm = true;
@@ -534,18 +543,18 @@ void runHousePump(unsigned long now) {
   // Есть и L1 и L2
   if (!hs.running) {
     if (hs.pressureBar <= cfgHouse::HYST_ON) {
-      // Запускаем насос
-      hs.actualFreq = cfgHouse::MIN_FREQ;
+      // Запускаем насос на 50 Гц
+      hs.actualFreq = cfgHouse::MAX_FREQ;
+      hs.targetFreq = cfgHouse::MAX_FREQ;
       setFrequency(hs.actualFreq);
       delay(100);
       
       vfdStart();
       hs.running = true;
       hs.mode = HouseState::Mode::RUNNING;
-      hs.targetFreq = cfgHouse::START_BOOST_FREQ;
-      hs.actualFreq = cfgHouse::MIN_FREQ;
       hs.integral = 0.0f;
       hs.lastFreqChange = now;
+      hs.startCurrentIgnoreUntil = now + cfgHouse::START_CURRENT_IGNORE_MS;
       
       // Инициализируем защиту по давлению при старте
       hs.initialPressure = hs.pressureBar;
@@ -664,6 +673,7 @@ void runMachine(unsigned long now) {
           if (now - st.pressureCheckStart >= cfg::PRESSURE_CHECK_DELAY) {
             if (st.pressureBar >= cfg::PRESSURE_MIN_OK) {
               st.workStart = now;
+              st.failedStartCount = 0;
               st.mode = State::Mode::RUN;
               Serial.println("WELL: Pump running");
             } else {
@@ -683,10 +693,18 @@ void runMachine(unsigned long now) {
           }
         } else {
           digitalWrite(RELAY_WELL, HIGH);
-          st.mode = State::Mode::WAIT;
-          st.pauseStart = now;
-          if (st.pauseMs == 0) st.pauseMs = cfg::MIN_PAUSE * 60000;
-          Serial.println("WELL: Current too low, waiting");
+          st.failedStartCount++;
+          if (st.failedStartCount >= cfg::MAX_FAILED_STARTS) {
+            st.blocked = st.alarm = true;
+            st.mode = State::Mode::FAIL;
+            saveState();
+            Serial.println("WELL: Blocked - failed starts");
+          } else {
+            st.mode = State::Mode::WAIT;
+            st.pauseStart = now;
+            if (st.pauseMs == 0) st.pauseMs = cfg::MIN_PAUSE * 60000;
+            Serial.println("WELL: Current too low, waiting");
+          }
         }
       }
       break;
