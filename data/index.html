@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Макси Дашборд Насосов</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <style>
+    body { background: linear-gradient(to right, #e0eafc, #cfdef3); font-family: Arial, sans-serif; }
+    .card { border-radius: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); transition: transform 0.2s; }
+    .card:hover { transform: scale(1.02); }
+    .gauge { height: 250px; }
+    .alert-icon { font-size: 1.5em; color: red; animation: pulse 1s infinite; }
+    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+    .tank { position: relative; width: 100px; height: 200px; border: 2px solid black; border-radius: 10px; background: #ddd; overflow: hidden; display: flex; flex-direction: column-reverse; }
+    .sector { height: 25%; transition: background 0.5s; }
+    .sector-on { background: blue; }
+    .sector-off { background: white; }
+    .sector-label { position: absolute; left: 110px; top: calc(12.5% + (50px * (3 - var(--idx)))); }
+  </style>
+</head>
+<body>
+  <div class="container mt-4">
+    <h1 class="text-center mb-4"><i class="fas fa-pump-soap"></i> Дашборд Насосов</h1>
+    <div class="row">
+      <div class="col-md-12">
+        <div class="card bg-light p-3">
+          <h5 class="card-title"><i class="fas fa-layer-group"></i> Уровни Воды (Бак)</h5>
+          <div class="tank">
+            <div class="sector" id="sector0"></div>
+            <div class="sector" id="sector1"></div>
+            <div class="sector" id="sector2"></div>
+            <div class="sector" id="sector3"></div>
+          </div>
+          <span class="sector-label" style="--idx:0">L1 (низ)</span>
+          <span class="sector-label" style="--idx:1">L2</span>
+          <span class="sector-label" style="--idx:2">L3</span>
+          <span class="sector-label" style="--idx:3">L4 (верх)</span>
+        </div>
+      </div>
+    </div>
+    <div class="row mt-4">
+      <div class="col-md-6">
+        <div class="card bg-light">
+          <div class="card-body">
+            <h5 class="card-title"><i class="fas fa-water"></i> Скважинный Насос</h5>
+            <canvas id="wellPressureChart" class="gauge"></canvas>
+            <p><i class="fas fa-bolt"></i> Ток: <span id="well_current">0 A</span></p>
+            <p><i class="fas fa-tachometer-alt"></i> Давление: <span id="well_pressure">0 bar</span></p>
+            <p><i class="fas fa-clock"></i> Время работы: <span id="last_work_sec">0 s</span></p>
+            <p><i class="fas fa-pause"></i> Время паузы: <span id="pause_ms">0 ms</span></p>
+            <p><i class="fas fa-database"></i> Объём перекачано: <span id="total_liters">0 L</span></p>
+            <p><i class="fas fa-exclamation-triangle"></i> Авария: <span id="well_alarm">Нет</span></p>
+          </div>
+        </div>
+        <div class="card bg-light mt-3 p-3">
+          <h5 class="card-title"><i class="fas fa-chart-line"></i> Статистика Скважинного Насоса</h5>
+          <canvas id="volumeChart"></canvas>
+          <canvas id="workTimeChart"></canvas>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card bg-light">
+          <div class="card-body">
+            <h5 class="card-title"><i class="fas fa-home"></i> Домашний Насос</h5>
+            <canvas id="housePressureChart" class="gauge"></canvas>
+            <p><i class="fas fa-bolt"></i> Ток: <span id="house_current">0 A</span></p>
+            <p><i class="fas fa-tachometer-alt"></i> Давление: <span id="house_pressure">0 bar</span></p>
+            <p><i class="fas fa-exclamation-triangle"></i> Авария: <span id="house_alarm">Нет</span></p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-center mt-4 mb-4">
+      <button class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#logsWellModal"><i class="fas fa-file-alt"></i> Логи Скважинного</button>
+      <button class="btn btn-danger ms-2" data-bs-toggle="modal" data-bs-target="#logsHouseModal"><i class="fas fa-file-alt"></i> Логи Домашнего</button>
+      <button class="btn btn-primary ms-2" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog"></i> Настройки</button>
+      <a href="/export_well" class="btn btn-info ms-2"><i class="fas fa-download"></i> CSV Скважинный</a>
+      <a href="/export_house" class="btn btn-info ms-2"><i class="fas fa-download"></i> CSV Домашний</a>
+    </div>
+  </div>
+
+  <div class="modal fade" id="logsWellModal"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>Логи Скважинного</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><pre id="logs_well" class="p-3 bg-dark text-white">Загрузка...</pre></div><div class="modal-footer"><button onclick="clearLogs('well')" class="btn btn-warning">Очистить</button></div></div></div></div>
+  <div class="modal fade" id="logsHouseModal"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>Логи Домашнего</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><pre id="logs_house" class="p-3 bg-dark text-white">Загрузка...</pre></div><div class="modal-footer"><button onclick="clearLogs('house')" class="btn btn-warning">Очистить</button></div></div></div></div>
+  <div class="modal fade" id="settingsModal"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>Уставки</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="settings"><div class="mb-3"><label class="form-label">Сухой ход (ток): <input type="range" class="form-range" id="current_dry" min="0" max="5" step="0.1" value="3.3"></label></div><div class="mb-3"><label class="form-label">Целевое давление: <input type="range" class="form-range" id="setpoint_bar" min="0" max="2" step="0.1" value="1.0"></label></div><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Сохранить</button></form></div></div></div></div>
+
+  <script>
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const charts = {};
+
+    function updateChart(id, dataset, label) {
+      const ctx = document.getElementById(id).getContext('2d');
+      if (charts[id]) charts[id].destroy();
+      charts[id] = new Chart(ctx, {
+        type: 'line',
+        data: { labels: Array(dataset.length).fill(''), datasets: [{ label, data: dataset, borderColor: 'rgb(75, 192, 192)', tension: 0.1 }] },
+        options: { responsive: true, scales: { y: { beginAtZero: true } }, animation: { duration: 200 } }
+      });
+    }
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      document.getElementById("well_current").innerText = data.well_current.toFixed(1) + " A";
+      document.getElementById("well_pressure").innerText = data.well_pressure.toFixed(1) + " bar";
+      document.getElementById("house_current").innerText = data.house_current.toFixed(1) + " A";
+      document.getElementById("house_pressure").innerText = data.house_pressure.toFixed(1) + " bar";
+      document.getElementById("last_work_sec").innerText = data.last_work_sec + " s";
+      document.getElementById("pause_ms").innerText = data.pause_ms.toFixed(0) + " ms";
+      document.getElementById("total_liters").innerText = data.total_liters.toFixed(0) + " L";
+      document.getElementById("well_alarm").innerHTML = data.well_alarm ? 'Да <i class="fas fa-exclamation-circle alert-icon"></i>' : 'Нет';
+      document.getElementById("house_alarm").innerHTML = data.house_alarm ? 'Да <i class="fas fa-exclamation-circle alert-icon"></i>' : 'Нет';
+
+      for (let i = 0; i < 4; i++) {
+        document.getElementById(`sector${i}`).className = `sector ${data.levels[i] ? 'sector-on' : 'sector-off'}`;
+      }
+
+      const volumeData = data.volume_history.filter(v => v > 0);
+      const workTimeData = data.work_time_history.filter(v => v > 0);
+      updateChart('wellPressureChart', [data.well_pressure], 'Давление Скважинный');
+      updateChart('housePressureChart', [data.house_pressure], 'Давление Домашний');
+      updateChart('volumeChart', volumeData, 'Объём за раз');
+      updateChart('workTimeChart', workTimeData, 'Время работы');
+    };
+
+    fetch("/logs_well").then(res => res.text()).then(text => document.getElementById("logs_well").innerText = text);
+    fetch("/logs_house").then(res => res.text()).then(text => document.getElementById("logs_house").innerText = text);
+
+    document.getElementById("settings").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const cd = document.getElementById("current_dry").value;
+      const sb = document.getElementById("setpoint_bar").value;
+      fetch(`/set?param=CURRENT_DRY&value=${cd}`, {method: "POST"});
+      fetch(`/set?param=SETPOINT_BAR&value=${sb}`, {method: "POST"}).then(() => alert("Сохранено!"));
+    });
+
+    function clearLogs(type) {
+      ws.send(`clear_logs_${type}`);
+      document.getElementById(`logs_${type}`).innerText = "";
+    }
+  </script>
+</body>
+</html>
