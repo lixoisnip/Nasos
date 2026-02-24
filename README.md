@@ -14,7 +14,7 @@
    - алгоритмы скважинного и домашнего насосов;
    - защиты по перегрузке и сухому ходу;
    - расчёт статистики (время работы, объём);
-   - веб-сервер (LittleFS + REST API).
+   - веб-сервер (LittleFS + WebSocket + REST API).
 
 3. **`data/index.html`** — веб-дашборд для загрузки в LittleFS ESP32.
 
@@ -48,14 +48,15 @@
 ## Веб-интерфейс ESP32
 
 - Главная страница: `/`
-- Текущее состояние (JSON): `/state`
+- WebSocket поток: `/ws`
 - Логи: `/logs_well`, `/logs_house`
 - Настройки: `POST /set?param=SETPOINT_BAR&value=...`
 - Экспорт CSV: `/export_well`, `/export_house`
 
 ## Библиотеки (ESP32)
 
-- `WebServer` (встроенная в ESP32 core)
+- `ESPAsyncWebServer`
+- `AsyncTCP`
 - `LittleFS`
 - `ArduinoJson`
 
@@ -64,20 +65,3 @@
 - Добавить сохранение уставок в NVS (Preferences).
 - Подтвердить значения коэффициентов датчиков под конкретную схему.
 - При необходимости добавить watchdog и heartbeat между контроллерами.
-
-
-## Wi‑Fi и доступ к интерфейсу
-
-В `esp32_controller.ino` добавлены оба режима:
-
-- **STA**: подключение к вашему роутеру (`WIFI_SSID` / `WIFI_PASS`).
-- **AP**: собственная точка доступа ESP32 (`AP_SSID` / `AP_PASS`).
-
-Даже если роутер недоступен, интерфейс будет доступен через AP ESP32 по адресу `192.168.4.1`.
-
-## Если Arduino IDE ругается на `#include <ESPAsyncWebServer.h>`
-
-В этой версии проект переведён на стандартный `WebServer.h`, поэтому:
-
-- ошибка с `ESPAsyncWebServer.h` исчезает;
-- не требуется установка `ESPAsyncWebServer` и `AsyncTCP`.
