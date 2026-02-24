@@ -4,13 +4,17 @@
 // =====================================================
 
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
+#include <WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
-// -------- Wi-Fi (edit for your network) --------
+// -------- Wi-Fi settings --------
+// 1) STA mode: ESP32 connects to your router.
+// 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* AP_SSID = "Nasos-ESP32";
+const char* AP_PASS = "12345678";  // min 8 chars for WPA2
 
 // -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
@@ -82,8 +86,7 @@ struct Controller {
   String logsHouse;
 } st;
 
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+WebServer server(80);
 
 void appendLog(String& dst, const String& msg) {
   dst += msg + "\n";
@@ -281,63 +284,103 @@ String buildJsonState() {
 }
 
 void notifyClients() {
-  ws.textAll(buildJsonState());
+  // kept for timing compatibility with old loop flow
 }
 
 void initWeb() {
   if (!LittleFS.begin(true)) return;
 
-  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
-
-  server.on("/logs_well", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "text/plain; charset=utf-8", st.logsWell);
+  server.on("/", HTTP_GET, []() {
+    File file = LittleFS.open("/index.html", "r");
+    if (!file) {
+      server.send(500, "text/plain", "index.html not found in LittleFS");
+      return;
+    }
+    server.streamFile(file, "text/html; charset=utf-8");
+    file.close();
   });
 
-  server.on("/logs_house", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "text/plain; charset=utf-8", st.logsHouse);
+  server.on("/state", HTTP_GET, []() {
+    server.send(200, "application/json", buildJsonState());
   });
 
-  server.on("/set", HTTP_POST, [](AsyncWebServerRequest *req) {
-    if (req->hasParam("param") && req->hasParam("value")) {
-      String p = req->getParam("param")->value();
-      float v = req->getParam("value")->value().toFloat();
+  server.on("/logs_well", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", st.logsWell);
+  });
+
+  server.on("/logs_house", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", st.logsHouse);
+  });
+
+  server.on("/set", HTTP_POST, []() {
+    if (server.hasArg("param") && server.hasArg("value")) {
+      String p = server.arg("param");
+      float v = server.arg("value").toFloat();
       if (p == "SETPOINT_BAR") st.setpointBar = constrain(v, 0.0f, 2.0f);
       // CURRENT_DRY kept for compatibility with UI; can be persisted later.
-      req->send(200, "text/plain", "OK");
+      server.send(200, "text/plain", "OK");
       return;
     }
-    req->send(400, "text/plain", "Missing param/value");
+    server.send(400, "text/plain", "Missing param/value");
   });
 
-  server.on("/export_well", HTTP_GET, [](AsyncWebServerRequest *req) {
+  server.on("/clear_logs_well", HTTP_POST, []() {
+    st.logsWell = "";
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/clear_logs_house", HTTP_POST, []() {
+    st.logsHouse = "";
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/export_well", HTTP_GET, []() {
     String csv = "idx,volume_l,work_s\n";
     for (int i = 0; i < 20; i++) csv += String(i) + "," + String(st.volumeHistory[i], 2) + "," + String(st.workHistory[i], 0) + "\n";
-    req->send(200, "text/csv", csv);
+    server.send(200, "text/csv", csv);
   });
 
-  server.on("/export_house", HTTP_GET, [](AsyncWebServerRequest *req) {
+  server.on("/export_house", HTTP_GET, []() {
     String csv = "house_current,house_pressure\n" + String(tm.houseCurrent, 2) + "," + String(tm.housePressure, 2) + "\n";
-    req->send(200, "text/csv", csv);
+    server.send(200, "text/csv", csv);
   });
 
-  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-                void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_CONNECT) {
-      client->text(buildJsonState());
+  server.onNotFound([]() {
+    String path = server.uri();
+    if (LittleFS.exists(path)) {
+      File file = LittleFS.open(path, "r");
+      String contentType = "text/plain";
+      if (path.endsWith(".css")) contentType = "text/css";
+      else if (path.endsWith(".js")) contentType = "application/javascript";
+      else if (path.endsWith(".html")) contentType = "text/html; charset=utf-8";
+      else if (path.endsWith(".png")) contentType = "image/png";
+      server.streamFile(file, contentType);
+      file.close();
       return;
     }
-    if (type == WS_EVT_DATA) {
-      AwsFrameInfo *info = (AwsFrameInfo*)arg;
-      if (!info->final || info->opcode != WS_TEXT) return;
-      String msg;
-      for (size_t i = 0; i < len; i++) msg += (char)data[i];
-      if (msg == "clear_logs_well") st.logsWell = "";
-      if (msg == "clear_logs_house") st.logsHouse = "";
-    }
+    server.send(404, "text/plain", "Not found");
   });
 
-  server.addHandler(&ws);
   server.begin();
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
+    appendLog(st.logsHouse, "Wi-Fi STA connected: " + WiFi.localIP().toString());
+  } else {
+    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
+    appendLog(st.logsHouse, "Wi-Fi STA not connected, AP mode still available");
+  }
+  appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
+  appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
 }
 
 void setup() {
@@ -345,9 +388,7 @@ void setup() {
 
   NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) delay(300);
+  initWiFi();
 
   initWeb();
   appendLog(st.logsWell, "System start: ESP32 controller online");
@@ -369,6 +410,6 @@ void loop() {
     notifyClients();
   }
 
-  ws.cleanupClients();
+  server.handleClient();
   delay(20);
 }
