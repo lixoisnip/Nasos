@@ -89,7 +89,6 @@
   <div class="modal fade" id="settingsModal"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>Уставки</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="settings"><div class="mb-3"><label class="form-label">Сухой ход (ток): <input type="range" class="form-range" id="current_dry" min="0" max="5" step="0.1" value="3.3"></label></div><div class="mb-3"><label class="form-label">Целевое давление: <input type="range" class="form-range" id="setpoint_bar" min="0" max="2" step="0.1" value="1.0"></label></div><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Сохранить</button></form></div></div></div></div>
 
   <script>
-    const ws = new WebSocket(`ws://${location.host}/ws`);
     const charts = {};
 
     function updateChart(id, dataset, label) {
@@ -102,8 +101,7 @@
       });
     }
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    function renderState(data) {
       document.getElementById("well_current").innerText = data.well_current.toFixed(1) + " A";
       document.getElementById("well_pressure").innerText = data.well_pressure.toFixed(1) + " bar";
       document.getElementById("house_current").innerText = data.house_current.toFixed(1) + " A";
@@ -124,7 +122,20 @@
       updateChart('housePressureChart', [data.house_pressure], 'Давление Домашний');
       updateChart('volumeChart', volumeData, 'Объём за раз');
       updateChart('workTimeChart', workTimeData, 'Время работы');
-    };
+    }
+
+    async function pollState() {
+      try {
+        const res = await fetch('/state');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderState(data);
+      } catch (e) {
+        console.error('state poll failed', e);
+      }
+    }
+    setInterval(pollState, 1000);
+    pollState();
 
     fetch("/logs_well").then(res => res.text()).then(text => document.getElementById("logs_well").innerText = text);
     fetch("/logs_house").then(res => res.text()).then(text => document.getElementById("logs_house").innerText = text);
@@ -138,8 +149,9 @@
     });
 
     function clearLogs(type) {
-      ws.send(`clear_logs_${type}`);
-      document.getElementById(`logs_${type}`).innerText = "";
+      fetch(`/clear_logs_${type}`, { method: 'POST' }).then(() => {
+        document.getElementById(`logs_${type}`).innerText = "";
+      });
     }
   </script>
 </body>
