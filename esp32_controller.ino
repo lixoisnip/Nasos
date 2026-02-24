@@ -8,6 +8,14 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
+// -------- Wi-Fi settings --------
+// 1) STA mode: ESP32 connects to your router.
+// 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* AP_SSID = "Nasos-ESP32";
+const char* AP_PASS = "12345678";  // min 8 chars for WPA2
+
 // -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
 constexpr int NANO_RX_PIN = 16;
@@ -59,10 +67,10 @@ struct Settings {
   float houseCurrentMaxA = 10.0f;
 
   // Wi-Fi
-  String wifiSsid = "YOUR_WIFI_SSID";
-  String wifiPass = "YOUR_WIFI_PASSWORD";
-  String apSsid = "Nasos-ESP32";
-  String apPass = "12345678";  // min 8 chars for WPA2
+  String wifiSsid = WIFI_SSID_DEFAULT;
+  String wifiPass = WIFI_PASS_DEFAULT;
+  String apSsid = AP_SSID_DEFAULT;
+  String apPass = AP_PASS_DEFAULT;
 } cfg;
 
 struct Controller {
@@ -310,91 +318,8 @@ String buildJsonState() {
   return out;
 }
 
-String buildJsonSettings() {
-  StaticJsonDocument<3072> doc;
-  doc["well_dry_current"] = cfg.wellDryCurrent;
-  doc["well_overload_current"] = cfg.wellOverloadCurrent;
-  doc["well_emergency_current"] = cfg.wellEmergencyCurrent;
-  doc["well_dry_delay_ms"] = cfg.wellDryDelayMs;
-  doc["well_overload_delay_ms"] = cfg.wellOverloadDelayMs;
-  doc["target_minutes"] = cfg.targetMinutes;
-  doc["liters_per_min"] = cfg.litersPerMin;
-
-  doc["setpoint_bar"] = cfg.setpointBar;
-  doc["house_hyst_on"] = cfg.houseHystOn;
-  doc["house_hyst_off"] = cfg.houseHystOff;
-  doc["house_min_freq"] = cfg.houseMinFreq;
-  doc["house_max_freq"] = cfg.houseMaxFreq;
-  doc["house_dry_current"] = cfg.houseDryCurrent;
-  doc["house_overload_current"] = cfg.houseOverloadCurrent;
-  doc["house_emergency_current"] = cfg.houseEmergencyCurrent;
-  doc["house_dry_delay_ms"] = cfg.houseDryDelayMs;
-  doc["house_overload_delay_ms"] = cfg.houseOverloadDelayMs;
-
-  doc["well_pressure_min_bar"] = cfg.wellPressureMinBar;
-  doc["well_pressure_max_bar"] = cfg.wellPressureMaxBar;
-  doc["house_pressure_min_bar"] = cfg.housePressureMinBar;
-  doc["house_pressure_max_bar"] = cfg.housePressureMaxBar;
-  doc["well_current_min_a"] = cfg.wellCurrentMinA;
-  doc["well_current_max_a"] = cfg.wellCurrentMaxA;
-  doc["house_current_min_a"] = cfg.houseCurrentMinA;
-  doc["house_current_max_a"] = cfg.houseCurrentMaxA;
-
-  doc["wifi_ssid"] = cfg.wifiSsid;
-  doc["wifi_pass"] = cfg.wifiPass;
-  doc["ap_ssid"] = cfg.apSsid;
-  doc["ap_pass"] = cfg.apPass;
-
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
-
-void setFloatParam(const String& p, float v) {
-  if (p == "well_dry_current") cfg.wellDryCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "well_overload_current") cfg.wellOverloadCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "well_emergency_current") cfg.wellEmergencyCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "well_dry_delay_ms") cfg.wellDryDelayMs = (unsigned long)constrain(v, 100.0f, 120000.0f);
-  else if (p == "well_overload_delay_ms") cfg.wellOverloadDelayMs = (unsigned long)constrain(v, 100.0f, 120000.0f);
-  else if (p == "target_minutes") cfg.targetMinutes = constrain(v, 0.1f, 30.0f);
-  else if (p == "liters_per_min") cfg.litersPerMin = constrain(v, 1.0f, 200.0f);
-  else if (p == "setpoint_bar") cfg.setpointBar = constrain(v, 0.0f, 10.0f);
-  else if (p == "house_hyst_on") cfg.houseHystOn = constrain(v, 0.0f, 10.0f);
-  else if (p == "house_hyst_off") cfg.houseHystOff = constrain(v, 0.0f, 10.0f);
-  else if (p == "house_min_freq") cfg.houseMinFreq = constrain(v, 0.0f, 100.0f);
-  else if (p == "house_max_freq") cfg.houseMaxFreq = constrain(v, 0.0f, 100.0f);
-  else if (p == "house_dry_current") cfg.houseDryCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "house_overload_current") cfg.houseOverloadCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "house_emergency_current") cfg.houseEmergencyCurrent = constrain(v, 0.0f, 30.0f);
-  else if (p == "house_dry_delay_ms") cfg.houseDryDelayMs = (unsigned long)constrain(v, 100.0f, 120000.0f);
-  else if (p == "house_overload_delay_ms") cfg.houseOverloadDelayMs = (unsigned long)constrain(v, 100.0f, 120000.0f);
-  else if (p == "well_pressure_min_bar") cfg.wellPressureMinBar = constrain(v, 0.0f, 20.0f);
-  else if (p == "well_pressure_max_bar") cfg.wellPressureMaxBar = constrain(v, 0.0f, 20.0f);
-  else if (p == "house_pressure_min_bar") cfg.housePressureMinBar = constrain(v, 0.0f, 20.0f);
-  else if (p == "house_pressure_max_bar") cfg.housePressureMaxBar = constrain(v, 0.0f, 20.0f);
-  else if (p == "well_current_min_a") cfg.wellCurrentMinA = constrain(v, 0.0f, 50.0f);
-  else if (p == "well_current_max_a") cfg.wellCurrentMaxA = constrain(v, 0.0f, 50.0f);
-  else if (p == "house_current_min_a") cfg.houseCurrentMinA = constrain(v, 0.0f, 50.0f);
-  else if (p == "house_current_max_a") cfg.houseCurrentMaxA = constrain(v, 0.0f, 50.0f);
-
-  if (cfg.houseMaxFreq < cfg.houseMinFreq) cfg.houseMaxFreq = cfg.houseMinFreq;
-  if (cfg.houseHystOff < cfg.houseHystOn) cfg.houseHystOff = cfg.houseHystOn;
-}
-
-void initWiFi() {
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str());
-
-  WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-  } else {
-    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
-  }
-  appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
+void notifyClients() {
+  // kept for timing compatibility with old loop flow
 }
 
 void initWeb() {
@@ -414,78 +339,46 @@ void initWeb() {
     server.send(200, "application/json", buildJsonState());
   });
 
-  server.on("/settings", HTTP_GET, []() {
-    server.send(200, "application/json", buildJsonSettings());
+  server.on("/logs_well", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", st.logsWell);
+  });
+
+  server.on("/logs_house", HTTP_GET, []() {
+    server.send(200, "text/plain; charset=utf-8", st.logsHouse);
   });
 
   server.on("/set", HTTP_POST, []() {
-    if (!(server.hasArg("param") && server.hasArg("value"))) {
-      server.send(400, "text/plain", "Missing param/value");
+    if (server.hasArg("param") && server.hasArg("value")) {
+      String p = server.arg("param");
+      float v = server.arg("value").toFloat();
+      if (p == "SETPOINT_BAR") st.setpointBar = constrain(v, 0.0f, 2.0f);
+      // CURRENT_DRY kept for compatibility with UI; can be persisted later.
+      server.send(200, "text/plain", "OK");
       return;
     }
+    server.send(400, "text/plain", "Missing param/value");
+  });
 
-    String p = server.arg("param");
-    if (p == "wifi_ssid") cfg.wifiSsid = server.arg("value");
-    else if (p == "wifi_pass") cfg.wifiPass = server.arg("value");
-    else if (p == "ap_ssid") cfg.apSsid = server.arg("value");
-    else if (p == "ap_pass") cfg.apPass = server.arg("value");
-    else setFloatParam(p, server.arg("value").toFloat());
-
+  server.on("/clear_logs_well", HTTP_POST, []() {
+    st.logsWell = "";
     server.send(200, "text/plain", "OK");
   });
 
-  server.on("/action", HTTP_POST, []() {
-    String pump = server.arg("pump");
-    String cmd = server.arg("cmd");
-
-    if (pump == "well" && cmd == "reset_alarm") {
-      st.wellAlarm = false;
-      st.wellBlocked = false;
-      st.wellDryStart = st.wellOverloadStart = 0;
-      appendLog(st.logsWell, "WELL: alarm reset");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    if (pump == "house" && cmd == "reset_alarm") {
-      st.houseAlarm = false;
-      st.houseBlocked = false;
-      st.houseDryStart = st.houseOverloadStart = 0;
-      appendLog(st.logsHouse, "HOUSE: alarm reset");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    if (pump == "well" && cmd == "force_on") {
-      st.wellForceMode = true;
-      appendLog(st.logsWell, "WELL: force mode ON");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    if (pump == "well" && cmd == "force_off") {
-      st.wellForceMode = false;
-      appendLog(st.logsWell, "WELL: force mode OFF");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    if (pump == "house" && cmd == "force_on") {
-      st.houseForceMode = true;
-      appendLog(st.logsHouse, "HOUSE: force mode ON");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    if (pump == "house" && cmd == "force_off") {
-      st.houseForceMode = false;
-      appendLog(st.logsHouse, "HOUSE: force mode OFF");
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-
-    server.send(400, "text/plain", "Unknown action");
+  server.on("/clear_logs_house", HTTP_POST, []() {
+    st.logsHouse = "";
+    server.send(200, "text/plain", "OK");
   });
 
-  server.on("/logs_well", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsWell); });
-  server.on("/logs_house", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsHouse); });
-  server.on("/clear_logs_well", HTTP_POST, []() { st.logsWell = ""; server.send(200, "text/plain", "OK"); });
-  server.on("/clear_logs_house", HTTP_POST, []() { st.logsHouse = ""; server.send(200, "text/plain", "OK"); });
+  server.on("/export_well", HTTP_GET, []() {
+    String csv = "idx,volume_l,work_s\n";
+    for (int i = 0; i < 20; i++) csv += String(i) + "," + String(st.volumeHistory[i], 2) + "," + String(st.workHistory[i], 0) + "\n";
+    server.send(200, "text/csv", csv);
+  });
+
+  server.on("/export_house", HTTP_GET, []() {
+    String csv = "house_current,house_pressure\n" + String(tm.houseCurrent, 2) + "," + String(tm.housePressure, 2) + "\n";
+    server.send(200, "text/csv", csv);
+  });
 
   server.onNotFound([]() {
     String path = server.uri();
@@ -506,11 +399,31 @@ void initWeb() {
   server.begin();
 }
 
+void initWiFi() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
+    appendLog(st.logsHouse, "Wi-Fi STA connected: " + WiFi.localIP().toString());
+  } else {
+    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
+    appendLog(st.logsHouse, "Wi-Fi STA not connected, AP mode still available");
+  }
+  appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
+  appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
+}
+
 void setup() {
   Serial.begin(115200);
   NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
 
   initWiFi();
+
   initWeb();
 
   appendLog(st.logsWell, "System start: ESP32 controller online");
@@ -525,6 +438,12 @@ void loop() {
   runHouseLogic();
   runProtections(now);
   sendNanoCommand();
+
+  static unsigned long lastWs = 0;
+  if (now - lastWs > 1000) {
+    lastWs = now;
+    notifyClients();
+  }
 
   server.handleClient();
   delay(20);
