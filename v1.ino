@@ -1,3 +1,4 @@
+#if !defined(ARDUINO_ARCH_ESP32)
 // =====================================================
 // Arduino Nano I/O bridge for dual-pump project
 // Nano keeps original wiring (sensors/relay/RS485 VFD),
@@ -228,3 +229,4 @@ void loop() {
   applyOutputs();
   sendTelemetry(now);
 }
+#endif

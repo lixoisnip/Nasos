@@ -1,3 +1,4 @@
+#if defined(ARDUINO_ARCH_ESP32)
 // =====================================================
 // ESP32 main controller: all pump logic/protections + web UI
 // Works with Arduino Nano I/O bridge over UART2.
@@ -545,3 +546,4 @@ void loop() {
   server.handleClient();
   delay(20);
 }
+#endif
