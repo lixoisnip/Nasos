@@ -3,144 +3,215 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Макси Дашборд Насосов</title>
+  <title>Панель насосов ESP32</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <style>
-    body { background: linear-gradient(to right, #e0eafc, #cfdef3); font-family: Arial, sans-serif; }
-    .card { border-radius: 15px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); transition: transform 0.2s; }
-    .card:hover { transform: scale(1.02); }
-    .gauge { height: 250px; }
-    .alert-icon { font-size: 1.5em; color: red; animation: pulse 1s infinite; }
-    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
-    .tank { position: relative; width: 100px; height: 200px; border: 2px solid black; border-radius: 10px; background: #ddd; overflow: hidden; display: flex; flex-direction: column-reverse; }
-    .sector { height: 25%; transition: background 0.5s; }
-    .sector-on { background: blue; }
-    .sector-off { background: white; }
-    .sector-label { position: absolute; left: 110px; top: calc(12.5% + (50px * (3 - var(--idx)))); }
+    body { background:#eef3f9; }
+    .tank { width: 120px; height: 220px; border: 2px solid #2b2b2b; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column-reverse; }
+    .sector { height: 25%; border-top: 1px solid #aaa; }
+    .sector-on { background: #0d6efd; }
+    .sector-off { background: #fff; }
+    .small-note { font-size: .85rem; color: #6c757d; }
+    .card { height: 100%; }
   </style>
 </head>
 <body>
-  <div class="container mt-4">
-    <h1 class="text-center mb-4"><i class="fas fa-pump-soap"></i> Дашборд Насосов</h1>
-    <div class="row">
-      <div class="col-md-12">
-        <div class="card bg-light p-3">
-          <h5 class="card-title"><i class="fas fa-layer-group"></i> Уровни Воды (Бак)</h5>
+<div class="container py-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <h2 class="m-0">Панель насосов ESP32</h2>
+    <div class="d-flex gap-2 flex-wrap">
+      <button class="btn btn-primary" onclick="goSettings()">Настройки</button>
+      <button class="btn btn-outline-secondary" onclick="loadLogs()">Обновить логи</button>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-12 col-lg-3">
+      <div class="card p-3">
+        <h5>Уровни бака</h5>
+        <div class="d-flex gap-3 align-items-start">
           <div class="tank">
             <div class="sector" id="sector0"></div>
             <div class="sector" id="sector1"></div>
             <div class="sector" id="sector2"></div>
             <div class="sector" id="sector3"></div>
           </div>
-          <span class="sector-label" style="--idx:0">L1 (низ)</span>
-          <span class="sector-label" style="--idx:1">L2</span>
-          <span class="sector-label" style="--idx:2">L3</span>
-          <span class="sector-label" style="--idx:3">L4 (верх)</span>
-        </div>
-      </div>
-    </div>
-    <div class="row mt-4">
-      <div class="col-md-6">
-        <div class="card bg-light">
-          <div class="card-body">
-            <h5 class="card-title"><i class="fas fa-water"></i> Скважинный Насос</h5>
-            <canvas id="wellPressureChart" class="gauge"></canvas>
-            <p><i class="fas fa-bolt"></i> Ток: <span id="well_current">0 A</span></p>
-            <p><i class="fas fa-tachometer-alt"></i> Давление: <span id="well_pressure">0 bar</span></p>
-            <p><i class="fas fa-clock"></i> Время работы: <span id="last_work_sec">0 s</span></p>
-            <p><i class="fas fa-pause"></i> Время паузы: <span id="pause_ms">0 ms</span></p>
-            <p><i class="fas fa-database"></i> Объём перекачано: <span id="total_liters">0 L</span></p>
-            <p><i class="fas fa-exclamation-triangle"></i> Авария: <span id="well_alarm">Нет</span></p>
-          </div>
-        </div>
-        <div class="card bg-light mt-3 p-3">
-          <h5 class="card-title"><i class="fas fa-chart-line"></i> Статистика Скважинного Насоса</h5>
-          <canvas id="volumeChart"></canvas>
-          <canvas id="workTimeChart"></canvas>
-        </div>
-      </div>
-      <div class="col-md-6">
-        <div class="card bg-light">
-          <div class="card-body">
-            <h5 class="card-title"><i class="fas fa-home"></i> Домашний Насос</h5>
-            <canvas id="housePressureChart" class="gauge"></canvas>
-            <p><i class="fas fa-bolt"></i> Ток: <span id="house_current">0 A</span></p>
-            <p><i class="fas fa-tachometer-alt"></i> Давление: <span id="house_pressure">0 bar</span></p>
-            <p><i class="fas fa-exclamation-triangle"></i> Авария: <span id="house_alarm">Нет</span></p>
+          <div>
+            <div>L1 (низ)</div><div>L2</div><div>L3</div><div>L4 (верх)</div>
+            <div class="mt-3 small-note" id="wifiStatus"></div>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="text-center mt-4 mb-4">
-      <button class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#logsWellModal"><i class="fas fa-file-alt"></i> Логи Скважинного</button>
-      <button class="btn btn-danger ms-2" data-bs-toggle="modal" data-bs-target="#logsHouseModal"><i class="fas fa-file-alt"></i> Логи Домашнего</button>
-      <button class="btn btn-primary ms-2" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog"></i> Настройки</button>
-      <a href="/export_well" class="btn btn-info ms-2"><i class="fas fa-download"></i> CSV Скважинный</a>
-      <a href="/export_house" class="btn btn-info ms-2"><i class="fas fa-download"></i> CSV Домашний</a>
+    <div class="col-12 col-lg-4">
+      <div class="card p-3">
+        <h5>Скважинный насос</h5>
+        <p>Ток: <b id="well_current">0 A</b></p>
+        <p>Давление: <b id="well_pressure">0 bar</b></p>
+        <p>Работа: <b id="last_work_sec">0 s</b></p>
+        <p>Пауза: <b id="pause_ms">0 ms</b></p>
+        <p>Объём: <b id="total_liters">0 L</b></p>
+        <p>Авария: <b id="well_alarm">Нет</b></p>
+        <p>Принудительный режим: <b id="well_force">OFF</b></p>
+        <div class="d-flex gap-2 flex-wrap">
+          <button class="btn btn-warning btn-sm" onclick="pumpAction('well','reset_alarm')">Сброс аварии</button>
+          <button class="btn btn-success btn-sm" onclick="pumpAction('well','force_on')">Принудительно ВКЛ</button>
+          <button class="btn btn-secondary btn-sm" onclick="pumpAction('well','force_off')">Принудительно ВЫКЛ</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-5">
+      <div class="card p-3">
+        <h5>Домашний насос</h5>
+        <p>Ток: <b id="house_current">0 A</b></p>
+        <p>Давление: <b id="house_pressure">0 bar</b></p>
+        <p>Авария: <b id="house_alarm">Нет</b></p>
+        <p>Принудительный режим: <b id="house_force">OFF</b></p>
+        <div class="d-flex gap-2 flex-wrap">
+          <button class="btn btn-warning btn-sm" onclick="pumpAction('house','reset_alarm')">Сброс аварии</button>
+          <button class="btn btn-success btn-sm" onclick="pumpAction('house','force_on')">Принудительно ВКЛ</button>
+          <button class="btn btn-secondary btn-sm" onclick="pumpAction('house','force_off')">Принудительно ВЫКЛ</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12">
+      <div class="card p-3" id="settings-section">
+        <h4>Меню настроек</h4>
+        <p class="small-note">Здесь собраны все настройки, используемые в коде: защиты, пороги, диапазоны датчиков и Wi‑Fi.</p>
+        <form id="settingsForm" class="row g-2"></form>
+        <div class="mt-2">
+          <button class="btn btn-primary" onclick="saveSettings(event)">Сохранить все настройки</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-6">
+      <div class="card p-3">
+        <h5>Логи скважинного</h5>
+        <pre id="logs_well" style="min-height:180px; white-space:pre-wrap"></pre>
+        <button class="btn btn-outline-danger btn-sm" onclick="clearLogs('well')">Очистить</button>
+      </div>
+    </div>
+    <div class="col-12 col-lg-6">
+      <div class="card p-3">
+        <h5>Логи домашнего</h5>
+        <pre id="logs_house" style="min-height:180px; white-space:pre-wrap"></pre>
+        <button class="btn btn-outline-danger btn-sm" onclick="clearLogs('house')">Очистить</button>
+      </div>
     </div>
   </div>
+</div>
 
-  <div class="modal fade" id="logsWellModal"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>Логи Скважинного</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><pre id="logs_well" class="p-3 bg-dark text-white">Загрузка...</pre></div><div class="modal-footer"><button onclick="clearLogs('well')" class="btn btn-warning">Очистить</button></div></div></div></div>
-  <div class="modal fade" id="logsHouseModal"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5>Логи Домашнего</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><pre id="logs_house" class="p-3 bg-dark text-white">Загрузка...</pre></div><div class="modal-footer"><button onclick="clearLogs('house')" class="btn btn-warning">Очистить</button></div></div></div></div>
-  <div class="modal fade" id="settingsModal"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>Уставки</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="settings"><div class="mb-3"><label class="form-label">Сухой ход (ток): <input type="range" class="form-range" id="current_dry" min="0" max="5" step="0.1" value="3.3"></label></div><div class="mb-3"><label class="form-label">Целевое давление: <input type="range" class="form-range" id="setpoint_bar" min="0" max="2" step="0.1" value="1.0"></label></div><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Сохранить</button></form></div></div></div></div>
+<script>
+  const settingKeys = [
+    ["well_dry_current","Скважина: сухой ход, А",0,30,0.1],
+    ["well_overload_current","Скважина: перегрузка, А",0,30,0.1],
+    ["well_emergency_current","Скважина: авария, А",0,30,0.1],
+    ["well_dry_delay_ms","Скважина: задержка сухого хода, мс",100,120000,100],
+    ["well_overload_delay_ms","Скважина: задержка перегрузки, мс",100,120000,100],
+    ["target_minutes","Скважина: целевое время цикла, мин",0.1,30,0.1],
+    ["liters_per_min","Скважина: производительность, л/мин",1,200,0.1],
 
-  <script>
-    const ws = new WebSocket(`ws://${location.host}/ws`);
-    const charts = {};
+    ["setpoint_bar","Дом: уставка давления, bar",0,10,0.1],
+    ["house_hyst_on","Дом: старт по давлению, bar",0,10,0.1],
+    ["house_hyst_off","Дом: стоп по давлению, bar",0,10,0.1],
+    ["house_min_freq","Дом: мин. частота, Гц",0,100,0.1],
+    ["house_max_freq","Дом: макс. частота, Гц",0,100,0.1],
+    ["house_dry_current","Дом: сухой ход, А",0,30,0.1],
+    ["house_overload_current","Дом: перегрузка, А",0,30,0.1],
+    ["house_emergency_current","Дом: авария, А",0,30,0.1],
+    ["house_dry_delay_ms","Дом: задержка сухого хода, мс",100,120000,100],
+    ["house_overload_delay_ms","Дом: задержка перегрузки, мс",100,120000,100],
 
-    function updateChart(id, dataset, label) {
-      const ctx = document.getElementById(id).getContext('2d');
-      if (charts[id]) charts[id].destroy();
-      charts[id] = new Chart(ctx, {
-        type: 'line',
-        data: { labels: Array(dataset.length).fill(''), datasets: [{ label, data: dataset, borderColor: 'rgb(75, 192, 192)', tension: 0.1 }] },
-        options: { responsive: true, scales: { y: { beginAtZero: true } }, animation: { duration: 200 } }
-      });
-    }
+    ["well_pressure_min_bar","Датчик скважина: минимум bar",0,20,0.1],
+    ["well_pressure_max_bar","Датчик скважина: максимум bar",0,20,0.1],
+    ["house_pressure_min_bar","Датчик дом: минимум bar",0,20,0.1],
+    ["house_pressure_max_bar","Датчик дом: максимум bar",0,20,0.1],
+    ["well_current_min_a","Датчик скважина: минимум А",0,50,0.1],
+    ["well_current_max_a","Датчик скважина: максимум А",0,50,0.1],
+    ["house_current_min_a","Датчик дом: минимум А",0,50,0.1],
+    ["house_current_max_a","Датчик дом: максимум А",0,50,0.1],
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      document.getElementById("well_current").innerText = data.well_current.toFixed(1) + " A";
-      document.getElementById("well_pressure").innerText = data.well_pressure.toFixed(1) + " bar";
-      document.getElementById("house_current").innerText = data.house_current.toFixed(1) + " A";
-      document.getElementById("house_pressure").innerText = data.house_pressure.toFixed(1) + " bar";
-      document.getElementById("last_work_sec").innerText = data.last_work_sec + " s";
-      document.getElementById("pause_ms").innerText = data.pause_ms.toFixed(0) + " ms";
-      document.getElementById("total_liters").innerText = data.total_liters.toFixed(0) + " L";
-      document.getElementById("well_alarm").innerHTML = data.well_alarm ? 'Да <i class="fas fa-exclamation-circle alert-icon"></i>' : 'Нет';
-      document.getElementById("house_alarm").innerHTML = data.house_alarm ? 'Да <i class="fas fa-exclamation-circle alert-icon"></i>' : 'Нет';
+    ["wifi_ssid","Wi‑Fi STA SSID"],
+    ["wifi_pass","Wi‑Fi STA пароль"],
+    ["ap_ssid","Wi‑Fi AP SSID"],
+    ["ap_pass","Wi‑Fi AP пароль"]
+  ];
 
-      for (let i = 0; i < 4; i++) {
-        document.getElementById(`sector${i}`).className = `sector ${data.levels[i] ? 'sector-on' : 'sector-off'}`;
-      }
+  function goSettings() {
+    document.getElementById('settings-section').scrollIntoView({behavior:'smooth'});
+  }
 
-      const volumeData = data.volume_history.filter(v => v > 0);
-      const workTimeData = data.work_time_history.filter(v => v > 0);
-      updateChart('wellPressureChart', [data.well_pressure], 'Давление Скважинный');
-      updateChart('housePressureChart', [data.house_pressure], 'Давление Домашний');
-      updateChart('volumeChart', volumeData, 'Объём за раз');
-      updateChart('workTimeChart', workTimeData, 'Время работы');
-    };
+  async function pumpAction(pump, cmd) {
+    await fetch(`/action?pump=${pump}&cmd=${cmd}`, {method:'POST'});
+    pollState();
+  }
 
-    fetch("/logs_well").then(res => res.text()).then(text => document.getElementById("logs_well").innerText = text);
-    fetch("/logs_house").then(res => res.text()).then(text => document.getElementById("logs_house").innerText = text);
+  async function pollState() {
+    try {
+      const r = await fetch('/state');
+      const d = await r.json();
+      document.getElementById('well_current').innerText = `${d.well_current.toFixed(2)} A`;
+      document.getElementById('well_pressure').innerText = `${d.well_pressure.toFixed(2)} bar`;
+      document.getElementById('house_current').innerText = `${d.house_current.toFixed(2)} A`;
+      document.getElementById('house_pressure').innerText = `${d.house_pressure.toFixed(2)} bar`;
+      document.getElementById('last_work_sec').innerText = `${d.last_work_sec} s`;
+      document.getElementById('pause_ms').innerText = `${d.pause_ms.toFixed(0)} ms`;
+      document.getElementById('total_liters').innerText = `${d.total_liters.toFixed(1)} L`;
+      document.getElementById('well_alarm').innerText = d.well_alarm ? 'Да' : 'Нет';
+      document.getElementById('house_alarm').innerText = d.house_alarm ? 'Да' : 'Нет';
+      document.getElementById('well_force').innerText = d.well_force ? 'ON' : 'OFF';
+      document.getElementById('house_force').innerText = d.house_force ? 'ON' : 'OFF';
+      document.getElementById('wifiStatus').innerText = `STA: ${d.wifi_sta_connected ? 'подключен' : 'нет'} (${d.wifi_sta_ip})\nAP: ${d.wifi_ap_ip}`;
+      for (let i = 0; i < 4; i++) document.getElementById(`sector${i}`).className = `sector ${d.levels[i] ? 'sector-on' : 'sector-off'}`;
+    } catch(e) {}
+  }
 
-    document.getElementById("settings").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const cd = document.getElementById("current_dry").value;
-      const sb = document.getElementById("setpoint_bar").value;
-      fetch(`/set?param=CURRENT_DRY&value=${cd}`, {method: "POST"});
-      fetch(`/set?param=SETPOINT_BAR&value=${sb}`, {method: "POST"}).then(() => alert("Сохранено!"));
+  async function loadSettings() {
+    const r = await fetch('/settings');
+    const d = await r.json();
+    const form = document.getElementById('settingsForm');
+    form.innerHTML = '';
+    settingKeys.forEach((s) => {
+      const [key,label,min,max,step] = s;
+      const col = document.createElement('div');
+      col.className = 'col-12 col-md-6 col-xl-4';
+      const isNum = min !== undefined;
+      col.innerHTML = `
+        <label class="form-label">${label}</label>
+        <input class="form-control" id="cfg_${key}" ${isNum ? `type="number" min="${min}" max="${max}" step="${step}"` : 'type="text"'} value="${d[key] ?? ''}">
+      `;
+      form.appendChild(col);
     });
+  }
 
-    function clearLogs(type) {
-      ws.send(`clear_logs_${type}`);
-      document.getElementById(`logs_${type}`).innerText = "";
+  async function saveSettings(e) {
+    e.preventDefault();
+    for (const s of settingKeys) {
+      const key = s[0];
+      const val = document.getElementById(`cfg_${key}`).value;
+      await fetch(`/set?param=${encodeURIComponent(key)}&value=${encodeURIComponent(val)}`, {method:'POST'});
     }
-  </script>
+    alert('Настройки сохранены в ОЗУ ESP32.');
+  }
+
+  async function loadLogs() {
+    document.getElementById('logs_well').innerText = await (await fetch('/logs_well')).text();
+    document.getElementById('logs_house').innerText = await (await fetch('/logs_house')).text();
+  }
+
+  async function clearLogs(type) {
+    await fetch(`/clear_logs_${type}`, {method:'POST'});
+    await loadLogs();
+  }
+
+  setInterval(pollState, 1000);
+  pollState();
+  loadSettings();
+  loadLogs();
+</script>
 </body>
 </html>
