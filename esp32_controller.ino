@@ -1,50 +1,63 @@
 // =====================================================
-// ESP32 main controller: all pump logic/protections + web UI
-// Works with Arduino Nano I/O bridge over UART2.
+// ESP32 main controller: logic/protections/web + persistence
 // =====================================================
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <math.h>
 
-// -------- Wi-Fi settings --------
-// 1) STA mode: ESP32 connects to your router.
-// 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID = "Nasos-ESP32";
-const char* AP_PASS = "12345678";  // min 8 chars for WPA2
+const char* AP_PASS = "12345678";
 
-// -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
 constexpr int NANO_RX_PIN = 16;
 constexpr int NANO_TX_PIN = 17;
 constexpr uint32_t NANO_BAUD = 38400;
+
+constexpr float PRESSURE_WARN = 1.20f;
+constexpr float PRESSURE_BLOCK = 1.50f;
+constexpr unsigned long PRESSURE_CHECK_DELAY = 8000UL;
+constexpr unsigned long CURRENT_CHECK_DELAY = 15000UL;
+constexpr float CURRENT_MIN_START = 2.9f;
+constexpr int FAILED_START_LIMIT = 3;
+constexpr float TARGET_MIN = 5.0f;
+constexpr float MIN_PAUSE_MS = 10000.0f;
+constexpr float MAX_PAUSE_MS = 90000.0f;
+
+constexpr unsigned long START_CURRENT_IGNORE_MS = 2000UL;
+constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;
+constexpr float PRESSURE_RISE_THRESHOLD = 0.1f;
+constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 15000UL;
+constexpr unsigned long PID_PERIOD_MS = 300UL;
+constexpr unsigned long FREQ_STEP_PERIOD_MS = 500UL;
+constexpr float INTEGRAL_LIMIT = 18.0f;
+
+enum WellIntention : uint8_t { INT_TARGET_REACHED = 0, INT_FILL_TO_L4 = 1 };
 
 struct Telemetry {
   unsigned long ts = 0;
   float wellCurrent = 0;
   float wellPressure = 0;
   float houseCurrent = 0;
+  float housePressureRaw = 0;
   float housePressure = 0;
   bool levels[4] = {false, false, false, false};
   bool vfdRunFeedback = false;
   float vfdFreqFeedback = 0;
   bool valid = false;
+  float pressureFilterBuf[6] = {0};
+  uint8_t pressureFilterIdx = 0;
+  bool pressureFilterInit = false;
 } tm;
 
 struct Settings {
-  // Well pump
-  float wellDryCurrent = 3.3f;
-  float wellOverloadCurrent = 4.3f;
-  float wellEmergencyCurrent = 6.0f;
-  unsigned long wellDryDelayMs = 8000UL;
-  unsigned long wellOverloadDelayMs = 5000UL;
-  float targetMinutes = 5.0f;
   float litersPerMin = 30.0f;
-
-  // House pump
   float setpointBar = 1.0f;
   float houseHystOn = 0.50f;
   float houseHystOff = 1.18f;
@@ -55,22 +68,6 @@ struct Settings {
   float houseEmergencyCurrent = 1.5f;
   unsigned long houseDryDelayMs = 8000UL;
   unsigned long houseOverloadDelayMs = 5000UL;
-
-  // Sensor ranges (for calibration/display settings)
-  float wellPressureMinBar = 0.0f;
-  float wellPressureMaxBar = 12.0f;
-  float housePressureMinBar = 0.0f;
-  float housePressureMaxBar = 12.0f;
-  float wellCurrentMinA = 0.0f;
-  float wellCurrentMaxA = 10.0f;
-  float houseCurrentMinA = 0.0f;
-  float houseCurrentMaxA = 10.0f;
-
-  // Wi-Fi
-  String wifiSsid = WIFI_SSID_DEFAULT;
-  String wifiPass = WIFI_PASS_DEFAULT;
-  String apSsid = AP_SSID_DEFAULT;
-  String apPass = AP_PASS_DEFAULT;
 } cfg;
 
 struct Controller {
@@ -82,6 +79,8 @@ struct Controller {
   bool wellAlarm = false;
   bool houseBlocked = false;
   bool houseAlarm = false;
+  bool filterWarning = false;
+  bool pressureBlock = false;
 
   bool wellForceMode = false;
   bool houseForceMode = false;
@@ -92,10 +91,30 @@ struct Controller {
   unsigned long wellOverloadStart = 0;
   unsigned long houseDryStart = 0;
   unsigned long houseOverloadStart = 0;
+  unsigned long houseStartTs = 0;
+  unsigned long houseDryPressureStart = 0;
+  unsigned long houseLowPressureStart = 0;
+  unsigned long lastHousePidTs = 0;
+  unsigned long lastFreqStepTs = 0;
+  unsigned long lastNanoCmdTs = 0;
+
+  unsigned long wellStartTs = 0;
+  bool wellStartChecksPending = false;
+  int failedStartCount = 0;
+
+  float housePidIntegral = 0;
+  float targetFreq = 28.0f;
+  float houseInitialPressure = 0.0f;
 
   unsigned long lastWorkSec = 0;
-  float pauseMs = 0;
+  float pauseMs = 30000;
   float totalLiters = 0;
+  WellIntention intention = INT_TARGET_REACHED;
+  float pidInt = 0;
+  float pidLastE = 0;
+
+  unsigned long lastPersistLitersTs = 0;
+  float lastPersistLitersVal = 0;
 
   float volumeHistory[20] = {0};
   float workHistory[20] = {0};
@@ -105,27 +124,86 @@ struct Controller {
 } st;
 
 WebServer server(80);
+Preferences prefs;
 
-void appendLog(String& dst, const String& msg) {
-  dst += msg + "\n";
-  if (dst.length() > 5000) dst.remove(0, dst.length() - 5000);
+void appendLog(String& dst, const String& msg) { dst += msg + "\n"; if (dst.length() > 5000) dst.remove(0, dst.length() - 5000); }
+void pushHistory(float* arr, float value) { for (int i = 0; i < 19; i++) arr[i] = arr[i + 1]; arr[19] = value; }
+
+uint8_t xorChecksum(const String &s) { uint8_t c = 0; for (size_t i = 0; i < s.length(); i++) c ^= (uint8_t)s[i]; return c; }
+
+void persistState(bool force = false) {
+  unsigned long now = millis();
+  bool litersDue = force || (now - st.lastPersistLitersTs >= 600000UL) || (fabs(st.totalLiters - st.lastPersistLitersVal) >= 50.0f);
+  if (litersDue) {
+    prefs.putFloat("totalLit", st.totalLiters);
+    st.lastPersistLitersTs = now;
+    st.lastPersistLitersVal = st.totalLiters;
+  }
+  if (force) {
+    prefs.putFloat("pauseMs", st.pauseMs);
+    prefs.putInt("failCnt", st.failedStartCount);
+    prefs.putUChar("intent", (uint8_t)st.intention);
+    prefs.putFloat("pidInt", st.pidInt);
+    prefs.putFloat("pidLastE", st.pidLastE);
+  }
 }
 
-void pushHistory(float* arr, float value) {
-  for (int i = 0; i < 19; i++) arr[i] = arr[i + 1];
-  arr[19] = value;
+void loadState() {
+  st.totalLiters = prefs.getFloat("totalLit", 0.0f);
+  st.pauseMs = prefs.getFloat("pauseMs", 30000.0f);
+  st.failedStartCount = prefs.getInt("failCnt", 0);
+  st.intention = (WellIntention)prefs.getUChar("intent", INT_TARGET_REACHED);
+  st.pidInt = prefs.getFloat("pidInt", 0.0f);
+  st.pidLastE = prefs.getFloat("pidLastE", 0.0f);
+  st.lastPersistLitersVal = st.totalLiters;
+  st.lastPersistLitersTs = millis();
+}
+
+void resetWellStartChecks() {
+  st.wellStartTs = 0;
+  st.wellStartChecksPending = false;
+}
+
+void handleWellStop(unsigned long now, const String &reason) {
+  if (!st.wellRelay) return;
+  st.wellRelay = false;
+  st.lastWorkSec = (now - st.wellRunStart) / 1000UL;
+  float workedMinutes = st.lastWorkSec / 60.0f;
+  float liters = st.lastWorkSec * (cfg.litersPerMin / 60.0f);
+  st.totalLiters += liters;
+  pushHistory(st.volumeHistory, liters);
+  pushHistory(st.workHistory, st.lastWorkSec);
+
+  float e = TARGET_MIN - workedMinutes;
+  float gain = fabs(e) > 2.0f ? 2.5f : 1.0f;
+  st.pidInt += e * gain;
+  float p = 1.5f * e * gain;
+  float d = 0.2f * (e - st.pidLastE);
+  st.pidLastE = e;
+  st.pauseMs = constrain(st.pauseMs + p + st.pidInt + d, MIN_PAUSE_MS, MAX_PAUSE_MS);
+
+  st.wellPauseStart = now;
+  resetWellStartChecks();
+  appendLog(st.logsWell, "WELL: stop " + reason);
+  persistState(true);
 }
 
 void parseNanoLine(const String& line) {
   if (!line.startsWith("TEL,")) return;
+  int starPos = line.lastIndexOf(",*");
+  if (starPos < 0 || starPos + 4 > (int)line.length()) return;
+  String payload = line.substring(0, starPos);
+  String cHex = line.substring(starPos + 2);
+  uint8_t got = (uint8_t)strtoul(cHex.c_str(), nullptr, 16);
+  if (xorChecksum(payload) != got) return;
 
   float vals[11] = {0};
   int idx = 0;
   int start = 4;
-  while (idx < 11 && start < (int)line.length()) {
-    int comma = line.indexOf(',', start);
-    if (comma < 0) comma = line.length();
-    vals[idx++] = line.substring(start, comma).toFloat();
+  while (idx < 11 && start < (int)payload.length()) {
+    int comma = payload.indexOf(',', start);
+    if (comma < 0) comma = payload.length();
+    vals[idx++] = payload.substring(start, comma).toFloat();
     start = comma + 1;
   }
   if (idx < 11) return;
@@ -134,7 +212,17 @@ void parseNanoLine(const String& line) {
   tm.wellCurrent = vals[1];
   tm.wellPressure = vals[2];
   tm.houseCurrent = vals[3];
-  tm.housePressure = vals[4];
+  tm.housePressureRaw = vals[4];
+  if (!tm.pressureFilterInit) {
+    for (uint8_t i = 0; i < 6; i++) tm.pressureFilterBuf[i] = tm.housePressureRaw;
+    tm.pressureFilterInit = true;
+  }
+  tm.pressureFilterBuf[tm.pressureFilterIdx] = tm.housePressureRaw;
+  tm.pressureFilterIdx = (tm.pressureFilterIdx + 1) % 6;
+  float sum = 0;
+  for (uint8_t i = 0; i < 6; i++) sum += tm.pressureFilterBuf[i];
+  tm.housePressure = sum / 6.0f;
+
   tm.levels[0] = vals[5] > 0.5f;
   tm.levels[1] = vals[6] > 0.5f;
   tm.levels[2] = vals[7] > 0.5f;
@@ -148,139 +236,191 @@ void readNanoUart() {
   static String line;
   while (NanoSerial.available()) {
     char c = (char)NanoSerial.read();
-    if (c == '\n') {
-      parseNanoLine(line);
-      line = "";
-    } else if (c != '\r') {
-      line += c;
-    }
+    if (c == '\n') { parseNanoLine(line); line = ""; }
+    else if (c != '\r') line += c;
   }
 }
 
 void sendNanoCommand() {
-  NanoSerial.printf("RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f\n", st.wellRelay ? 1 : 0, st.vfdRun ? 1 : 0, st.vfdFreq);
+  NanoSerial.printf(
+    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WB=%d;HB=%d;WA=%d;HA=%d;WF=%d;HF=%d;FW=%d;PB=%d;FSC=%d;PMS=%.0f;TL=%.1f;SP=%.2f\n",
+    st.wellRelay ? 1 : 0,
+    st.vfdRun ? 1 : 0,
+    st.vfdFreq,
+    st.wellBlocked ? 1 : 0,
+    st.houseBlocked ? 1 : 0,
+    st.wellAlarm ? 1 : 0,
+    st.houseAlarm ? 1 : 0,
+    st.wellForceMode ? 1 : 0,
+    st.houseForceMode ? 1 : 0,
+    st.filterWarning ? 1 : 0,
+    st.pressureBlock ? 1 : 0,
+    st.failedStartCount,
+    st.pauseMs,
+    st.totalLiters,
+    cfg.setpointBar
+  );
 }
 
 void runWellLogic(unsigned long now) {
-  if (!tm.valid || st.wellBlocked) {
-    st.wellRelay = false;
-    return;
+  if (!tm.valid || st.wellBlocked) { st.wellRelay = false; return; }
+
+  st.filterWarning = tm.wellPressure >= PRESSURE_WARN;
+  if (tm.wellPressure >= PRESSURE_BLOCK) st.pressureBlock = true;
+
+  if (tm.levels[3]) st.intention = INT_TARGET_REACHED;
+  else if (!tm.levels[1]) st.intention = INT_FILL_TO_L4;
+
+  bool levelNeed = false;
+  if (!tm.levels[3]) {
+    if (st.intention == INT_FILL_TO_L4) levelNeed = true;
+    else levelNeed = (!tm.levels[1] || !tm.levels[2]);
   }
+  bool needPump = st.wellForceMode || levelNeed;
 
-  bool needByLevels = !tm.levels[3] && (!tm.levels[1] || !tm.levels[2]);
-  bool needPump = st.wellForceMode || needByLevels;
-
-  // Force mode bypasses level logic, but pause timer and protections still have priority.
-  if (needPump && !st.wellRelay && (now - st.wellPauseStart > (unsigned long)st.pauseMs)) {
+  if (needPump && !st.wellRelay && !st.pressureBlock && (now - st.wellPauseStart > (unsigned long)st.pauseMs)) {
     st.wellRelay = true;
     st.wellRunStart = now;
+    st.wellStartTs = now;
+    st.wellStartChecksPending = true;
     appendLog(st.logsWell, st.wellForceMode ? "WELL: force start" : "WELL: start");
   }
 
   if (st.wellRelay && !st.wellForceMode && tm.levels[3]) {
-    st.wellRelay = false;
-    st.lastWorkSec = (now - st.wellRunStart) / 1000UL;
-    float liters = st.lastWorkSec * (cfg.litersPerMin / 60.0f);
-    st.totalLiters += liters;
-    pushHistory(st.volumeHistory, liters);
-    pushHistory(st.workHistory, st.lastWorkSec);
-    st.pauseMs = constrain(((cfg.targetMinutes * 60.0f) - st.lastWorkSec) * 1000.0f, 10000.0f, 90000.0f);
-    st.wellPauseStart = now;
-    appendLog(st.logsWell, "WELL: stop by L4");
+    st.intention = INT_TARGET_REACHED;
+    handleWellStop(now, "by L4");
   }
+
+  if (st.wellRelay && st.wellStartChecksPending) {
+    if ((now - st.wellStartTs) >= PRESSURE_CHECK_DELAY && tm.wellPressure <= 0.30f) {
+      st.failedStartCount++;
+      appendLog(st.logsWell, "WELL: start fail pressure");
+      handleWellStop(now, "start fail");
+    } else if ((now - st.wellStartTs) >= CURRENT_CHECK_DELAY && tm.wellCurrent < CURRENT_MIN_START) {
+      st.failedStartCount++;
+      appendLog(st.logsWell, "WELL: start fail current");
+      handleWellStop(now, "start fail");
+    } else if (tm.wellPressure > 0.30f && tm.wellCurrent >= CURRENT_MIN_START) {
+      st.wellStartChecksPending = false;
+      st.failedStartCount = 0;
+      persistState(true);
+    }
+  }
+
+  if (st.failedStartCount >= FAILED_START_LIMIT) {
+    st.wellBlocked = st.wellAlarm = true;
+    st.wellRelay = false;
+    st.wellForceMode = false;
+    resetWellStartChecks();
+    appendLog(st.logsWell, "WELL: blocked by failed starts");
+    persistState(true);
+  }
+
+  persistState();
 }
 
-void runHouseLogic() {
-  if (!tm.valid || st.houseBlocked) {
-    st.vfdRun = false;
-    st.vfdFreq = cfg.houseMinFreq;
-    return;
-  }
+void runHouseLogic(unsigned long now) {
+  if (!tm.valid || st.houseBlocked) { st.vfdRun = false; st.vfdFreq = cfg.houseMinFreq; return; }
 
-  bool hasWater = tm.levels[0] && tm.levels[1];
-  if (!st.houseForceMode && !hasWater) {
-    st.vfdRun = false;
-    st.vfdFreq = cfg.houseMinFreq;
-    return;
-  }
+  bool l1 = tm.levels[0], l2 = tm.levels[1];
+  if (!st.houseForceMode) {
+    if (!l1) {
+      st.vfdRun = false;
+      st.vfdFreq = cfg.houseMinFreq;
+      return;
+    }
+    if (!st.vfdRun && !l2) {
+      st.vfdFreq = cfg.houseMinFreq;
+      return;
+    }
 
-  if (st.houseForceMode) {
-    st.vfdRun = true;
-  } else {
     if (!st.vfdRun && tm.housePressure <= cfg.houseHystOn) {
       st.vfdRun = true;
+      st.houseStartTs = now;
+      st.houseDryPressureStart = now;
+      st.houseInitialPressure = tm.housePressure;
+      st.houseLowPressureStart = 0;
       appendLog(st.logsHouse, "HOUSE: start");
     }
     if (st.vfdRun && tm.housePressure >= cfg.houseHystOff) {
       st.vfdRun = false;
       st.vfdFreq = cfg.houseMinFreq;
       appendLog(st.logsHouse, "HOUSE: stop by pressure");
+      return;
     }
+  } else if (!st.vfdRun) {
+    st.vfdRun = true;
+    st.houseStartTs = now;
+    st.houseDryPressureStart = now;
+    st.houseInitialPressure = tm.housePressure;
   }
 
-  if (st.vfdRun) {
+  if (!st.vfdRun) return;
+
+  if (now - st.lastHousePidTs >= PID_PERIOD_MS) {
+    st.lastHousePidTs = now;
     float error = cfg.setpointBar - tm.housePressure;
-    st.vfdFreq = constrain(cfg.houseMinFreq + error * 20.0f, cfg.houseMinFreq, cfg.houseMaxFreq);
+    st.housePidIntegral += error * (PID_PERIOD_MS / 1000.0f);
+    st.housePidIntegral = constrain(st.housePidIntegral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+    st.targetFreq = cfg.houseMinFreq + 260.0f * error + 0.45f * st.housePidIntegral;
+    st.targetFreq = constrain(st.targetFreq, cfg.houseMinFreq, cfg.houseMaxFreq);
+  }
+
+  if (now - st.lastFreqStepTs >= FREQ_STEP_PERIOD_MS) {
+    st.lastFreqStepTs = now;
+    float step = fabs(st.targetFreq - st.vfdFreq) > 8.0f ? 2.0f : 1.0f;
+    if (st.targetFreq > st.vfdFreq) st.vfdFreq = min(st.vfdFreq + step, st.targetFreq);
+    else st.vfdFreq = max(st.vfdFreq - step, st.targetFreq);
   }
 }
 
 void runProtections(unsigned long now) {
   if (st.wellRelay) {
-    if (tm.wellCurrent >= cfg.wellEmergencyCurrent) {
-      st.wellBlocked = st.wellAlarm = true;
-      st.wellRelay = false;
-      st.wellForceMode = false;
-      appendLog(st.logsWell, "WELL: emergency overcurrent");
-    }
-
-    if (tm.wellCurrent >= cfg.wellOverloadCurrent) {
-      if (!st.wellOverloadStart) st.wellOverloadStart = now;
-      if (now - st.wellOverloadStart > cfg.wellOverloadDelayMs) {
-        st.wellBlocked = st.wellAlarm = true;
-        st.wellRelay = false;
-        st.wellForceMode = false;
-        appendLog(st.logsWell, "WELL: overload");
-      }
-    } else st.wellOverloadStart = 0;
-
-    if (tm.wellCurrent < cfg.wellDryCurrent) {
-      if (!st.wellDryStart) st.wellDryStart = now;
-      if (now - st.wellDryStart > cfg.wellDryDelayMs) {
-        st.wellBlocked = st.wellAlarm = true;
-        st.wellRelay = false;
-        st.wellForceMode = false;
-        appendLog(st.logsWell, "WELL: dry run");
-      }
-    } else st.wellDryStart = 0;
+    if (tm.wellCurrent >= 6.0f) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; st.wellForceMode = false; appendLog(st.logsWell, "WELL: emergency overcurrent"); }
+    if (tm.wellCurrent >= 4.3f) { if (!st.wellOverloadStart) st.wellOverloadStart = now; if (now - st.wellOverloadStart > 5000UL) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "WELL: overload"); } }
+    else st.wellOverloadStart = 0;
+    if (tm.wellCurrent < 3.3f) { if (!st.wellDryStart) st.wellDryStart = now; if (now - st.wellDryStart > 8000UL) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "WELL: dry run"); handleWellStop(now, "dry"); } }
+    else st.wellDryStart = 0;
   }
 
   if (st.vfdRun) {
     if (tm.houseCurrent >= cfg.houseEmergencyCurrent) {
-      st.houseBlocked = st.houseAlarm = true;
-      st.vfdRun = false;
-      st.houseForceMode = false;
+      st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; st.houseForceMode = false;
       appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
     }
 
-    if (tm.houseCurrent >= cfg.houseOverloadCurrent) {
-      if (!st.houseOverloadStart) st.houseOverloadStart = now;
-      if (now - st.houseOverloadStart > cfg.houseOverloadDelayMs) {
-        st.houseBlocked = st.houseAlarm = true;
-        st.vfdRun = false;
-        st.houseForceMode = false;
-        appendLog(st.logsHouse, "HOUSE: overload");
-      }
-    } else st.houseOverloadStart = 0;
+    bool ignoreCurr = (now - st.houseStartTs) < START_CURRENT_IGNORE_MS;
+    if (!ignoreCurr) {
+      if (tm.houseCurrent >= cfg.houseOverloadCurrent) {
+        if (!st.houseOverloadStart) st.houseOverloadStart = now;
+        if (now - st.houseOverloadStart > cfg.houseOverloadDelayMs) {
+          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: overload");
+        }
+      } else st.houseOverloadStart = 0;
 
-    if (tm.houseCurrent < cfg.houseDryCurrent) {
-      if (!st.houseDryStart) st.houseDryStart = now;
-      if (now - st.houseDryStart > cfg.houseDryDelayMs) {
-        st.houseBlocked = st.houseAlarm = true;
-        st.vfdRun = false;
-        st.houseForceMode = false;
-        appendLog(st.logsHouse, "HOUSE: dry run");
+      if (tm.houseCurrent < cfg.houseDryCurrent) {
+        if (!st.houseDryStart) st.houseDryStart = now;
+        if (now - st.houseDryStart > cfg.houseDryDelayMs) {
+          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry current");
+        }
+      } else st.houseDryStart = 0;
+    }
+
+    if (st.houseDryPressureStart && (now - st.houseDryPressureStart) >= DRY_PRESSURE_START_TIMEOUT) {
+      if (tm.housePressure < st.houseInitialPressure + PRESSURE_RISE_THRESHOLD) {
+        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry pressure start");
       }
-    } else st.houseDryStart = 0;
+      st.houseDryPressureStart = 0;
+    }
+
+    if (tm.housePressure < cfg.houseHystOn) {
+      if (!st.houseLowPressureStart) st.houseLowPressureStart = now;
+      if (now - st.houseLowPressureStart > DRY_PRESSURE_WORK_TIMEOUT) {
+        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry pressure work");
+      }
+    } else {
+      st.houseLowPressureStart = 0;
+    }
   }
 }
 
@@ -299,152 +439,82 @@ String buildJsonState() {
   doc["house_force"] = st.houseForceMode;
   doc["well_blocked"] = st.wellBlocked;
   doc["house_blocked"] = st.houseBlocked;
-  doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
-  doc["wifi_sta_ip"] = WiFi.localIP().toString();
-  doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
-
+  doc["failed_start_count"] = st.failedStartCount;
+  doc["filter_warning"] = st.filterWarning;
+  doc["pressure_block"] = st.pressureBlock;
   JsonArray lv = doc.createNestedArray("levels");
   for (int i = 0; i < 4; i++) lv.add(tm.levels[i]);
-
-  JsonArray vh = doc.createNestedArray("volume_history");
-  JsonArray wh = doc.createNestedArray("work_time_history");
-  for (int i = 0; i < 20; i++) {
-    vh.add(st.volumeHistory[i]);
-    wh.add(st.workHistory[i]);
-  }
-
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
-
-void notifyClients() {
-  // kept for timing compatibility with old loop flow
+  String out; serializeJson(doc, out); return out;
 }
 
 void initWeb() {
-  if (!LittleFS.begin(true)) return;
-
-  server.on("/", HTTP_GET, []() {
-    File file = LittleFS.open("/index.html", "r");
-    if (!file) {
-      server.send(500, "text/plain", "index.html not found in LittleFS");
-      return;
-    }
-    server.streamFile(file, "text/html; charset=utf-8");
-    file.close();
-  });
-
-  server.on("/state", HTTP_GET, []() {
-    server.send(200, "application/json", buildJsonState());
-  });
-
-  server.on("/logs_well", HTTP_GET, []() {
-    server.send(200, "text/plain; charset=utf-8", st.logsWell);
-  });
-
-  server.on("/logs_house", HTTP_GET, []() {
-    server.send(200, "text/plain; charset=utf-8", st.logsHouse);
-  });
+  LittleFS.begin(true);
+  server.on("/", HTTP_GET, []() { File file = LittleFS.open("/index.html", "r"); if (!file) return server.send(500, "text/plain", "index.html missing"); server.streamFile(file, "text/html; charset=utf-8"); file.close(); });
+  server.on("/state", HTTP_GET, []() { server.send(200, "application/json", buildJsonState()); });
+  server.on("/logs_well", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsWell); });
+  server.on("/logs_house", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsHouse); });
 
   server.on("/set", HTTP_POST, []() {
-    if (server.hasArg("param") && server.hasArg("value")) {
-      String p = server.arg("param");
-      float v = server.arg("value").toFloat();
-      if (p == "SETPOINT_BAR") st.setpointBar = constrain(v, 0.0f, 2.0f);
-      // CURRENT_DRY kept for compatibility with UI; can be persisted later.
-      server.send(200, "text/plain", "OK");
-      return;
-    }
-    server.send(400, "text/plain", "Missing param/value");
-  });
-
-  server.on("/clear_logs_well", HTTP_POST, []() {
-    st.logsWell = "";
+    if (!server.hasArg("param") || !server.hasArg("value")) return server.send(400, "text/plain", "Missing param/value");
+    String p = server.arg("param");
+    float v = server.arg("value").toFloat();
+    if (p == "SETPOINT_BAR") cfg.setpointBar = constrain(v, 0.0f, 2.0f);
     server.send(200, "text/plain", "OK");
   });
 
-  server.on("/clear_logs_house", HTTP_POST, []() {
-    st.logsHouse = "";
+  server.on("/action", HTTP_POST, []() {
+    String pump = server.arg("pump");
+    String cmd = server.arg("cmd");
+    if (pump == "well") {
+      if (cmd == "reset_alarm") {
+        st.wellBlocked = st.wellAlarm = false; st.failedStartCount = 0; st.pressureBlock = false; st.wellDryStart = st.wellOverloadStart = 0; resetWellStartChecks(); persistState(true);
+      } else if (cmd == "force_on") st.wellForceMode = true;
+      else if (cmd == "force_off") st.wellForceMode = false;
+    } else if (pump == "house") {
+      if (cmd == "reset_alarm") {
+        st.houseBlocked = st.houseAlarm = false; st.houseDryStart = st.houseOverloadStart = 0; st.houseLowPressureStart = 0;
+      } else if (cmd == "force_on") st.houseForceMode = true;
+      else if (cmd == "force_off") st.houseForceMode = false;
+    }
     server.send(200, "text/plain", "OK");
   });
-
-  server.on("/export_well", HTTP_GET, []() {
-    String csv = "idx,volume_l,work_s\n";
-    for (int i = 0; i < 20; i++) csv += String(i) + "," + String(st.volumeHistory[i], 2) + "," + String(st.workHistory[i], 0) + "\n";
-    server.send(200, "text/csv", csv);
-  });
-
-  server.on("/export_house", HTTP_GET, []() {
-    String csv = "house_current,house_pressure\n" + String(tm.houseCurrent, 2) + "," + String(tm.housePressure, 2) + "\n";
-    server.send(200, "text/csv", csv);
-  });
-
-  server.onNotFound([]() {
-    String path = server.uri();
-    if (LittleFS.exists(path)) {
-      File file = LittleFS.open(path, "r");
-      String contentType = "text/plain";
-      if (path.endsWith(".css")) contentType = "text/css";
-      else if (path.endsWith(".js")) contentType = "application/javascript";
-      else if (path.endsWith(".html")) contentType = "text/html; charset=utf-8";
-      else if (path.endsWith(".png")) contentType = "image/png";
-      server.streamFile(file, contentType);
-      file.close();
-      return;
-    }
-    server.send(404, "text/plain", "Not found");
-  });
-
   server.begin();
 }
 
 void initWiFi() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
-
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-    appendLog(st.logsHouse, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-  } else {
-    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
-    appendLog(st.logsHouse, "Wi-Fi STA not connected, AP mode still available");
-  }
-  appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
-  appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
 }
 
 void setup() {
   Serial.begin(115200);
   NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+  esp_task_wdt_init(5, true);
+  esp_task_wdt_add(NULL);
+
+  prefs.begin("nasos", false);
+  loadState();
 
   initWiFi();
-
   initWeb();
-
-  appendLog(st.logsWell, "System start: ESP32 controller online");
-  appendLog(st.logsHouse, "System start: ESP32 controller online");
+  appendLog(st.logsWell, "System start");
+  appendLog(st.logsHouse, "System start");
 }
 
 void loop() {
+  esp_task_wdt_reset();
   unsigned long now = millis();
-
   readNanoUart();
   runWellLogic(now);
-  runHouseLogic();
+  runHouseLogic(now);
   runProtections(now);
-  sendNanoCommand();
-
-  static unsigned long lastWs = 0;
-  if (now - lastWs > 1000) {
-    lastWs = now;
-    notifyClients();
+  if (now - st.lastNanoCmdTs >= 100UL) {
+    st.lastNanoCmdTs = now;
+    sendNanoCommand();
   }
-
   server.handleClient();
-  delay(20);
+  delay(5);
 }
