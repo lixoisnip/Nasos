@@ -121,6 +121,14 @@
         options: { responsive: true, scales: { y: { beginAtZero: true } }, animation: { duration: 200 } }
       });
     }
+  };
+
+  let currentGroup = 'well';
+  let settingsCache = {};
+
+  function goSettings() {
+    document.getElementById('settings-section').scrollIntoView({behavior:'smooth'});
+  }
 
     function renderState(data) {
       document.getElementById("well_current").innerText = data.well_current.toFixed(1) + " A";
