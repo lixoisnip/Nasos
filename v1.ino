@@ -6,8 +6,6 @@
 #include <SoftwareSerial.h>
 #include <avr/wdt.h>
 #include <math.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
 #define RELAY_WELL        3
 #define PIN_RS485_DE_RE   7
@@ -27,8 +25,6 @@ SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
 constexpr unsigned long TELEMETRY_PERIOD_MS = 150;
 constexpr unsigned long LEVEL_FILTER_MS = 2000;
 constexpr int LEVEL_THRESHOLD = 700;
-constexpr unsigned long DISPLAY_REFRESH_MS = 350;
-constexpr unsigned long DISPLAY_PAGE_MS = 3000;
 
 struct LevelFilter {
   bool stable = false;
@@ -53,26 +49,7 @@ struct NanoState {
   uint8_t housePressureIdx = 0;
   bool housePressureInit = false;
   LevelFilter levelFilter[4];
-
-  bool wellBlocked = false;
-  bool houseBlocked = false;
-  bool wellAlarm = false;
-  bool houseAlarm = false;
-  bool wellForceMode = false;
-  bool houseForceMode = false;
-  bool filterWarning = false;
-  bool pressureBlock = false;
-  int failedStartCount = 0;
-  float pauseMs = 0.0f;
-  float totalLiters = 0.0f;
-  float setpointBar = 1.0f;
-
-  unsigned long lastDisplayRefresh = 0;
-  unsigned long pageChangedAt = 0;
-  uint8_t displayPage = 0;
 } ns;
-
-LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 void txMode() { digitalWrite(PIN_RS485_DE_RE, HIGH); delayMicroseconds(100); }
 void rxMode() { delayMicroseconds(100); digitalWrite(PIN_RS485_DE_RE, LOW); }

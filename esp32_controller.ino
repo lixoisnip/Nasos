@@ -20,10 +20,23 @@ constexpr int NANO_RX_PIN = 16;
 constexpr int NANO_TX_PIN = 17;
 constexpr uint32_t NANO_BAUD = 38400;
 
+constexpr float PRESSURE_WARN = 1.20f;
+constexpr float PRESSURE_BLOCK = 1.50f;
+constexpr unsigned long PRESSURE_CHECK_DELAY = 8000UL;
 constexpr unsigned long CURRENT_CHECK_DELAY = 15000UL;
-constexpr int LEVEL_FILTER_MS = 2000;
-constexpr int INIT_DELAY_MS = 6000;
-constexpr int THRESH = 700;
+constexpr float CURRENT_MIN_START = 2.9f;
+constexpr int FAILED_START_LIMIT = 3;
+constexpr float TARGET_MIN = 5.0f;
+constexpr float MIN_PAUSE_MS = 10000.0f;
+constexpr float MAX_PAUSE_MS = 90000.0f;
+
+constexpr unsigned long START_CURRENT_IGNORE_MS = 2000UL;
+constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;
+constexpr float PRESSURE_RISE_THRESHOLD = 0.1f;
+constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 15000UL;
+constexpr unsigned long PID_PERIOD_MS = 300UL;
+constexpr unsigned long FREQ_STEP_PERIOD_MS = 500UL;
+constexpr float INTEGRAL_LIMIT = 18.0f;
 
 enum WellIntention : uint8_t { INT_TARGET_REACHED = 0, INT_FILL_TO_L4 = 1 };
 
@@ -44,22 +57,7 @@ struct Telemetry {
 } tm;
 
 struct Settings {
-  float targetMin = 5.0f;
   float litersPerMin = 30.0f;
-  float minPauseMin = 10.0f;
-  float maxPauseMin = 90.0f;
-  float wellDryCurrent = 3.3f;
-  float wellOverloadCurrent = 4.3f;
-  float wellEmergencyCurrent = 6.0f;
-  float currentMinStart = 2.9f;
-  float pressureMinOk = 0.30f;
-  float pressureWarning = 1.20f;
-  float pressureBlock = 1.50f;
-  unsigned long wellOverloadDelayMs = 5000UL;
-  unsigned long wellDryDelayMs = 8000UL;
-  unsigned long pressureCheckDelay = 8000UL;
-  int maxFailedStarts = 3;
-
   float setpointBar = 1.0f;
   float houseHystOn = 0.50f;
   float houseHystOff = 1.18f;
@@ -73,15 +71,6 @@ struct Settings {
   float houseEmergencyCurrent = 1.5f;
   unsigned long houseDryDelayMs = 8000UL;
   unsigned long houseOverloadDelayMs = 5000UL;
-  unsigned long startCurrentIgnoreMs = 2000UL;
-  unsigned long dryPressureStartTimeout = 10000UL;
-  unsigned long dryPressureWorkTimeout = 15000UL;
-  float pressureRiseThreshold = 0.1f;
-  float kp = 260.0f;
-  float ki = 0.45f;
-  float integralLimit = 18.0f;
-  unsigned long pidPeriod = 300UL;
-  unsigned long freqStepDelay = 500UL;
 } cfg;
 
 struct Controller {
@@ -110,7 +99,6 @@ struct Controller {
   unsigned long houseLowPressureStart = 0;
   unsigned long lastHousePidTs = 0;
   unsigned long lastFreqStepTs = 0;
-  unsigned long lastNanoCmdTs = 0;
 
   unsigned long wellStartTs = 0;
   bool wellStartChecksPending = false;
@@ -188,17 +176,17 @@ void handleWellStop(unsigned long now, const String &reason) {
   pushHistory(st.volumeHistory, liters);
   pushHistory(st.workHistory, st.lastWorkSec);
 
-  float e = cfg.targetMin - workedMinutes;
+  float e = TARGET_MIN - workedMinutes;
   float gain = fabs(e) > 2.0f ? 2.5f : 1.0f;
   st.pidInt += e * gain;
   float p = 1.5f * e * gain;
   float d = 0.2f * (e - st.pidLastE);
   st.pidLastE = e;
-  st.pauseMs = constrain(st.pauseMs + p + st.pidInt + d, (cfg.minPauseMin * 60000.0f), (cfg.maxPauseMin * 60000.0f));
+  st.pauseMs = constrain(st.pauseMs + p + st.pidInt + d, MIN_PAUSE_MS, MAX_PAUSE_MS);
 
   st.wellPauseStart = now;
   resetWellStartChecks();
-  appendLog(st.logsWell, "СКВАЖИННЫЙ: остановка " + reason);
+  appendLog(st.logsWell, "WELL: stop " + reason);
   persistState(true);
 }
 
@@ -255,32 +243,13 @@ void readNanoUart() {
   }
 }
 
-void sendNanoCommand() {
-  NanoSerial.printf(
-    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WB=%d;HB=%d;WA=%d;HA=%d;WF=%d;HF=%d;FW=%d;PB=%d;FSC=%d;PMS=%.0f;TL=%.1f;SP=%.2f\n",
-    st.wellRelay ? 1 : 0,
-    st.vfdRun ? 1 : 0,
-    st.vfdFreq,
-    st.wellBlocked ? 1 : 0,
-    st.houseBlocked ? 1 : 0,
-    st.wellAlarm ? 1 : 0,
-    st.houseAlarm ? 1 : 0,
-    st.wellForceMode ? 1 : 0,
-    st.houseForceMode ? 1 : 0,
-    st.filterWarning ? 1 : 0,
-    st.pressureBlock ? 1 : 0,
-    st.failedStartCount,
-    st.pauseMs,
-    st.totalLiters,
-    cfg.setpointBar
-  );
-}
+void sendNanoCommand() { NanoSerial.printf("RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f\n", st.wellRelay ? 1 : 0, st.vfdRun ? 1 : 0, st.vfdFreq); }
 
 void runWellLogic(unsigned long now) {
   if (!tm.valid || st.wellBlocked) { st.wellRelay = false; return; }
 
-  st.filterWarning = tm.wellPressure >= cfg.pressureWarning;
-  if (tm.wellPressure >= cfg.pressureBlock) st.pressureBlock = true;
+  st.filterWarning = tm.wellPressure >= PRESSURE_WARN;
+  if (tm.wellPressure >= PRESSURE_BLOCK) st.pressureBlock = true;
 
   if (tm.levels[3]) st.intention = INT_TARGET_REACHED;
   else if (!tm.levels[1]) st.intention = INT_FILL_TO_L4;
@@ -297,36 +266,36 @@ void runWellLogic(unsigned long now) {
     st.wellRunStart = now;
     st.wellStartTs = now;
     st.wellStartChecksPending = true;
-    appendLog(st.logsWell, st.wellForceMode ? "Скважинный: принудительный старт" : "Скважинный: старт");
+    appendLog(st.logsWell, st.wellForceMode ? "WELL: force start" : "WELL: start");
   }
 
   if (st.wellRelay && !st.wellForceMode && tm.levels[3]) {
     st.intention = INT_TARGET_REACHED;
-    handleWellStop(now, "по уровню L4");
+    handleWellStop(now, "by L4");
   }
 
   if (st.wellRelay && st.wellStartChecksPending) {
-    if ((now - st.wellStartTs) >= cfg.pressureCheckDelay && tm.wellPressure <= cfg.pressureMinOk) {
+    if ((now - st.wellStartTs) >= PRESSURE_CHECK_DELAY && tm.wellPressure <= 0.30f) {
       st.failedStartCount++;
-      appendLog(st.logsWell, "Скважинный: неудачный старт (давление не выросло)");
-      handleWellStop(now, "неудачный пуск");
-    } else if ((now - st.wellStartTs) >= CURRENT_CHECK_DELAY && tm.wellCurrent < cfg.currentMinStart) {
+      appendLog(st.logsWell, "WELL: start fail pressure");
+      handleWellStop(now, "start fail");
+    } else if ((now - st.wellStartTs) >= CURRENT_CHECK_DELAY && tm.wellCurrent < CURRENT_MIN_START) {
       st.failedStartCount++;
-      appendLog(st.logsWell, "Скважинный: неудачный старт (низкий ток)");
-      handleWellStop(now, "неудачный пуск");
-    } else if (tm.wellPressure > cfg.pressureMinOk && tm.wellCurrent >= cfg.currentMinStart) {
+      appendLog(st.logsWell, "WELL: start fail current");
+      handleWellStop(now, "start fail");
+    } else if (tm.wellPressure > 0.30f && tm.wellCurrent >= CURRENT_MIN_START) {
       st.wellStartChecksPending = false;
       st.failedStartCount = 0;
       persistState(true);
     }
   }
 
-  if (st.failedStartCount >= cfg.maxFailedStarts) {
+  if (st.failedStartCount >= FAILED_START_LIMIT) {
     st.wellBlocked = st.wellAlarm = true;
     st.wellRelay = false;
     st.wellForceMode = false;
     resetWellStartChecks();
-    appendLog(st.logsWell, "Скважинный: блокировка по числу неудачных пусков");
+    appendLog(st.logsWell, "WELL: blocked by failed starts");
     persistState(true);
   }
 
@@ -354,12 +323,12 @@ void runHouseLogic(unsigned long now) {
       st.houseDryPressureStart = now;
       st.houseInitialPressure = tm.housePressure;
       st.houseLowPressureStart = 0;
-      appendLog(st.logsHouse, "Домашний: старт");
+      appendLog(st.logsHouse, "HOUSE: start");
     }
     if (st.vfdRun && tm.housePressure >= cfg.houseHystOff) {
       st.vfdRun = false;
       st.vfdFreq = cfg.houseMinFreq;
-      appendLog(st.logsHouse, "Домашний: остановка по давлению");
+      appendLog(st.logsHouse, "HOUSE: stop by pressure");
       return;
     }
   } else if (!st.vfdRun) {
@@ -371,16 +340,16 @@ void runHouseLogic(unsigned long now) {
 
   if (!st.vfdRun) return;
 
-  if (now - st.lastHousePidTs >= cfg.pidPeriod) {
+  if (now - st.lastHousePidTs >= PID_PERIOD_MS) {
     st.lastHousePidTs = now;
     float error = cfg.setpointBar - tm.housePressure;
-    st.housePidIntegral += error * (cfg.pidPeriod / 1000.0f);
-    st.housePidIntegral = constrain(st.housePidIntegral, -cfg.integralLimit, cfg.integralLimit);
-    st.targetFreq = cfg.houseMinFreq + cfg.kp * error + cfg.ki * st.housePidIntegral;
+    st.housePidIntegral += error * (PID_PERIOD_MS / 1000.0f);
+    st.housePidIntegral = constrain(st.housePidIntegral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+    st.targetFreq = cfg.houseMinFreq + 260.0f * error + 0.45f * st.housePidIntegral;
     st.targetFreq = constrain(st.targetFreq, cfg.houseMinFreq, cfg.houseMaxFreq);
   }
 
-  if (now - st.lastFreqStepTs >= cfg.freqStepDelay) {
+  if (now - st.lastFreqStepTs >= FREQ_STEP_PERIOD_MS) {
     st.lastFreqStepTs = now;
     float step = fabs(st.targetFreq - st.vfdFreq) > 8.0f ? 2.0f : 1.0f;
     if (st.targetFreq > st.vfdFreq) st.vfdFreq = min(st.vfdFreq + step, st.targetFreq);
@@ -390,47 +359,47 @@ void runHouseLogic(unsigned long now) {
 
 void runProtections(unsigned long now) {
   if (st.wellRelay) {
-    if (tm.wellCurrent >= cfg.wellEmergencyCurrent) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; st.wellForceMode = false; appendLog(st.logsWell, "Скважинный: авария по току"); }
-    if (tm.wellCurrent >= cfg.wellOverloadCurrent) { if (!st.wellOverloadStart) st.wellOverloadStart = now; if (now - st.wellOverloadStart > cfg.wellOverloadDelayMs) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "Скважинный: перегрузка по току"); } }
+    if (tm.wellCurrent >= 6.0f) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; st.wellForceMode = false; appendLog(st.logsWell, "WELL: emergency overcurrent"); }
+    if (tm.wellCurrent >= 4.3f) { if (!st.wellOverloadStart) st.wellOverloadStart = now; if (now - st.wellOverloadStart > 5000UL) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "WELL: overload"); } }
     else st.wellOverloadStart = 0;
-    if (tm.wellCurrent < cfg.wellDryCurrent) { if (!st.wellDryStart) st.wellDryStart = now; if (now - st.wellDryStart > cfg.wellDryDelayMs) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "Скважинный: сухой ход"); handleWellStop(now, "сухой ход"); } }
+    if (tm.wellCurrent < 3.3f) { if (!st.wellDryStart) st.wellDryStart = now; if (now - st.wellDryStart > 8000UL) { st.wellBlocked = st.wellAlarm = true; st.wellRelay = false; appendLog(st.logsWell, "WELL: dry run"); handleWellStop(now, "dry"); } }
     else st.wellDryStart = 0;
   }
 
   if (st.vfdRun) {
     if (tm.houseCurrent >= cfg.houseEmergencyCurrent) {
       st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; st.houseForceMode = false;
-      appendLog(st.logsHouse, "Домашний: авария по току");
+      appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
     }
 
-    bool ignoreCurr = (now - st.houseStartTs) < cfg.startCurrentIgnoreMs;
+    bool ignoreCurr = (now - st.houseStartTs) < START_CURRENT_IGNORE_MS;
     if (!ignoreCurr) {
       if (tm.houseCurrent >= cfg.houseOverloadCurrent) {
         if (!st.houseOverloadStart) st.houseOverloadStart = now;
         if (now - st.houseOverloadStart > cfg.houseOverloadDelayMs) {
-          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "Домашний: перегрузка по току");
+          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: overload");
         }
       } else st.houseOverloadStart = 0;
 
       if (tm.houseCurrent < cfg.houseDryCurrent) {
         if (!st.houseDryStart) st.houseDryStart = now;
         if (now - st.houseDryStart > cfg.houseDryDelayMs) {
-          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "Домашний: сухой ход по току");
+          st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry current");
         }
       } else st.houseDryStart = 0;
     }
 
-    if (st.houseDryPressureStart && (now - st.houseDryPressureStart) >= cfg.dryPressureStartTimeout) {
-      if (tm.housePressure < st.houseInitialPressure + cfg.pressureRiseThreshold) {
-        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "Домашний: сухой ход (нет роста давления при старте)");
+    if (st.houseDryPressureStart && (now - st.houseDryPressureStart) >= DRY_PRESSURE_START_TIMEOUT) {
+      if (tm.housePressure < st.houseInitialPressure + PRESSURE_RISE_THRESHOLD) {
+        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry pressure start");
       }
       st.houseDryPressureStart = 0;
     }
 
     if (tm.housePressure < cfg.houseHystOn) {
       if (!st.houseLowPressureStart) st.houseLowPressureStart = now;
-      if (now - st.houseLowPressureStart > cfg.dryPressureWorkTimeout) {
-        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "Домашний: сухой ход (низкое давление в работе)");
+      if (now - st.houseLowPressureStart > DRY_PRESSURE_WORK_TIMEOUT) {
+        st.houseBlocked = st.houseAlarm = true; st.vfdRun = false; appendLog(st.logsHouse, "HOUSE: dry pressure work");
       }
     } else {
       st.houseLowPressureStart = 0;
@@ -516,56 +485,15 @@ void initWeb() {
   LittleFS.begin(true);
   server.on("/", HTTP_GET, []() { File file = LittleFS.open("/index.html", "r"); if (!file) return server.send(500, "text/plain", "index.html missing"); server.streamFile(file, "text/html; charset=utf-8"); file.close(); });
   server.on("/state", HTTP_GET, []() { server.send(200, "application/json", buildJsonState()); });
-  server.on("/settings", HTTP_GET, []() { server.send(200, "application/json", buildJsonSettings()); });
   server.on("/logs_well", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsWell); });
   server.on("/logs_house", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsHouse); });
-  server.on("/clear_logs_well", HTTP_POST, []() { st.logsWell = ""; server.send(200, "text/plain", "OK"); });
-  server.on("/clear_logs_house", HTTP_POST, []() { st.logsHouse = ""; server.send(200, "text/plain", "OK"); });
 
   server.on("/set", HTTP_POST, []() {
     if (!server.hasArg("param") || !server.hasArg("value")) return server.send(400, "text/plain", "Missing param/value");
     String p = server.arg("param");
     float v = server.arg("value").toFloat();
-    bool ok = true;
-    if (p == "TARGET_MIN") cfg.targetMin = v;
-    else if (p == "L_PER_MIN") cfg.litersPerMin = v;
-    else if (p == "MIN_PAUSE") cfg.minPauseMin = v;
-    else if (p == "MAX_PAUSE") cfg.maxPauseMin = v;
-    else if (p == "CURRENT_DRY_WELL") cfg.wellDryCurrent = v;
-    else if (p == "CURRENT_OVERLOAD_WELL") cfg.wellOverloadCurrent = v;
-    else if (p == "CURRENT_EMERGENCY_WELL") cfg.wellEmergencyCurrent = v;
-    else if (p == "CURRENT_MIN_START") cfg.currentMinStart = v;
-    else if (p == "PRESSURE_MIN_OK") cfg.pressureMinOk = v;
-    else if (p == "PRESSURE_WARNING") cfg.pressureWarning = v;
-    else if (p == "PRESSURE_BLOCK") cfg.pressureBlock = v;
-    else if (p == "OVERLOAD_DELAY_MS_WELL") cfg.wellOverloadDelayMs = (unsigned long)v;
-    else if (p == "DRY_DELAY_MS_WELL") cfg.wellDryDelayMs = (unsigned long)v;
-    else if (p == "PRESSURE_CHECK_DELAY") cfg.pressureCheckDelay = (unsigned long)v;
-    else if (p == "MAX_FAILED_STARTS") cfg.maxFailedStarts = (int)v;
-    else if (p == "SETPOINT_BAR") cfg.setpointBar = v;
-    else if (p == "HYST_ON") cfg.houseHystOn = v;
-    else if (p == "HYST_OFF") cfg.houseHystOff = v;
-    else if (p == "MIN_FREQ") cfg.houseMinFreq = v;
-    else if (p == "MAX_FREQ") cfg.houseMaxFreq = v;
-    else if (p == "SHUTDOWN_FREQ") cfg.shutdownFreq = v;
-    else if (p == "CURRENT_NORMAL_MIN") cfg.houseCurrentNormalMin = v;
-    else if (p == "CURRENT_NORMAL_MAX") cfg.houseCurrentNormalMax = v;
-    else if (p == "CURRENT_DRY_HOUSE") cfg.houseDryCurrent = v;
-    else if (p == "CURRENT_OVERLOAD_HOUSE") cfg.houseOverloadCurrent = v;
-    else if (p == "CURRENT_EMERGENCY_HOUSE") cfg.houseEmergencyCurrent = v;
-    else if (p == "OVERLOAD_DELAY_MS_HOUSE") cfg.houseOverloadDelayMs = (unsigned long)v;
-    else if (p == "DRY_DELAY_MS_HOUSE") cfg.houseDryDelayMs = (unsigned long)v;
-    else if (p == "START_CURRENT_IGNORE_MS") cfg.startCurrentIgnoreMs = (unsigned long)v;
-    else if (p == "DRY_PRESSURE_START_TIMEOUT") cfg.dryPressureStartTimeout = (unsigned long)v;
-    else if (p == "DRY_PRESSURE_WORK_TIMEOUT") cfg.dryPressureWorkTimeout = (unsigned long)v;
-    else if (p == "PRESSURE_RISE_THRESHOLD") cfg.pressureRiseThreshold = v;
-    else if (p == "Kp") cfg.kp = v;
-    else if (p == "Ki") cfg.ki = v;
-    else if (p == "INTEGRAL_LIMIT") cfg.integralLimit = v;
-    else if (p == "PID_PERIOD") cfg.pidPeriod = (unsigned long)v;
-    else if (p == "FREQ_STEP_DELAY") cfg.freqStepDelay = (unsigned long)v;
-    else ok = false;
-    server.send(ok ? 200 : 400, "text/plain", ok ? "OK" : "Unknown param");
+    if (p == "SETPOINT_BAR") cfg.setpointBar = constrain(v, 0.0f, 2.0f);
+    server.send(200, "text/plain", "OK");
   });
 
   server.on("/action", HTTP_POST, []() {
@@ -606,8 +534,8 @@ void setup() {
 
   initWiFi();
   initWeb();
-  appendLog(st.logsWell, "Система запущена");
-  appendLog(st.logsHouse, "Система запущена");
+  appendLog(st.logsWell, "System start");
+  appendLog(st.logsHouse, "System start");
 }
 
 void loop() {
@@ -617,10 +545,7 @@ void loop() {
   runWellLogic(now);
   runHouseLogic(now);
   runProtections(now);
-  if (now - st.lastNanoCmdTs >= 100UL) {
-    st.lastNanoCmdTs = now;
-    sendNanoCommand();
-  }
+  sendNanoCommand();
   server.handleClient();
   delay(5);
 }
