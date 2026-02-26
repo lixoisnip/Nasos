@@ -63,9 +63,6 @@ struct Settings {
   float houseHystOff = 1.18f;
   float houseMinFreq = 28.0f;
   float houseMaxFreq = 50.0f;
-  float shutdownFreq = 34.0f;
-  float houseCurrentNormalMin = 0.6f;
-  float houseCurrentNormalMax = 1.0f;
   float houseDryCurrent = 0.4f;
   float houseOverloadCurrent = 1.3f;
   float houseEmergencyCurrent = 1.5f;
@@ -405,57 +402,6 @@ void runProtections(unsigned long now) {
       st.houseLowPressureStart = 0;
     }
   }
-}
-
-
-void addSetting(JsonObject obj, const char* key, float value) { obj[key] = value; }
-void addSetting(JsonObject obj, const char* key, unsigned long value) { obj[key] = value; }
-void addSetting(JsonObject obj, const char* key, int value) { obj[key] = value; }
-
-String buildJsonSettings() {
-  StaticJsonDocument<4096> doc;
-  JsonObject c = doc.to<JsonObject>();
-  addSetting(c, "TARGET_MIN", cfg.targetMin);
-  addSetting(c, "L_PER_MIN", cfg.litersPerMin);
-  addSetting(c, "MIN_PAUSE", cfg.minPauseMin);
-  addSetting(c, "MAX_PAUSE", cfg.maxPauseMin);
-  addSetting(c, "CURRENT_DRY_WELL", cfg.wellDryCurrent);
-  addSetting(c, "CURRENT_OVERLOAD_WELL", cfg.wellOverloadCurrent);
-  addSetting(c, "CURRENT_EMERGENCY_WELL", cfg.wellEmergencyCurrent);
-  addSetting(c, "CURRENT_MIN_START", cfg.currentMinStart);
-  addSetting(c, "PRESSURE_MIN_OK", cfg.pressureMinOk);
-  addSetting(c, "PRESSURE_WARNING", cfg.pressureWarning);
-  addSetting(c, "PRESSURE_BLOCK", cfg.pressureBlock);
-  addSetting(c, "OVERLOAD_DELAY_MS_WELL", cfg.wellOverloadDelayMs);
-  addSetting(c, "DRY_DELAY_MS_WELL", cfg.wellDryDelayMs);
-  addSetting(c, "PRESSURE_CHECK_DELAY", cfg.pressureCheckDelay);
-  addSetting(c, "MAX_FAILED_STARTS", cfg.maxFailedStarts);
-  addSetting(c, "SETPOINT_BAR", cfg.setpointBar);
-  addSetting(c, "HYST_ON", cfg.houseHystOn);
-  addSetting(c, "HYST_OFF", cfg.houseHystOff);
-  addSetting(c, "MIN_FREQ", cfg.houseMinFreq);
-  addSetting(c, "MAX_FREQ", cfg.houseMaxFreq);
-  addSetting(c, "SHUTDOWN_FREQ", cfg.shutdownFreq);
-  addSetting(c, "CURRENT_NORMAL_MIN", cfg.houseCurrentNormalMin);
-  addSetting(c, "CURRENT_NORMAL_MAX", cfg.houseCurrentNormalMax);
-  addSetting(c, "CURRENT_DRY_HOUSE", cfg.houseDryCurrent);
-  addSetting(c, "CURRENT_OVERLOAD_HOUSE", cfg.houseOverloadCurrent);
-  addSetting(c, "CURRENT_EMERGENCY_HOUSE", cfg.houseEmergencyCurrent);
-  addSetting(c, "OVERLOAD_DELAY_MS_HOUSE", cfg.houseOverloadDelayMs);
-  addSetting(c, "DRY_DELAY_MS_HOUSE", cfg.houseDryDelayMs);
-  addSetting(c, "START_CURRENT_IGNORE_MS", cfg.startCurrentIgnoreMs);
-  addSetting(c, "DRY_PRESSURE_START_TIMEOUT", cfg.dryPressureStartTimeout);
-  addSetting(c, "DRY_PRESSURE_WORK_TIMEOUT", cfg.dryPressureWorkTimeout);
-  addSetting(c, "PRESSURE_RISE_THRESHOLD", cfg.pressureRiseThreshold);
-  addSetting(c, "Kp", cfg.kp);
-  addSetting(c, "Ki", cfg.ki);
-  addSetting(c, "INTEGRAL_LIMIT", cfg.integralLimit);
-  addSetting(c, "PID_PERIOD", cfg.pidPeriod);
-  addSetting(c, "FREQ_STEP_DELAY", cfg.freqStepDelay);
-  addSetting(c, "LEVEL_FILTER_MS", LEVEL_FILTER_MS);
-  addSetting(c, "INIT_DELAY_MS", INIT_DELAY_MS);
-  addSetting(c, "THRESH", THRESH);
-  String out; serializeJson(doc, out); return out;
 }
 
 String buildJsonState() {

@@ -179,102 +179,6 @@ void applyOutputs() {
   }
 }
 
-
-String onOff(bool v) { return v ? "ON" : "OFF"; }
-
-void drawPage0() {
-  lcd.setCursor(0, 0);
-  lcd.print("W ");
-  lcd.print(onOff(ns.relayWellOn));
-  lcd.print(" ");
-  lcd.print(ns.wellPressureBar, 2);
-  lcd.print("b ");
-  lcd.print(ns.wellCurrent, 1);
-  lcd.print("A   ");
-
-  lcd.setCursor(0, 1);
-  lcd.print("H ");
-  lcd.print(onOff(ns.vfdRun));
-  lcd.print(" ");
-  lcd.print(ns.housePressureBar, 2);
-  lcd.print("b ");
-  lcd.print(ns.houseCurrent, 1);
-  lcd.print("A   ");
-
-  lcd.setCursor(0, 2);
-  lcd.print("LVL ");
-  for (uint8_t i = 0; i < 4; i++) lcd.print(ns.levels[i] ? "1" : "0");
-  lcd.print(" F:");
-  lcd.print(ns.vfdFreqHz, 1);
-  lcd.print("  ");
-
-  lcd.setCursor(0, 3);
-  lcd.print("SP:");
-  lcd.print(ns.setpointBar, 2);
-  lcd.print(" L:");
-  lcd.print(ns.totalLiters, 0);
-  lcd.print("    ");
-}
-
-void drawPage1() {
-  lcd.setCursor(0, 0);
-  lcd.print("WB:"); lcd.print(ns.wellBlocked ? 1 : 0);
-  lcd.print(" WA:"); lcd.print(ns.wellAlarm ? 1 : 0);
-  lcd.print(" WF:"); lcd.print(ns.wellForceMode ? 1 : 0);
-  lcd.print("  ");
-
-  lcd.setCursor(0, 1);
-  lcd.print("HB:"); lcd.print(ns.houseBlocked ? 1 : 0);
-  lcd.print(" HA:"); lcd.print(ns.houseAlarm ? 1 : 0);
-  lcd.print(" HF:"); lcd.print(ns.houseForceMode ? 1 : 0);
-  lcd.print("  ");
-
-  lcd.setCursor(0, 2);
-  lcd.print("FWarn:"); lcd.print(ns.filterWarning ? 1 : 0);
-  lcd.print(" PBlk:"); lcd.print(ns.pressureBlock ? 1 : 0);
-  lcd.print("  ");
-
-  lcd.setCursor(0, 3);
-  lcd.print("Fail:"); lcd.print(ns.failedStartCount);
-  lcd.print(" Pause:"); lcd.print((unsigned long)(ns.pauseMs / 1000.0f));
-  lcd.print("s   ");
-}
-
-void drawPage2() {
-  lcd.setCursor(0, 0);
-  lcd.print("WEB mirror (osnova)");
-  lcd.setCursor(0, 1);
-  lcd.print("WPr:"); lcd.print(ns.wellPressureBar, 2);
-  lcd.print(" HPr:"); lcd.print(ns.housePressureBar, 2);
-  lcd.print("  ");
-
-  lcd.setCursor(0, 2);
-  lcd.print("WC:"); lcd.print(ns.wellCurrent, 2);
-  lcd.print(" HC:"); lcd.print(ns.houseCurrent, 2);
-  lcd.print("   ");
-
-  lcd.setCursor(0, 3);
-  lcd.print("R:"); lcd.print(ns.relayWellOn ? 1 : 0);
-  lcd.print(" VFD:"); lcd.print(ns.vfdRun ? 1 : 0);
-  lcd.print(" "); lcd.print(ns.vfdFreqHz, 1);
-  lcd.print("Hz ");
-}
-
-void updateDisplay(unsigned long now) {
-  if (now - ns.lastDisplayRefresh < DISPLAY_REFRESH_MS) return;
-  ns.lastDisplayRefresh = now;
-
-  if (now - ns.pageChangedAt >= DISPLAY_PAGE_MS) {
-    ns.displayPage = (ns.displayPage + 1) % 3;
-    ns.pageChangedAt = now;
-    lcd.clear();
-  }
-
-  if (ns.displayPage == 0) drawPage0();
-  else if (ns.displayPage == 1) drawPage1();
-  else drawPage2();
-}
-
 void handleCommand(String cmd) {
   cmd.trim();
   int pos = 0;
@@ -289,18 +193,6 @@ void handleCommand(String cmd) {
       if (key == "RELAY") ns.relayWellOn = val.toInt() == 1;
       if (key == "VFD_RUN") ns.vfdRun = val.toInt() == 1;
       if (key == "VFD_FREQ") ns.vfdFreqHz = val.toFloat();
-      if (key == "WB") ns.wellBlocked = val.toInt() == 1;
-      if (key == "HB") ns.houseBlocked = val.toInt() == 1;
-      if (key == "WA") ns.wellAlarm = val.toInt() == 1;
-      if (key == "HA") ns.houseAlarm = val.toInt() == 1;
-      if (key == "WF") ns.wellForceMode = val.toInt() == 1;
-      if (key == "HF") ns.houseForceMode = val.toInt() == 1;
-      if (key == "FW") ns.filterWarning = val.toInt() == 1;
-      if (key == "PB") ns.pressureBlock = val.toInt() == 1;
-      if (key == "FSC") ns.failedStartCount = val.toInt();
-      if (key == "PMS") ns.pauseMs = val.toFloat();
-      if (key == "TL") ns.totalLiters = val.toFloat();
-      if (key == "SP") ns.setpointBar = val.toFloat();
     }
     pos = sep + 1;
   }
@@ -370,13 +262,6 @@ void setup() {
   }
 
   initVFD();
-
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Nasos osnova LCD");
-  ns.pageChangedAt = millis();
 }
 
 void loop() {
@@ -386,5 +271,4 @@ void loop() {
   readInputs(now);
   applyOutputs();
   sendTelemetry(now);
-  updateDisplay(now);
 }
