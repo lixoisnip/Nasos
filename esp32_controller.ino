@@ -88,6 +88,37 @@ const NetworkConfig network = {
 };
 }
 
+namespace wellCtrl {
+constexpr float CURRENT_MIN_START = 2.9f;
+constexpr float PRESSURE_MIN_OK = 0.30f;
+constexpr float PRESSURE_WARNING = 1.20f;
+constexpr float PRESSURE_BLOCK = 1.50f;
+constexpr unsigned long CURRENT_CHECK_DELAY = 15000UL;
+constexpr unsigned long PRESSURE_CHECK_DELAY = 8000UL;
+constexpr int MAX_FAILED_STARTS = 3;
+
+constexpr float PID_KP = 1.5f;
+constexpr float PID_KI = 0.1f;
+constexpr float PID_KD = 0.2f;
+constexpr float PID_BOOST_ERROR = 2.0f;
+constexpr float PID_BOOST_FACTOR = 2.5f;
+constexpr float PID_INT_MIN = -40.0f;
+constexpr float PID_INT_MAX = 40.0f;
+}
+
+enum class PumpIntention : uint8_t {
+  UNKNOWN,
+  TARGET_REACHED,
+  PUMPING_TO_L4
+};
+
+enum class WellMode : uint8_t {
+  WAIT,
+  STARTING,
+  RUN,
+  FAIL
+};
+
 // -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
 constexpr int NANO_RX_PIN = 16;
@@ -120,6 +151,8 @@ struct Controller {
 
   bool wellBlocked = false;
   bool wellAlarm = false;
+  bool filterWarning = false;
+  bool pressureBlock = false;
   bool houseBlocked = false;
   bool houseAlarm = false;
 
@@ -128,6 +161,7 @@ struct Controller {
 
   unsigned long wellRunStart = 0;
   unsigned long wellPauseStart = 0;
+  unsigned long wellStartAttempt = 0;
   unsigned long wellDryStart = 0;
   unsigned long wellOverloadStart = 0;
   unsigned long houseDryStart = 0;
@@ -136,6 +170,17 @@ struct Controller {
   unsigned long lastWorkSec = 0;
   float pauseMs = 0;
   float totalLiters = 0;
+  int failedStartCount = 0;
+
+  bool needPump = false;
+  bool targetOk = false;
+  PumpIntention intention = PumpIntention::UNKNOWN;
+  WellMode wellMode = WellMode::WAIT;
+
+  bool startCurrentOk = false;
+  bool startPressureOk = false;
+  float pidInt = 0;
+  float pidLastE = 0;
 
   float volumeHistory[20] = {0};
   float workHistory[20] = {0};
@@ -143,6 +188,79 @@ struct Controller {
   String logsWell;
   String logsHouse;
 } st;
+
+void resetWellRuntimeTimers() {
+  st.wellRunStart = 0;
+  st.wellStartAttempt = 0;
+  st.wellDryStart = 0;
+  st.wellOverloadStart = 0;
+  st.startCurrentOk = false;
+  st.startPressureOk = false;
+}
+
+void resetWellTimersFull() {
+  resetWellRuntimeTimers();
+  st.wellPauseStart = 0;
+}
+
+void updateWellPumpNeed() {
+  bool L2 = tm.levels[1];
+  bool L4 = tm.levels[3];
+
+  if (!L2) {
+    st.needPump = true;
+    st.targetOk = false;
+    st.intention = PumpIntention::PUMPING_TO_L4;
+  } else if (L2 && L4) {
+    st.needPump = false;
+    st.targetOk = true;
+    st.intention = PumpIntention::TARGET_REACHED;
+  } else if (L2 && !L4) {
+    if (st.intention == PumpIntention::PUMPING_TO_L4) {
+      st.needPump = true;
+      st.targetOk = false;
+    } else {
+      st.needPump = false;
+      st.targetOk = true;
+    }
+  }
+}
+
+void adjustPID(float workedMin) {
+  float error = cfg.well.targetMinutes - workedMin;
+  float scale = fabs(error) > wellCtrl::PID_BOOST_ERROR ? wellCtrl::PID_BOOST_FACTOR : 1.0f;
+  st.pidInt += error * scale;
+  st.pidInt = constrain(st.pidInt, wellCtrl::PID_INT_MIN, wellCtrl::PID_INT_MAX);
+
+  float p = wellCtrl::PID_KP * error * scale;
+  float i = wellCtrl::PID_KI * st.pidInt * scale;
+  float d = wellCtrl::PID_KD * (error - st.pidLastE);
+  st.pidLastE = error;
+
+  float curMin = st.pauseMs / 60000.0f;
+  curMin = constrain(curMin + p + i + d, cfg.common.pauseMinMs / 60000.0f, cfg.common.pauseMaxMs / 60000.0f);
+  st.pauseMs = curMin * 60000.0f;
+}
+
+void stopWellPump(unsigned long now, const String& reason, PumpIntention nextIntention, bool withPid) {
+  if (!st.wellRelay) return;
+  st.wellRelay = false;
+
+  st.lastWorkSec = st.wellRunStart ? (now - st.wellRunStart) / 1000UL : 0;
+  float workedMin = st.lastWorkSec / 60.0f;
+  float liters = workedMin * cfg.well.litersPerMin;
+  st.totalLiters += liters;
+  pushHistory(st.volumeHistory, liters);
+  pushHistory(st.workHistory, st.lastWorkSec);
+
+  if (withPid) adjustPID(workedMin);
+
+  st.intention = nextIntention;
+  st.wellPauseStart = now;
+  st.wellMode = st.wellBlocked || st.pressureBlock ? WellMode::FAIL : WellMode::WAIT;
+  resetWellRuntimeTimers();
+  appendLog(st.logsWell, reason);
+}
 
 void initConfigFromNamespaces() {
   cfg.well = defaults::well;
@@ -209,35 +327,71 @@ void sendNanoCommand() {
 }
 
 void runWellLogic(unsigned long now) {
-  if (!tm.valid || st.wellBlocked) {
+  if (!tm.valid || st.wellBlocked || st.pressureBlock) {
     st.wellRelay = false;
+    if (st.wellBlocked || st.pressureBlock) st.wellMode = WellMode::FAIL;
     return;
   }
 
-  bool needByLevels = !tm.levels[3] && (!tm.levels[1] || !tm.levels[2]);
-  bool needPump = st.wellForceMode || needByLevels;
+  updateWellPumpNeed();
+  bool needPump = st.wellForceMode || st.needPump;
 
-  // Force mode bypasses level logic, but pause timer and protections still have priority.
-  if (needPump && !st.wellRelay && (now - st.wellPauseStart > (unsigned long)st.pauseMs)) {
+  if (st.wellMode == WellMode::WAIT && needPump && !st.wellRelay && (now - st.wellPauseStart >= (unsigned long)st.pauseMs)) {
     st.wellRelay = true;
-    st.wellRunStart = now;
-    appendLog(st.logsWell, st.wellForceMode ? "WELL: force start" : "WELL: start");
+    st.wellStartAttempt = now;
+    st.startCurrentOk = false;
+    st.startPressureOk = false;
+    st.wellMode = WellMode::STARTING;
+    appendLog(st.logsWell, st.wellForceMode ? "WELL: force start" : "WELL: starting");
   }
 
-  if (st.wellRelay && !st.wellForceMode && tm.levels[3]) {
-    st.wellRelay = false;
-    st.lastWorkSec = (now - st.wellRunStart) / 1000UL;
-    float liters = st.lastWorkSec * (cfg.well.litersPerMin / 60.0f);
-    st.totalLiters += liters;
-    pushHistory(st.volumeHistory, liters);
-    pushHistory(st.workHistory, st.lastWorkSec);
-    st.pauseMs = constrain(
-      ((cfg.well.targetMinutes * 60.0f) - st.lastWorkSec) * 1000.0f,
-      cfg.common.pauseMinMs,
-      cfg.common.pauseMaxMs
-    );
-    st.wellPauseStart = now;
-    appendLog(st.logsWell, "WELL: stop by L4");
+  if (st.wellMode == WellMode::STARTING && now - st.wellStartAttempt >= wellCtrl::CURRENT_CHECK_DELAY) {
+    if (tm.wellCurrent < wellCtrl::CURRENT_MIN_START) {
+      st.wellRelay = false;
+      st.failedStartCount++;
+      st.wellPauseStart = now;
+      st.wellMode = st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS ? WellMode::FAIL : WellMode::WAIT;
+      if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
+        st.wellBlocked = true;
+        st.wellAlarm = true;
+        appendLog(st.logsWell, "WELL: blocked by failed starts (current)");
+      } else {
+        appendLog(st.logsWell, "WELL: start failed by current");
+      }
+      resetWellRuntimeTimers();
+      return;
+    }
+    st.startCurrentOk = true;
+
+    if (now - st.wellStartAttempt >= wellCtrl::PRESSURE_CHECK_DELAY) {
+      if (tm.wellPressure < wellCtrl::PRESSURE_MIN_OK) {
+        st.wellRelay = false;
+        st.failedStartCount++;
+        st.wellPauseStart = now;
+        st.wellMode = st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS ? WellMode::FAIL : WellMode::WAIT;
+        if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
+          st.wellBlocked = true;
+          st.wellAlarm = true;
+          appendLog(st.logsWell, "WELL: blocked by failed starts (pressure)");
+        } else {
+          appendLog(st.logsWell, "WELL: start failed by pressure");
+        }
+        resetWellRuntimeTimers();
+        return;
+      }
+      st.startPressureOk = true;
+    }
+
+    if (st.startCurrentOk && st.startPressureOk) {
+      st.wellRunStart = now;
+      st.wellMode = WellMode::RUN;
+      st.failedStartCount = 0;
+      appendLog(st.logsWell, "WELL: run");
+    }
+  }
+
+  if (st.wellMode == WellMode::RUN && !st.wellForceMode && tm.levels[1] && tm.levels[3]) {
+    stopWellPump(now, "WELL: stop by L4", PumpIntention::TARGET_REACHED, true);
   }
 }
 
@@ -276,6 +430,13 @@ void runHouseLogic() {
 }
 
 void runProtections(unsigned long now) {
+  st.filterWarning = tm.wellPressure >= wellCtrl::PRESSURE_WARNING;
+  if (tm.wellPressure >= wellCtrl::PRESSURE_BLOCK) {
+    st.pressureBlock = true;
+    st.wellAlarm = true;
+    stopWellPump(now, "WELL: pressure block", st.intention, false);
+  }
+
   if (st.wellRelay) {
     if (tm.wellCurrent >= cfg.well.emergencyCurrent) {
       st.wellBlocked = st.wellAlarm = true;
@@ -298,9 +459,8 @@ void runProtections(unsigned long now) {
       if (!st.wellDryStart) st.wellDryStart = now;
       if (now - st.wellDryStart > cfg.well.dryDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
-        st.wellRelay = false;
         st.wellForceMode = false;
-        appendLog(st.logsWell, "WELL: dry run");
+        stopWellPump(now, "WELL: dry run", PumpIntention::PUMPING_TO_L4, true);
       }
     } else st.wellDryStart = 0;
   }
@@ -345,6 +505,13 @@ String buildJsonState() {
   doc["pause_ms"] = st.pauseMs;
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
+  doc["well_mode"] = (int)st.wellMode;
+  doc["well_intention"] = (int)st.intention;
+  doc["well_need_pump"] = st.needPump;
+  doc["well_target_ok"] = st.targetOk;
+  doc["well_failed_starts"] = st.failedStartCount;
+  doc["filter_warning"] = st.filterWarning;
+  doc["pressure_block"] = st.pressureBlock;
   doc["house_alarm"] = st.houseAlarm;
   doc["well_force"] = st.wellForceMode;
   doc["house_force"] = st.houseForceMode;
@@ -412,6 +579,22 @@ void initWeb() {
 
   server.on("/clear_logs_well", HTTP_POST, []() {
     st.logsWell = "";
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/reset_well", HTTP_POST, []() {
+    st.wellRelay = false;
+    st.wellBlocked = false;
+    st.wellAlarm = false;
+    st.filterWarning = false;
+    st.pressureBlock = false;
+    st.failedStartCount = 0;
+    st.pidInt = 0;
+    st.pidLastE = 0;
+    st.wellMode = WellMode::WAIT;
+    st.pauseMs = cfg.common.pauseMinMs;
+    resetWellTimersFull();
+    appendLog(st.logsWell, "WELL: manual reset");
     server.send(200, "text/plain", "OK");
   });
 
