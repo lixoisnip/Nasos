@@ -10,6 +10,9 @@
 #include <Preferences.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
 
 // -------- Controller enums --------
 enum class PumpIntention : uint8_t {
@@ -208,6 +211,7 @@ constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
 constexpr unsigned long RX_GUARD_MS = 5UL;
 constexpr unsigned long LINK_TIMEOUT_MS = 2000UL;
 constexpr float FREQ_EPS = 0.05f;
+constexpr size_t MAX_FRAME_LEN = 160;
 }
 
 struct Telemetry {
@@ -227,6 +231,7 @@ struct LinkHealth {
   unsigned long crcErrorCount = 0;
   unsigned long totalPackets = 0;
   unsigned long lastRxByteMs = 0;
+  unsigned long rxFrameErrorCount = 0;
 } linkHealth;
 
 bool linkAlive = false;
@@ -689,15 +694,20 @@ uint8_t calcXorChecksum(const String& payload) {
   return checksum;
 }
 
-void parseNanoLine(const String& line) {
-  int starPos = line.lastIndexOf('*');
-  if (starPos <= 0 || starPos + 2 >= (int)line.length()) return;
+uint8_t calcXorChecksum(const char* payload, size_t len) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < len; i++) checksum ^= (uint8_t)payload[i];
+  return checksum;
+}
 
-  String payload = line.substring(0, starPos);
-  String checksumText = line.substring(starPos + 1);
-  checksumText.trim();
-  uint8_t expected = (uint8_t)strtoul(checksumText.c_str(), nullptr, 16);
-  uint8_t actual = calcXorChecksum(payload);
+void parseNanoLine(char* line) {
+  char* star = strrchr(line, '*');
+  if (star == nullptr || star == line || *(star + 1) == '\0') return;
+
+  *star = '\0';
+  char* checksumText = star + 1;
+  uint8_t expected = (uint8_t)strtoul(checksumText, nullptr, 16);
+  uint8_t actual = calcXorChecksum(line, strlen(line));
 
   linkHealth.totalPackets++;
   if (actual != expected) {
@@ -705,16 +715,16 @@ void parseNanoLine(const String& line) {
     return;
   }
 
-  if (!payload.startsWith("TEL,")) return;
+  if (strncmp(line, "TEL,", 4) != 0) return;
 
   float vals[11] = {0};
   int idx = 0;
-  int start = 4;
-  while (idx < 11 && start < (int)payload.length()) {
-    int comma = payload.indexOf(',', start);
-    if (comma < 0) comma = payload.length();
-    vals[idx++] = payload.substring(start, comma).toFloat();
-    start = comma + 1;
+  char* cursor = line + 4;
+  while (idx < 11 && cursor != nullptr && *cursor != '\0') {
+    char* comma = strchr(cursor, ',');
+    if (comma != nullptr) *comma = '\0';
+    vals[idx++] = atof(cursor);
+    cursor = (comma != nullptr) ? (comma + 1) : nullptr;
   }
   if (idx < 11) return;
 
@@ -734,16 +744,34 @@ void parseNanoLine(const String& line) {
 }
 
 void readNanoUart() {
-
-  static String line;
+  static char line[nanoLink::MAX_FRAME_LEN + 1];
+  static size_t idx = 0;
+  static bool droppingFrame = false;
   while (NanoSerial.available()) {
     char c = (char)NanoSerial.read();
     linkHealth.lastRxByteMs = millis();
+
     if (c == '\n') {
-      parseNanoLine(line);
-      line = "";
-    } else if (c != '\r') {
-      line += c;
+      if (!droppingFrame && idx > 0) {
+        line[idx] = '\0';
+        parseNanoLine(line);
+      }
+      idx = 0;
+      droppingFrame = false;
+    } else if (c == '\r') {
+      continue;
+    } else if (!isprint((unsigned char)c)) {
+      continue;
+    } else if (droppingFrame) {
+      continue;
+    } else {
+      if (idx >= nanoLink::MAX_FRAME_LEN) {
+        idx = 0;
+        droppingFrame = true;
+        linkHealth.rxFrameErrorCount++;
+      } else {
+        line[idx++] = c;
+      }
     }
   }
 }
