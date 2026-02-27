@@ -110,6 +110,21 @@ constexpr unsigned long SAVE_INTERVAL_MS = 10UL * 60UL * 1000UL;
 constexpr float SAVE_LITERS_DELTA = 50.0f;
 }
 
+namespace houseCtrl {
+constexpr unsigned long PID_PERIOD = 300UL;
+constexpr float PID_KP = 18.0f;
+constexpr float PID_KI = 2.8f;
+constexpr float INTEGRAL_LIMIT = 6.0f;
+constexpr float FREQ_STEP = 1.5f;
+constexpr unsigned long FREQ_STEP_DELAY = 180UL;
+
+constexpr float PRESSURE_RISE_THRESHOLD = 0.08f;
+constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 8000UL;
+constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 12000UL;
+
+constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
+}
+
 enum class PumpIntention : uint8_t {
   UNKNOWN,
   TARGET_REACHED,
@@ -121,6 +136,13 @@ enum class WellMode : uint8_t {
   STARTING,
   RUN,
   FAIL
+};
+
+enum class HouseMode : uint8_t {
+  WAIT_WATER,
+  READY,
+  RUNNING,
+  STOPPED
 };
 
 // -------- UART to Nano --------
@@ -170,6 +192,15 @@ struct Controller {
   unsigned long wellOverloadStart = 0;
   unsigned long houseDryStart = 0;
   unsigned long houseOverloadStart = 0;
+  unsigned long houseStartAt = 0;
+  unsigned long housePidLastAt = 0;
+  unsigned long houseFreqLastStepAt = 0;
+  unsigned long housePressureDryStartAt = 0;
+  float houseInitialPressure = 0;
+  bool housePressureRiseOk = false;
+  float housePidIntegral = 0;
+  float houseTargetFreq = 28.0f;
+  HouseMode houseMode = HouseMode::WAIT_WATER;
 
   unsigned long lastWorkSec = 0;
   float pauseMs = 0;
@@ -476,11 +507,40 @@ void runHouseLogic() {
   if (!tm.valid || st.houseBlocked) {
     st.vfdRun = false;
     st.vfdFreq = cfg.house.minFreq;
+    st.houseMode = HouseMode::STOPPED;
+    st.housePressureDryStartAt = 0;
+    st.housePidLastAt = 0;
+    st.houseStartAt = 0;
+    st.housePressureRiseOk = false;
     return;
   }
 
-  bool hasWater = tm.levels[0] && tm.levels[1];
-  if (!st.houseForceMode && !hasWater) {
+  bool L1 = tm.levels[0];
+  bool L2 = tm.levels[1];
+  bool fullWater = L1 && L2;
+
+  if (!st.houseForceMode) {
+    if (!L1) {
+      st.houseMode = HouseMode::WAIT_WATER;
+      st.vfdRun = false;
+      st.vfdFreq = cfg.house.minFreq;
+      st.housePressureDryStartAt = 0;
+      st.housePidLastAt = 0;
+      return;
+    }
+
+    if (L1 && !L2) {
+      if (!st.vfdRun) {
+        st.houseMode = HouseMode::READY;
+      }
+    } else {
+      st.houseMode = st.vfdRun ? HouseMode::RUNNING : HouseMode::READY;
+    }
+  } else {
+    st.houseMode = st.vfdRun ? HouseMode::RUNNING : HouseMode::READY;
+  }
+
+  if (!st.houseForceMode && !fullWater && !st.vfdRun) {
     st.vfdRun = false;
     st.vfdFreq = cfg.house.minFreq;
     return;
@@ -491,18 +551,57 @@ void runHouseLogic() {
   } else {
     if (!st.vfdRun && tm.housePressure <= cfg.house.hystOn) {
       st.vfdRun = true;
+      st.houseMode = HouseMode::RUNNING;
+      st.houseStartAt = millis();
+      st.houseInitialPressure = tm.housePressure;
+      st.housePressureRiseOk = false;
+      st.housePressureDryStartAt = 0;
+      st.housePidLastAt = 0;
+      st.houseFreqLastStepAt = 0;
+      st.housePidIntegral = 0;
+      st.houseTargetFreq = cfg.house.minFreq;
       appendLog(st.logsHouse, "HOUSE: start");
     }
     if (st.vfdRun && tm.housePressure >= cfg.house.hystOff) {
       st.vfdRun = false;
+      st.houseMode = HouseMode::READY;
       st.vfdFreq = cfg.house.minFreq;
+      st.housePressureDryStartAt = 0;
+      st.housePidLastAt = 0;
       appendLog(st.logsHouse, "HOUSE: stop by pressure");
     }
   }
 
   if (st.vfdRun) {
-    float error = cfg.house.setpointBar - tm.housePressure;
-    st.vfdFreq = constrain(cfg.house.minFreq + error * 20.0f, cfg.house.minFreq, cfg.house.maxFreq);
+    if (!st.houseStartAt) {
+      st.houseStartAt = millis();
+      st.houseInitialPressure = tm.housePressure;
+      st.housePressureRiseOk = false;
+    }
+
+    unsigned long now = millis();
+    if (!st.housePidLastAt) st.housePidLastAt = now;
+
+    if (now - st.housePidLastAt >= houseCtrl::PID_PERIOD) {
+      float dt = (now - st.housePidLastAt) / 1000.0f;
+      st.housePidLastAt = now;
+      float error = cfg.house.setpointBar - tm.housePressure;
+      st.housePidIntegral += error * dt;
+      st.housePidIntegral = constrain(st.housePidIntegral, -houseCtrl::INTEGRAL_LIMIT, houseCtrl::INTEGRAL_LIMIT);
+      st.houseTargetFreq = cfg.house.minFreq + houseCtrl::PID_KP * error + houseCtrl::PID_KI * st.housePidIntegral;
+      st.houseTargetFreq = constrain(st.houseTargetFreq, cfg.house.minFreq, cfg.house.maxFreq);
+    }
+
+    if (!st.houseFreqLastStepAt || now - st.houseFreqLastStepAt >= houseCtrl::FREQ_STEP_DELAY) {
+      st.houseFreqLastStepAt = now;
+      float delta = st.houseTargetFreq - st.vfdFreq;
+      if (fabs(delta) <= houseCtrl::FREQ_STEP) st.vfdFreq = st.houseTargetFreq;
+      else st.vfdFreq += delta > 0 ? houseCtrl::FREQ_STEP : -houseCtrl::FREQ_STEP;
+      st.vfdFreq = constrain(st.vfdFreq, cfg.house.minFreq, cfg.house.maxFreq);
+    }
+  } else {
+    st.housePidLastAt = 0;
+    st.housePressureDryStartAt = 0;
   }
 }
 
@@ -543,32 +642,68 @@ void runProtections(unsigned long now) {
   }
 
   if (st.vfdRun) {
+    bool ignoreStartCurrent = st.houseStartAt && (now - st.houseStartAt < houseCtrl::START_CURRENT_IGNORE_MS);
+
     if (tm.houseCurrent >= cfg.house.emergencyCurrent) {
       st.houseBlocked = st.houseAlarm = true;
       st.vfdRun = false;
       st.houseForceMode = false;
+      st.houseMode = HouseMode::STOPPED;
       appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
     }
 
-    if (tm.houseCurrent >= cfg.house.overloadCurrent) {
+    if (!ignoreStartCurrent && tm.houseCurrent >= cfg.house.overloadCurrent) {
       if (!st.houseOverloadStart) st.houseOverloadStart = now;
       if (now - st.houseOverloadStart > cfg.house.overloadDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseForceMode = false;
+        st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "HOUSE: overload");
       }
     } else st.houseOverloadStart = 0;
 
-    if (tm.houseCurrent < cfg.house.dryCurrent) {
+    if (!ignoreStartCurrent && tm.houseCurrent < cfg.house.dryCurrent) {
       if (!st.houseDryStart) st.houseDryStart = now;
       if (now - st.houseDryStart > cfg.house.dryDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseForceMode = false;
+        st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "HOUSE: dry run");
       }
     } else st.houseDryStart = 0;
+
+    if (!st.housePressureRiseOk && st.houseStartAt) {
+      if (tm.housePressure > st.houseInitialPressure + houseCtrl::PRESSURE_RISE_THRESHOLD) {
+        st.housePressureRiseOk = true;
+      } else if (now - st.houseStartAt >= houseCtrl::DRY_PRESSURE_START_TIMEOUT) {
+        st.houseBlocked = st.houseAlarm = true;
+        st.vfdRun = false;
+        st.houseForceMode = false;
+        st.houseMode = HouseMode::STOPPED;
+        appendLog(st.logsHouse, "HOUSE: dry start by pressure");
+      }
+    }
+
+    if (tm.housePressure <= cfg.house.hystOn) {
+      if (!st.housePressureDryStartAt) st.housePressureDryStartAt = now;
+      if (now - st.housePressureDryStartAt > houseCtrl::DRY_PRESSURE_WORK_TIMEOUT) {
+        st.houseBlocked = st.houseAlarm = true;
+        st.vfdRun = false;
+        st.houseForceMode = false;
+        st.houseMode = HouseMode::STOPPED;
+        appendLog(st.logsHouse, "HOUSE: dry work by pressure");
+      }
+    } else {
+      st.housePressureDryStartAt = 0;
+    }
+  } else {
+    st.houseOverloadStart = 0;
+    st.houseDryStart = 0;
+    st.housePressureDryStartAt = 0;
+    st.houseStartAt = 0;
+    st.housePressureRiseOk = false;
   }
 }
 
@@ -590,6 +725,7 @@ String buildJsonState() {
   doc["filter_warning"] = st.filterWarning;
   doc["pressure_block"] = st.pressureBlock;
   doc["house_alarm"] = st.houseAlarm;
+  doc["house_mode"] = (int)st.houseMode;
   doc["well_force"] = st.wellForceMode;
   doc["house_force"] = st.houseForceMode;
   doc["well_blocked"] = st.wellBlocked;
