@@ -163,6 +163,12 @@ struct Telemetry {
   bool valid = false;
 } tm;
 
+struct LinkHealth {
+  unsigned long lastValidPacketMs = 0;
+  unsigned long crcErrorCount = 0;
+  unsigned long totalPackets = 0;
+} linkHealth;
+
 struct Settings {
   WellConfig well;
   HouseConfig house;
@@ -386,16 +392,37 @@ void pushHistory(float* arr, float value) {
   arr[19] = value;
 }
 
+uint8_t calcXorChecksum(const String& payload) {
+  uint8_t checksum = 0;
+  for (int i = 0; i < payload.length(); i++) checksum ^= (uint8_t)payload[i];
+  return checksum;
+}
+
 void parseNanoLine(const String& line) {
-  if (!line.startsWith("TEL,")) return;
+  int starPos = line.lastIndexOf('*');
+  if (starPos <= 0 || starPos + 2 >= (int)line.length()) return;
+
+  String payload = line.substring(0, starPos);
+  String checksumText = line.substring(starPos + 1);
+  checksumText.trim();
+  uint8_t expected = (uint8_t)strtoul(checksumText.c_str(), nullptr, 16);
+  uint8_t actual = calcXorChecksum(payload);
+
+  linkHealth.totalPackets++;
+  if (actual != expected) {
+    linkHealth.crcErrorCount++;
+    return;
+  }
+
+  if (!payload.startsWith("TEL,")) return;
 
   float vals[11] = {0};
   int idx = 0;
   int start = 4;
-  while (idx < 11 && start < (int)line.length()) {
-    int comma = line.indexOf(',', start);
-    if (comma < 0) comma = line.length();
-    vals[idx++] = line.substring(start, comma).toFloat();
+  while (idx < 11 && start < (int)payload.length()) {
+    int comma = payload.indexOf(',', start);
+    if (comma < 0) comma = payload.length();
+    vals[idx++] = payload.substring(start, comma).toFloat();
     start = comma + 1;
   }
   if (idx < 11) return;
@@ -412,9 +439,11 @@ void parseNanoLine(const String& line) {
   tm.vfdRunFeedback = vals[9] > 0.5f;
   tm.vfdFreqFeedback = vals[10];
   tm.valid = true;
+  linkHealth.lastValidPacketMs = millis();
 }
 
 void readNanoUart() {
+
   static String line;
   while (NanoSerial.available()) {
     char c = (char)NanoSerial.read();
@@ -733,6 +762,9 @@ String buildJsonState() {
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
+  doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
+  doc["link_crc_errors"] = linkHealth.crcErrorCount;
+  doc["link_total_packets"] = linkHealth.totalPackets;
 
   JsonArray lv = doc.createNestedArray("levels");
   for (int i = 0; i < 4; i++) lv.add(tm.levels[i]);
@@ -898,5 +930,4 @@ void loop() {
   saveWellState();
 
   server.handleClient();
-  delay(20);
 }
