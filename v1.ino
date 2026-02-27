@@ -23,6 +23,17 @@
 #define ESP_TX_PIN        5
 SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
 
+const uint8_t WELL_CURRENT_SAMPLES = 120;
+const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
+const unsigned long LEVEL_FILTER_MS = 2000;
+const int LEVEL_THRESH = 700;
+
+struct LevelFilter {
+  bool stableState = false;
+  bool pendingState = false;
+  unsigned long pendingSince = 0;
+};
+
 struct NanoState {
   float wellCurrent = 0.0f;
   float houseCurrent = 0.0f;
@@ -38,6 +49,10 @@ struct NanoState {
   // Runtime
   float currentZeroOffset = 512.0f;
   unsigned long lastTelemetry = 0;
+  LevelFilter levelFilters[4];
+  float housePressureHistory[HOUSE_PRESSURE_AVG_SAMPLES] = {0};
+  uint8_t housePressureIndex = 0;
+  uint8_t housePressureCount = 0;
 } ns;
 
 void txMode() {
@@ -97,8 +112,14 @@ void initVFD() {
 }
 
 float readWellCurrent() {
-  int raw = analogRead(ACS_PIN);
-  float amps = abs(raw - ns.currentZeroOffset) * (5.0f / 1023.0f) / 0.185f;
+  float sqSum = 0.0f;
+  for (uint8_t i = 0; i < WELL_CURRENT_SAMPLES; i++) {
+    float delta = analogRead(ACS_PIN) - ns.currentZeroOffset;
+    sqSum += delta * delta;
+  }
+
+  float rmsRaw = sqrt(sqSum / WELL_CURRENT_SAMPLES);
+  float amps = rmsRaw * (5.0f / 1023.0f) / 0.066f;
   return amps < 0.10f ? 0.0f : amps;
 }
 
@@ -109,26 +130,59 @@ float readHouseCurrent() {
   return amps < 0.10f ? 0.0f : amps;
 }
 
-float readPressureBar(uint8_t pin) {
-  int raw = analogRead(pin);
+float readWellPressureBar() {
+  int raw = analogRead(PRESSURE_PIN);
   float voltage = raw * 5.0f / 1023.0f;
-  return max(0.0f, (voltage - 0.5f) * 12.0f / 4.0f);
+  return max(0.0f, (voltage - 0.5f) * 12.0f / 5.2f);
 }
 
-bool readLevel(uint8_t pin) {
-  return analogRead(pin) > 500;  // threshold for analog level channels
+float readHousePressureBar() {
+  int raw = analogRead(PIN_PRESSURE);
+  float voltage = raw * 5.0f / 1023.0f;
+  float rawBar = max(0.0f, (voltage - 0.5f) * 12.0f / 4.0f);
+
+  float corrected = rawBar - 0.152f;
+  corrected *= (1.80f / 1.95f);
+  corrected = max(0.0f, corrected);
+
+  ns.housePressureHistory[ns.housePressureIndex] = corrected;
+  ns.housePressureIndex = (ns.housePressureIndex + 1) % HOUSE_PRESSURE_AVG_SAMPLES;
+  if (ns.housePressureCount < HOUSE_PRESSURE_AVG_SAMPLES) ns.housePressureCount++;
+
+  float sum = 0.0f;
+  for (uint8_t i = 0; i < ns.housePressureCount; i++) sum += ns.housePressureHistory[i];
+  return ns.housePressureCount ? (sum / ns.housePressureCount) : corrected;
 }
 
-void readInputs() {
+bool readLevelFiltered(uint8_t idx, uint8_t pin, unsigned long now) {
+  bool measuredState = analogRead(pin) > LEVEL_THRESH;
+  LevelFilter &filter = ns.levelFilters[idx];
+
+  if (measuredState != filter.stableState) {
+    if (measuredState != filter.pendingState) {
+      filter.pendingState = measuredState;
+      filter.pendingSince = now;
+    } else if (now - filter.pendingSince >= LEVEL_FILTER_MS) {
+      filter.stableState = measuredState;
+    }
+  } else {
+    filter.pendingState = filter.stableState;
+    filter.pendingSince = now;
+  }
+
+  return filter.stableState;
+}
+
+void readInputs(unsigned long now) {
   ns.wellCurrent = readWellCurrent();
   ns.houseCurrent = readHouseCurrent();
-  ns.wellPressureBar = readPressureBar(PRESSURE_PIN);
-  ns.housePressureBar = readPressureBar(PIN_PRESSURE);
+  ns.wellPressureBar = readWellPressureBar();
+  ns.housePressureBar = readHousePressureBar();
 
-  ns.levels[0] = readLevel(L1);
-  ns.levels[1] = readLevel(L2);
-  ns.levels[2] = readLevel(L3);
-  ns.levels[3] = readLevel(L4);
+  ns.levels[0] = readLevelFiltered(0, L1, now);
+  ns.levels[1] = readLevelFiltered(1, L2, now);
+  ns.levels[2] = readLevelFiltered(2, L3, now);
+  ns.levels[3] = readLevelFiltered(3, L4, now);
 }
 
 void applyOutputs() {
@@ -224,7 +278,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   processEspUart();
-  readInputs();
+  readInputs(now);
   applyOutputs();
   sendTelemetry(now);
 }
