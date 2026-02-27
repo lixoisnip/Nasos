@@ -5,10 +5,19 @@
 // =====================================================
 
 #include <SoftwareSerial.h>
+#include <avr/wdt.h>
+
+// Set to 1 to enable TFT diagnostics on Nano.
+// Default is 0 to keep firmware size below ATmega328P limit.
+#ifndef NANO_USE_TFT
+#define NANO_USE_TFT 0
+#endif
+
+#if NANO_USE_TFT
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
-#include <avr/wdt.h>
+#endif
 
 // Original project pins (unchanged wiring)
 #define RELAY_WELL        3
@@ -27,7 +36,9 @@
 #define TFT_DC            9
 #define TFT_RST           8
 
+#if NANO_USE_TFT
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
+#endif
 
 #define BLACK   ST77XX_BLACK
 #define WHITE   ST77XX_WHITE
@@ -145,6 +156,7 @@ const char* intentionText(int intention) {
 }
 
 void drawStatic() {
+#if NANO_USE_TFT
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
   tft.setCursor(5, 10);   tft.print("S:");
@@ -171,9 +183,11 @@ void drawStatic() {
 
   tft.setCursor(5, Y5 + 5);    tft.print("FIL:");
   tft.setCursor(120, Y5 + 5);  tft.print("PRO:");
+#endif
 }
 
 void updateDisplay(unsigned long now) {
+#if NANO_USE_TFT
   bool espStatus = useEspDisplayStatus(now);
   bool wellAlarm = espStatus ? ns.wellAlarm : false;
   bool wellBlocked = espStatus ? ns.wellBlocked : false;
@@ -256,9 +270,13 @@ void updateDisplay(unsigned long now) {
   bool protectionOff = wellBlocked || houseBlocked || pressureBlock;
   tft.setTextColor(protectionOff ? RED : GREEN);
   tft.setCursor(150, Y5 + 5); tft.print(protectionOff ? "OFF" : "ON");
+#else
+  (void)now;
+#endif
 }
 
 void handleFlashing(unsigned long now) {
+#if NANO_USE_TFT
   bool espStatus = useEspDisplayStatus(now);
   bool wellAlarm = espStatus ? ns.wellAlarm : false;
   bool houseAlarm = espStatus ? ns.houseAlarm : false;
@@ -278,6 +296,9 @@ void handleFlashing(unsigned long now) {
   tft.setCursor(5, 10); tft.print("S:");
   tft.setCursor(70, 10); tft.print("A:");
   tft.setCursor(135, 10); tft.print("W:");
+#else
+  (void)now;
+#endif
 }
 
 
@@ -514,9 +535,11 @@ void setup() {
   pinMode(PIN_RS485_DE_RE, OUTPUT);
   digitalWrite(PIN_RS485_DE_RE, LOW);
 
+  #if NANO_USE_TFT
   tft.init(240, 320);
   tft.setRotation(2);
   tft.fillScreen(BLACK);
+  #endif
   drawStatic();
 
   long sum = 0;
