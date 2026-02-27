@@ -105,13 +105,8 @@ struct NanoState {
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
 
-  // Display runtime
-  unsigned long lastDisplayUpdate = 0;
-  unsigned long flash = 0;
-  bool flashOn = false;
 } ns;
 
-const unsigned long DISPLAY_UPDATE_MS = 1000;
 const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
 
 const float WELL_CURRENT_DRY = 3.3f;
@@ -154,153 +149,6 @@ const char* intentionText(int intention) {
     default: return "UNKNOWN";
   }
 }
-
-void drawStatic() {
-#if NANO_USE_TFT
-  tft.setTextColor(WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(5, 10);   tft.print("S:");
-  tft.setCursor(70, 10);  tft.print("A:");
-  tft.setCursor(135, 10); tft.print("W:");
-
-  tft.setTextSize(1);
-  for (uint8_t i = 0; i < 4; i++) {
-    int x = 10 + i * 55;
-    tft.drawRoundRect(x, Y2 + 15, 30, 30, 5, GRAY);
-    tft.setCursor(x + 11, Y2 + 25); tft.print(i + 1);
-  }
-
-  tft.setCursor(5, Y3 + 10);   tft.print("I1:");
-  tft.setCursor(5, Y3 + 30);   tft.print("T1:");
-  tft.setCursor(5, Y3 + 50);   tft.print("T2:");
-  tft.setCursor(120, Y3 + 10); tft.print("V1:");
-  tft.setCursor(120, Y3 + 30); tft.print("P1:");
-
-  tft.setCursor(5, Y4 + 10);   tft.print("I2:");
-  tft.setCursor(5, Y4 + 30);   tft.print("H2:");
-  tft.setCursor(5, Y4 + 50);   tft.print("P2:");
-  tft.setCursor(120, Y4 + 10); tft.print("ST2:");
-
-  tft.setCursor(5, Y5 + 5);    tft.print("FIL:");
-  tft.setCursor(120, Y5 + 5);  tft.print("PRO:");
-#endif
-}
-
-void updateDisplay(unsigned long now) {
-#if NANO_USE_TFT
-  bool espStatus = useEspDisplayStatus(now);
-  bool wellAlarm = espStatus ? ns.wellAlarm : false;
-  bool wellBlocked = espStatus ? ns.wellBlocked : false;
-  bool houseAlarm = espStatus ? ns.houseAlarm : false;
-  bool houseBlocked = espStatus ? ns.houseBlocked : false;
-  bool filterWarning = ns.wellPressureBar >= WELL_PRESSURE_WARNING;
-  bool pressureBlock = ns.wellPressureBar >= WELL_PRESSURE_BLOCK;
-
-  tft.fillRect(25, 10, 35, 16, BLACK); tft.setTextSize(2); tft.setTextColor(GREEN); tft.setCursor(25, 10); tft.print("ON");
-  tft.fillRect(90, 10, 35, 16, BLACK); tft.setTextColor((wellAlarm || houseAlarm) ? RED : GREEN); tft.setCursor(90, 10); tft.print((wellAlarm || houseAlarm) ? "Y" : "N");
-  tft.fillRect(155, 10, 35, 16, BLACK); tft.setTextColor(filterWarning ? YELLOW : GREEN); tft.setCursor(155, 10); tft.print(filterWarning ? "Y" : "N");
-
-  for (uint8_t i = 0; i < 4; i++) {
-    int x = 10 + i * 55;
-    tft.fillRoundRect(x, Y2 + 15, 30, 30, 5, ns.levels[i] ? GREEN : GRAY);
-    tft.setTextColor(BLACK); tft.setCursor(x + 11, Y2 + 25); tft.print(i + 1);
-  }
-
-  tft.setTextSize(2);
-  tft.fillRect(25, Y3 + 10, 90, 16, BLACK);
-  tft.setTextColor(ns.wellCurrent > WELL_CURRENT_OVERLOAD ? RED : ns.wellCurrent < WELL_CURRENT_DRY ? YELLOW : WHITE);
-  tft.setCursor(25, Y3 + 10); tft.print(ns.wellCurrent, 1); tft.print("A");
-
-  tft.fillRect(25, Y3 + 30, 90, 16, BLACK);
-  tft.setTextColor(WHITE);
-  tft.setCursor(25, Y3 + 30); tft.print(espStatus ? wellModeText(ns.wellMode) : (ns.relayWellOn ? "RUN" : "WAIT"));
-
-  tft.fillRect(25, Y3 + 50, 90, 16, BLACK);
-  tft.setTextColor(WHITE);
-  tft.setCursor(25, Y3 + 50); tft.print(espStatus ? intentionText(ns.wellIntention) : "LOCAL");
-
-  tft.fillRect(140, Y3 + 10, 80, 16, BLACK);
-  tft.setTextColor(WHITE);
-  tft.setCursor(140, Y3 + 10); tft.print(ns.vfdRun ? "RUN" : "STOP");
-
-  tft.fillRect(140, Y3 + 30, 80, 16, BLACK);
-  tft.setTextColor(filterWarning ? YELLOW : pressureBlock ? RED : WHITE);
-  tft.setCursor(140, Y3 + 30); tft.print(ns.wellPressureBar, 2); tft.print("b");
-
-  tft.setTextSize(2);
-  tft.fillRect(25, Y4 + 10, 70, 16, BLACK);
-  tft.setCursor(25, Y4 + 10);
-  if (ns.houseCurrent >= HOUSE_CURRENT_EMERGENCY) {
-    tft.setTextColor(RED);
-  } else if (ns.houseCurrent < HOUSE_CURRENT_DRY) {
-    tft.setTextColor(YELLOW);
-  } else if (ns.houseCurrent > HOUSE_CURRENT_OVERLOAD) {
-    tft.setTextColor(RED);
-  } else {
-    tft.setTextColor(WHITE);
-  }
-  tft.print(ns.houseCurrent, 1); tft.print("A");
-
-  tft.fillRect(25, Y4 + 30, 70, 16, BLACK);
-  tft.setCursor(25, Y4 + 30);
-  tft.setTextColor(WHITE);
-  tft.print(ns.vfdFreqHz, 1); tft.print("H");
-
-  tft.fillRect(25, Y4 + 50, 70, 16, BLACK);
-  tft.setCursor(25, Y4 + 50);
-  tft.setTextColor(WHITE);
-  tft.print(ns.housePressureBar, 1); tft.print("b");
-
-  tft.fillRect(140, Y4 + 10, 70, 16, BLACK);
-  tft.setCursor(140, Y4 + 10);
-  if (houseBlocked) {
-    tft.setTextColor(RED);
-    tft.print("BLOCK");
-  } else {
-    tft.setTextColor(ns.vfdRun ? GREEN : YELLOW);
-    tft.print(espStatus ? houseModeText(ns.houseMode) : (ns.vfdRun ? "RUN" : "WAIT"));
-  }
-
-  tft.setTextSize(1);
-  tft.fillRect(30, Y5 + 5, 60, 10, BLACK);
-  tft.setTextColor(filterWarning ? YELLOW : GREEN);
-  tft.setCursor(30, Y5 + 5); tft.print(filterWarning ? "BAD" : "OK");
-
-  tft.fillRect(150, Y5 + 5, 60, 10, BLACK);
-  bool protectionOff = wellBlocked || houseBlocked || pressureBlock;
-  tft.setTextColor(protectionOff ? RED : GREEN);
-  tft.setCursor(150, Y5 + 5); tft.print(protectionOff ? "OFF" : "ON");
-#else
-  (void)now;
-#endif
-}
-
-void handleFlashing(unsigned long now) {
-#if NANO_USE_TFT
-  bool espStatus = useEspDisplayStatus(now);
-  bool wellAlarm = espStatus ? ns.wellAlarm : false;
-  bool houseAlarm = espStatus ? ns.houseAlarm : false;
-  bool filterWarning = ns.wellPressureBar >= WELL_PRESSURE_WARNING;
-  bool pressureBlock = ns.wellPressureBar >= WELL_PRESSURE_BLOCK;
-
-  if (!wellAlarm && !houseAlarm && !filterWarning && !pressureBlock) return;
-  if (now - ns.flash < 500) return;
-
-  ns.flash = now;
-  ns.flashOn = !ns.flashOn;
-
-  uint16_t color = pressureBlock ? RED : (filterWarning || houseAlarm) ? YELLOW : RED;
-  tft.fillRect(0, 0, 240, Z1, ns.flashOn ? color : BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(ns.flashOn ? BLACK : WHITE);
-  tft.setCursor(5, 10); tft.print("S:");
-  tft.setCursor(70, 10); tft.print("A:");
-  tft.setCursor(135, 10); tft.print("W:");
-#else
-  (void)now;
-#endif
-}
-
 
 void feedWatchdog() {
   wdt_reset();
@@ -535,13 +383,6 @@ void setup() {
   pinMode(PIN_RS485_DE_RE, OUTPUT);
   digitalWrite(PIN_RS485_DE_RE, LOW);
 
-  #if NANO_USE_TFT
-  tft.init(240, 320);
-  tft.setRotation(2);
-  tft.fillScreen(BLACK);
-  #endif
-  drawStatic();
-
   long sum = 0;
   for (int i = 0; i < 600; i++) {
     sum += analogRead(ACS_PIN);
@@ -567,11 +408,5 @@ void loop() {
   feedWatchdog();
   sendTelemetry(now);
 
-  if (now - ns.lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
-    ns.lastDisplayUpdate = now;
-    updateDisplay(now);
-    feedWatchdog();
-  }
-  handleFlashing(now);
   feedWatchdog();
 }

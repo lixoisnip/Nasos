@@ -224,6 +224,7 @@ struct Settings {
   NetworkConfig network;
 } cfg;
 
+
 struct Controller {
   bool wellRelay = false;
   bool vfdRun = false;
@@ -277,6 +278,90 @@ struct Controller {
   String logsWell;
   String logsHouse;
 } st;
+
+// -------- Optional ESP32 TFT display --------
+#ifndef ESP32_USE_TFT
+#define ESP32_USE_TFT 1
+#endif
+
+#if ESP32_USE_TFT
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+
+constexpr int ESP_TFT_CS = 5;
+constexpr int ESP_TFT_DC = 2;
+constexpr int ESP_TFT_RST = 4;
+Adafruit_ST7789 espTft(ESP_TFT_CS, ESP_TFT_DC, ESP_TFT_RST);
+
+const char* wellModeLabel(WellMode mode) {
+  switch (mode) {
+    case WellMode::WAIT: return "WAIT";
+    case WellMode::STARTING: return "START";
+    case WellMode::RUN: return "RUN";
+    case WellMode::FAIL: return "FAIL";
+  }
+  return "WAIT";
+}
+
+const char* houseModeLabel(HouseMode mode) {
+  switch (mode) {
+    case HouseMode::WAIT_WATER: return "WAIT";
+    case HouseMode::READY: return "READY";
+    case HouseMode::RUNNING: return "RUN";
+    case HouseMode::STOPPED: return "STOP";
+  }
+  return "WAIT";
+}
+
+void initEspDisplay() {
+  espTft.init(240, 320);
+  espTft.setRotation(2);
+  espTft.fillScreen(ST77XX_BLACK);
+  espTft.setTextColor(ST77XX_WHITE);
+  espTft.setTextSize(2);
+  espTft.setCursor(10, 8);
+  espTft.println("ESP32 DISPLAY");
+}
+
+void updateEspDisplay() {
+  espTft.fillRect(0, 40, 240, 280, ST77XX_BLACK);
+  espTft.setTextSize(2);
+  espTft.setTextColor(ST77XX_WHITE);
+
+  espTft.setCursor(10, 45);
+  espTft.printf("Well: %s", wellModeLabel(st.wellMode));
+  espTft.setCursor(10, 70);
+  espTft.printf("I1: %.1fA", tm.wellCurrent);
+  espTft.setCursor(10, 95);
+  espTft.printf("P1: %.2fb", tm.wellPressure);
+
+  espTft.setCursor(10, 130);
+  espTft.printf("House: %s", houseModeLabel(st.houseMode));
+  espTft.setCursor(10, 155);
+  espTft.printf("I2: %.1fA", tm.houseCurrent);
+  espTft.setCursor(10, 180);
+  espTft.printf("P2: %.2fb", tm.housePressure);
+  espTft.setCursor(10, 205);
+  espTft.printf("VFD: %s %.1fHz", st.vfdRun ? "ON" : "OFF", st.vfdFreq);
+
+  espTft.setCursor(10, 240);
+  espTft.printf("L1:%d L2:%d L3:%d L4:%d",
+                tm.levels[0] ? 1 : 0,
+                tm.levels[1] ? 1 : 0,
+                tm.levels[2] ? 1 : 0,
+                tm.levels[3] ? 1 : 0);
+
+  bool alarm = st.wellAlarm || st.houseAlarm || st.wellBlocked || st.houseBlocked || st.pressureBlock;
+  espTft.setTextColor(alarm ? ST77XX_RED : ST77XX_GREEN);
+  espTft.setCursor(10, 270);
+  espTft.printf("ALARM: %s", alarm ? "YES" : "NO");
+}
+#else
+void initEspDisplay() {}
+void updateEspDisplay() {}
+#endif
+
 
 Preferences wellPrefs;
 Preferences settingsPrefs;
@@ -1191,6 +1276,7 @@ void setup() {
   initTaskWatchdog();
   feedTaskWatchdog();
   logResetReason();
+  initEspDisplay();
 
   appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
   appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
@@ -1212,6 +1298,12 @@ void loop() {
   if (now - lastWs > 1000) {
     lastWs = now;
     notifyClients();
+  }
+
+  static unsigned long lastDisplay = 0;
+  if (now - lastDisplay > 500) {
+    lastDisplay = now;
+    updateEspDisplay();
   }
 
   saveWellState();
