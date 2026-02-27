@@ -11,6 +11,27 @@
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 
+// -------- Controller enums --------
+enum class PumpIntention : uint8_t {
+  UNKNOWN,
+  TARGET_REACHED,
+  PUMPING_TO_L4
+};
+
+enum class WellMode : uint8_t {
+  WAIT,
+  STARTING,
+  RUN,
+  FAIL
+};
+
+enum class HouseMode : uint8_t {
+  WAIT_WATER,
+  READY,
+  RUNNING,
+  STOPPED
+};
+
 // -------- Wi-Fi settings --------
 // 1) STA mode: ESP32 connects to your router.
 // 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
@@ -96,14 +117,6 @@ String resetReasonToString(esp_reset_reason_t reason) {
   }
 }
 
-void logResetReason() {
-  const esp_reset_reason_t reason = esp_reset_reason();
-  const String message = "Причина перезапуска: " + resetReasonToString(reason) + " (" + String((int)reason) + ")";
-  appendLog(st.logsWell, message);
-  appendLog(st.logsHouse, message);
-  Serial.println(message);
-}
-
 namespace defaults {
 const WellConfig well = {
   3.3f,
@@ -179,26 +192,6 @@ constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 12000UL;
 
 constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
 }
-
-enum class PumpIntention : uint8_t {
-  UNKNOWN,
-  TARGET_REACHED,
-  PUMPING_TO_L4
-};
-
-enum class WellMode : uint8_t {
-  WAIT,
-  STARTING,
-  RUN,
-  FAIL
-};
-
-enum class HouseMode : uint8_t {
-  WAIT_WATER,
-  READY,
-  RUNNING,
-  STOPPED
-};
 
 // -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
@@ -563,6 +556,14 @@ WebServer server(80);
 void appendLog(String& dst, const String& msg) {
   dst += msg + "\n";
   if (dst.length() > 5000) dst.remove(0, dst.length() - 5000);
+}
+
+void logResetReason() {
+  const esp_reset_reason_t reason = esp_reset_reason();
+  const String message = "Причина перезапуска: " + resetReasonToString(reason) + " (" + String((int)reason) + ")";
+  appendLog(st.logsWell, message);
+  appendLog(st.logsHouse, message);
+  Serial.println(message);
 }
 
 void pushHistory(float* arr, float value) {
