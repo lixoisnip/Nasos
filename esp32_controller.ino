@@ -43,6 +43,9 @@ struct HouseConfig {
 struct CommonConfig {
   float pauseMinMs;
   float pauseMaxMs;
+  unsigned long levelFilterMs;
+  unsigned long initDelayMs;
+  float thresh;
 };
 
 struct NetworkConfig {
@@ -78,7 +81,10 @@ const HouseConfig house = {
 
 const CommonConfig common = {
   10000.0f,
-  90000.0f
+  90000.0f,
+  200UL,
+  3000UL,
+  0.10f
 };
 
 const NetworkConfig network = {
@@ -231,6 +237,7 @@ struct Controller {
 } st;
 
 Preferences wellPrefs;
+Preferences settingsPrefs;
 unsigned long wellStateLastSaveMs = 0;
 float wellStateLastSaveLiters = 0;
 float persistedPauseMs = 0;
@@ -380,6 +387,128 @@ void initConfigFromNamespaces() {
   cfg.network = defaults::network;
 }
 
+
+void saveSettingsToPrefs() {
+  settingsPrefs.putFloat("w_dry_cur", cfg.well.dryCurrent);
+  settingsPrefs.putFloat("w_over_cur", cfg.well.overloadCurrent);
+  settingsPrefs.putFloat("w_em_cur", cfg.well.emergencyCurrent);
+  settingsPrefs.putULong("w_dry_ms", cfg.well.dryDelayMs);
+  settingsPrefs.putULong("w_over_ms", cfg.well.overloadDelayMs);
+  settingsPrefs.putFloat("w_tgt_min", cfg.well.targetMinutes);
+  settingsPrefs.putFloat("w_lpm", cfg.well.litersPerMin);
+
+  settingsPrefs.putFloat("h_set", cfg.house.setpointBar);
+  settingsPrefs.putFloat("h_on", cfg.house.hystOn);
+  settingsPrefs.putFloat("h_off", cfg.house.hystOff);
+  settingsPrefs.putFloat("h_minf", cfg.house.minFreq);
+  settingsPrefs.putFloat("h_maxf", cfg.house.maxFreq);
+  settingsPrefs.putFloat("h_dry_cur", cfg.house.dryCurrent);
+  settingsPrefs.putFloat("h_over_cur", cfg.house.overloadCurrent);
+  settingsPrefs.putFloat("h_em_cur", cfg.house.emergencyCurrent);
+  settingsPrefs.putULong("h_dry_ms", cfg.house.dryDelayMs);
+  settingsPrefs.putULong("h_over_ms", cfg.house.overloadDelayMs);
+
+  settingsPrefs.putFloat("c_pmin", cfg.common.pauseMinMs);
+  settingsPrefs.putFloat("c_pmax", cfg.common.pauseMaxMs);
+  settingsPrefs.putULong("c_lvl_ms", cfg.common.levelFilterMs);
+  settingsPrefs.putULong("c_init_ms", cfg.common.initDelayMs);
+  settingsPrefs.putFloat("c_thresh", cfg.common.thresh);
+}
+
+void loadSettingsFromPrefs() {
+  cfg.well.dryCurrent = settingsPrefs.getFloat("w_dry_cur", cfg.well.dryCurrent);
+  cfg.well.overloadCurrent = settingsPrefs.getFloat("w_over_cur", cfg.well.overloadCurrent);
+  cfg.well.emergencyCurrent = settingsPrefs.getFloat("w_em_cur", cfg.well.emergencyCurrent);
+  cfg.well.dryDelayMs = settingsPrefs.getULong("w_dry_ms", cfg.well.dryDelayMs);
+  cfg.well.overloadDelayMs = settingsPrefs.getULong("w_over_ms", cfg.well.overloadDelayMs);
+  cfg.well.targetMinutes = settingsPrefs.getFloat("w_tgt_min", cfg.well.targetMinutes);
+  cfg.well.litersPerMin = settingsPrefs.getFloat("w_lpm", cfg.well.litersPerMin);
+
+  cfg.house.setpointBar = settingsPrefs.getFloat("h_set", cfg.house.setpointBar);
+  cfg.house.hystOn = settingsPrefs.getFloat("h_on", cfg.house.hystOn);
+  cfg.house.hystOff = settingsPrefs.getFloat("h_off", cfg.house.hystOff);
+  cfg.house.minFreq = settingsPrefs.getFloat("h_minf", cfg.house.minFreq);
+  cfg.house.maxFreq = settingsPrefs.getFloat("h_maxf", cfg.house.maxFreq);
+  cfg.house.dryCurrent = settingsPrefs.getFloat("h_dry_cur", cfg.house.dryCurrent);
+  cfg.house.overloadCurrent = settingsPrefs.getFloat("h_over_cur", cfg.house.overloadCurrent);
+  cfg.house.emergencyCurrent = settingsPrefs.getFloat("h_em_cur", cfg.house.emergencyCurrent);
+  cfg.house.dryDelayMs = settingsPrefs.getULong("h_dry_ms", cfg.house.dryDelayMs);
+  cfg.house.overloadDelayMs = settingsPrefs.getULong("h_over_ms", cfg.house.overloadDelayMs);
+
+  cfg.common.pauseMinMs = settingsPrefs.getFloat("c_pmin", cfg.common.pauseMinMs);
+  cfg.common.pauseMaxMs = settingsPrefs.getFloat("c_pmax", cfg.common.pauseMaxMs);
+  cfg.common.levelFilterMs = settingsPrefs.getULong("c_lvl_ms", cfg.common.levelFilterMs);
+  cfg.common.initDelayMs = settingsPrefs.getULong("c_init_ms", cfg.common.initDelayMs);
+  cfg.common.thresh = settingsPrefs.getFloat("c_thresh", cfg.common.thresh);
+}
+
+bool applySingleSetting(const String& key, float value) {
+  if (key == "SETPOINT_BAR" || key == "cfgHouse.setpointBar") cfg.house.setpointBar = constrain(value, 0.0f, 4.0f);
+  else if (key == "CURRENT_DRY" || key == "cfg.dryCurrent") cfg.well.dryCurrent = constrain(value, 0.0f, 20.0f);
+  else if (key == "cfg.overloadCurrent") cfg.well.overloadCurrent = constrain(value, 0.0f, 30.0f);
+  else if (key == "cfg.emergencyCurrent") cfg.well.emergencyCurrent = constrain(value, 0.0f, 40.0f);
+  else if (key == "cfg.dryDelayMs") cfg.well.dryDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
+  else if (key == "cfg.overloadDelayMs") cfg.well.overloadDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
+  else if (key == "cfg.targetMinutes") cfg.well.targetMinutes = constrain(value, 0.1f, 60.0f);
+  else if (key == "cfg.litersPerMin") cfg.well.litersPerMin = constrain(value, 0.1f, 300.0f);
+
+  else if (key == "cfgHouse.hystOn") cfg.house.hystOn = constrain(value, 0.1f, 4.0f);
+  else if (key == "cfgHouse.hystOff") cfg.house.hystOff = constrain(value, 0.1f, 4.0f);
+  else if (key == "cfgHouse.minFreq") cfg.house.minFreq = constrain(value, 10.0f, 60.0f);
+  else if (key == "cfgHouse.maxFreq") cfg.house.maxFreq = constrain(value, 10.0f, 60.0f);
+  else if (key == "cfgHouse.dryCurrent") cfg.house.dryCurrent = constrain(value, 0.0f, 20.0f);
+  else if (key == "cfgHouse.overloadCurrent") cfg.house.overloadCurrent = constrain(value, 0.0f, 30.0f);
+  else if (key == "cfgHouse.emergencyCurrent") cfg.house.emergencyCurrent = constrain(value, 0.0f, 40.0f);
+  else if (key == "cfgHouse.dryDelayMs") cfg.house.dryDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
+  else if (key == "cfgHouse.overloadDelayMs") cfg.house.overloadDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
+
+  else if (key == "common.pauseMinMs") cfg.common.pauseMinMs = constrain(value, 1000.0f, 300000.0f);
+  else if (key == "common.pauseMaxMs") cfg.common.pauseMaxMs = constrain(value, 1000.0f, 600000.0f);
+  else if (key == "LEVEL_FILTER_MS" || key == "common.LEVEL_FILTER_MS") cfg.common.levelFilterMs = (unsigned long)constrain(value, 0.0f, 30000.0f);
+  else if (key == "INIT_DELAY_MS" || key == "common.INIT_DELAY_MS") cfg.common.initDelayMs = (unsigned long)constrain(value, 0.0f, 60000.0f);
+  else if (key == "THRESH" || key == "common.THRESH") cfg.common.thresh = constrain(value, 0.0f, 5.0f);
+  else return false;
+
+  if (cfg.house.minFreq > cfg.house.maxFreq) cfg.house.maxFreq = cfg.house.minFreq;
+  if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
+  return true;
+}
+
+String buildJsonSettings() {
+  StaticJsonDocument<2048> doc;
+  JsonObject c1 = doc.createNestedObject("cfg");
+  c1["dryCurrent"] = cfg.well.dryCurrent;
+  c1["overloadCurrent"] = cfg.well.overloadCurrent;
+  c1["emergencyCurrent"] = cfg.well.emergencyCurrent;
+  c1["dryDelayMs"] = cfg.well.dryDelayMs;
+  c1["overloadDelayMs"] = cfg.well.overloadDelayMs;
+  c1["targetMinutes"] = cfg.well.targetMinutes;
+  c1["litersPerMin"] = cfg.well.litersPerMin;
+
+  JsonObject c2 = doc.createNestedObject("cfgHouse");
+  c2["setpointBar"] = cfg.house.setpointBar;
+  c2["hystOn"] = cfg.house.hystOn;
+  c2["hystOff"] = cfg.house.hystOff;
+  c2["minFreq"] = cfg.house.minFreq;
+  c2["maxFreq"] = cfg.house.maxFreq;
+  c2["dryCurrent"] = cfg.house.dryCurrent;
+  c2["overloadCurrent"] = cfg.house.overloadCurrent;
+  c2["emergencyCurrent"] = cfg.house.emergencyCurrent;
+  c2["dryDelayMs"] = cfg.house.dryDelayMs;
+  c2["overloadDelayMs"] = cfg.house.overloadDelayMs;
+
+  JsonObject c3 = doc.createNestedObject("common");
+  c3["pauseMinMs"] = cfg.common.pauseMinMs;
+  c3["pauseMaxMs"] = cfg.common.pauseMaxMs;
+  c3["LEVEL_FILTER_MS"] = cfg.common.levelFilterMs;
+  c3["INIT_DELAY_MS"] = cfg.common.initDelayMs;
+  c3["THRESH"] = cfg.common.thresh;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
 WebServer server(80);
 
 void appendLog(String& dst, const String& msg) {
@@ -476,7 +605,7 @@ void runWellLogic(unsigned long now) {
     st.startCurrentOk = false;
     st.startPressureOk = false;
     st.wellMode = WellMode::STARTING;
-    appendLog(st.logsWell, st.wellForceMode ? "WELL: force start" : "WELL: starting");
+    appendLog(st.logsWell, st.wellForceMode ? "Скважина: принудительный запуск" : "Скважина: запуск");
   }
 
   if (st.wellMode == WellMode::STARTING && now - st.wellStartAttempt >= wellCtrl::CURRENT_CHECK_DELAY) {
@@ -489,9 +618,9 @@ void runWellLogic(unsigned long now) {
       if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
         st.wellBlocked = true;
         st.wellAlarm = true;
-        appendLog(st.logsWell, "WELL: blocked by failed starts (current)");
+        appendLog(st.logsWell, "Скважина: блокировка — нет тока после 3 попыток запуска");
       } else {
-        appendLog(st.logsWell, "WELL: start failed by current");
+        appendLog(st.logsWell, "Скважина: неудачный запуск — ток не появился");
       }
       resetWellRuntimeTimers();
       return;
@@ -508,9 +637,9 @@ void runWellLogic(unsigned long now) {
         if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
           st.wellBlocked = true;
           st.wellAlarm = true;
-          appendLog(st.logsWell, "WELL: blocked by failed starts (pressure)");
+          appendLog(st.logsWell, "Скважина: блокировка — давление не выросло после 3 попыток");
         } else {
-          appendLog(st.logsWell, "WELL: start failed by pressure");
+          appendLog(st.logsWell, "Скважина: неудачный запуск — давление не выросло");
         }
         resetWellRuntimeTimers();
         return;
@@ -523,12 +652,12 @@ void runWellLogic(unsigned long now) {
       st.wellMode = WellMode::RUN;
       st.failedStartCount = 0;
       saveWellState();
-      appendLog(st.logsWell, "WELL: run");
+      appendLog(st.logsWell, "Скважина: насос работает");
     }
   }
 
   if (st.wellMode == WellMode::RUN && !st.wellForceMode && tm.levels[1] && tm.levels[3]) {
-    stopWellPump(now, "WELL: stop by L4", PumpIntention::TARGET_REACHED, true);
+    stopWellPump(now, "Скважина: остановка — достигнут верхний уровень L4", PumpIntention::TARGET_REACHED, true);
   }
 }
 
@@ -589,7 +718,7 @@ void runHouseLogic() {
       st.houseFreqLastStepAt = 0;
       st.housePidIntegral = 0;
       st.houseTargetFreq = cfg.house.minFreq;
-      appendLog(st.logsHouse, "HOUSE: start");
+      appendLog(st.logsHouse, "Дом: запуск насоса");
     }
     if (st.vfdRun && tm.housePressure >= cfg.house.hystOff) {
       st.vfdRun = false;
@@ -597,7 +726,7 @@ void runHouseLogic() {
       st.vfdFreq = cfg.house.minFreq;
       st.housePressureDryStartAt = 0;
       st.housePidLastAt = 0;
-      appendLog(st.logsHouse, "HOUSE: stop by pressure");
+      appendLog(st.logsHouse, "Дом: остановка — верхний порог давления достигнут");
     }
   }
 
@@ -639,7 +768,7 @@ void runProtections(unsigned long now) {
   if (tm.wellPressure >= wellCtrl::PRESSURE_BLOCK) {
     st.pressureBlock = true;
     st.wellAlarm = true;
-    stopWellPump(now, "WELL: pressure block", st.intention, false);
+    stopWellPump(now, "Скважина: авария — давление выше порога, работа запрещена", st.intention, false);
   }
 
   if (st.wellRelay) {
@@ -647,7 +776,7 @@ void runProtections(unsigned long now) {
       st.wellBlocked = st.wellAlarm = true;
       st.wellRelay = false;
       st.wellForceMode = false;
-      appendLog(st.logsWell, "WELL: emergency overcurrent");
+      appendLog(st.logsWell, "Скважина: авария — аварийная перегрузка по току");
     }
 
     if (tm.wellCurrent >= cfg.well.overloadCurrent) {
@@ -656,7 +785,7 @@ void runProtections(unsigned long now) {
         st.wellBlocked = st.wellAlarm = true;
         st.wellRelay = false;
         st.wellForceMode = false;
-        appendLog(st.logsWell, "WELL: overload");
+        appendLog(st.logsWell, "Скважина: авария — перегрузка по току");
       }
     } else st.wellOverloadStart = 0;
 
@@ -665,7 +794,7 @@ void runProtections(unsigned long now) {
       if (now - st.wellDryStart > cfg.well.dryDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
         st.wellForceMode = false;
-        stopWellPump(now, "WELL: dry run", PumpIntention::PUMPING_TO_L4, true);
+        stopWellPump(now, "Скважина: сухой ход — ток ниже порога", PumpIntention::PUMPING_TO_L4, true);
       }
     } else st.wellDryStart = 0;
   }
@@ -678,7 +807,7 @@ void runProtections(unsigned long now) {
       st.vfdRun = false;
       st.houseForceMode = false;
       st.houseMode = HouseMode::STOPPED;
-      appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
+      appendLog(st.logsHouse, "Дом: авария — аварийная перегрузка по току");
     }
 
     if (!ignoreStartCurrent && tm.houseCurrent >= cfg.house.overloadCurrent) {
@@ -688,7 +817,7 @@ void runProtections(unsigned long now) {
         st.vfdRun = false;
         st.houseForceMode = false;
         st.houseMode = HouseMode::STOPPED;
-        appendLog(st.logsHouse, "HOUSE: overload");
+        appendLog(st.logsHouse, "Дом: авария — перегрузка по току");
       }
     } else st.houseOverloadStart = 0;
 
@@ -699,7 +828,7 @@ void runProtections(unsigned long now) {
         st.vfdRun = false;
         st.houseForceMode = false;
         st.houseMode = HouseMode::STOPPED;
-        appendLog(st.logsHouse, "HOUSE: dry run");
+        appendLog(st.logsHouse, "Дом: сухой ход — ток ниже порога");
       }
     } else st.houseDryStart = 0;
 
@@ -711,7 +840,7 @@ void runProtections(unsigned long now) {
         st.vfdRun = false;
         st.houseForceMode = false;
         st.houseMode = HouseMode::STOPPED;
-        appendLog(st.logsHouse, "HOUSE: dry start by pressure");
+        appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
       }
     }
 
@@ -722,7 +851,7 @@ void runProtections(unsigned long now) {
         st.vfdRun = false;
         st.houseForceMode = false;
         st.houseMode = HouseMode::STOPPED;
-        appendLog(st.logsHouse, "HOUSE: dry work by pressure");
+        appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 10 с");
       }
     } else {
       st.housePressureDryStartAt = 0;
@@ -810,16 +939,102 @@ void initWeb() {
     server.send(200, "text/plain; charset=utf-8", st.logsHouse);
   });
 
+  server.on("/settings", HTTP_GET, []() {
+    server.send(200, "application/json", buildJsonSettings());
+  });
+
   server.on("/set", HTTP_POST, []() {
-    if (server.hasArg("param") && server.hasArg("value")) {
-      String p = server.arg("param");
-      float v = server.arg("value").toFloat();
-      if (p == "SETPOINT_BAR") cfg.house.setpointBar = constrain(v, 0.0f, 2.0f);
-      // CURRENT_DRY kept for compatibility with UI; can be persisted later.
-      server.send(200, "text/plain", "OK");
+    if (!server.hasArg("param") || !server.hasArg("value")) {
+      server.send(400, "text/plain", "Missing param/value");
       return;
     }
-    server.send(400, "text/plain", "Missing param/value");
+    String p = server.arg("param");
+    float v = server.arg("value").toFloat();
+    if (!applySingleSetting(p, v)) {
+      server.send(400, "text/plain", "Unknown parameter");
+      return;
+    }
+    saveSettingsToPrefs();
+    server.send(200, "application/json", buildJsonSettings());
+  });
+
+  server.on("/settings/save", HTTP_POST, []() {
+    if (!server.hasArg("plain")) {
+      server.send(400, "text/plain", "Missing JSON body");
+      return;
+    }
+
+    StaticJsonDocument<3072> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (err) {
+      server.send(400, "text/plain", "Bad JSON");
+      return;
+    }
+
+    JsonObject cfgWell = doc["cfg"];
+    for (JsonPair kv : cfgWell) applySingleSetting(String("cfg.") + kv.key().c_str(), kv.value().as<float>());
+
+    JsonObject cfgHouse = doc["cfgHouse"];
+    for (JsonPair kv : cfgHouse) applySingleSetting(String("cfgHouse.") + kv.key().c_str(), kv.value().as<float>());
+
+    JsonObject common = doc["common"];
+    for (JsonPair kv : common) applySingleSetting(String("common.") + kv.key().c_str(), kv.value().as<float>());
+
+    saveSettingsToPrefs();
+    server.send(200, "application/json", buildJsonSettings());
+  });
+
+  server.on("/pump_action", HTTP_POST, []() {
+    String pump = server.arg("pump");
+    String action = server.arg("action");
+
+    if (pump == "well") {
+      if (action == "reset_alarm") {
+        st.wellRelay = false;
+        st.wellBlocked = false;
+        st.wellAlarm = false;
+        st.filterWarning = false;
+        st.pressureBlock = false;
+        st.wellForceMode = false;
+        st.wellMode = WellMode::WAIT;
+        resetWellTimersFull();
+        appendLog(st.logsWell, "Скважина: ручной сброс аварии");
+        saveWellState(true);
+      } else if (action == "force_on") {
+        st.wellForceMode = true;
+        appendLog(st.logsWell, "Скважина: включен принудительный режим");
+      } else if (action == "force_off") {
+        st.wellForceMode = false;
+        if (st.wellRelay) stopWellPump(millis(), "Скважина: принудительный режим отключен", st.intention, false);
+      } else {
+        server.send(400, "text/plain", "Unknown action");
+        return;
+      }
+    } else if (pump == "house") {
+      if (action == "reset_alarm") {
+        st.houseBlocked = false;
+        st.houseAlarm = false;
+        st.houseForceMode = false;
+        st.houseMode = HouseMode::READY;
+        appendLog(st.logsHouse, "Дом: ручной сброс аварии");
+      } else if (action == "force_on") {
+        st.houseForceMode = true;
+        appendLog(st.logsHouse, "Дом: включен принудительный режим");
+      } else if (action == "force_off") {
+        st.houseForceMode = false;
+        st.vfdRun = false;
+        st.houseMode = HouseMode::STOPPED;
+        appendLog(st.logsHouse, "Дом: принудительный режим отключен");
+      } else {
+        server.send(400, "text/plain", "Unknown action");
+        return;
+      }
+    } else {
+      server.send(400, "text/plain", "Unknown pump");
+      return;
+    }
+
+    server.send(200, "text/plain", "OK");
   });
 
   server.on("/clear_logs_well", HTTP_POST, []() {
@@ -836,7 +1051,7 @@ void initWeb() {
     st.wellForceMode = false;
     st.wellMode = WellMode::WAIT;
     resetWellTimersFull();
-    appendLog(st.logsWell, "WELL: manual reset alarms/timers");
+    appendLog(st.logsWell, "Скважина: ручной сброс аварии и таймеров");
     saveWellState(true);
     server.send(200, "text/plain", "OK");
   });
@@ -885,11 +1100,11 @@ void initWiFi() {
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
 
   if (WiFi.status() == WL_CONNECTED) {
-    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-    appendLog(st.logsHouse, "Wi-Fi STA connected: " + WiFi.localIP().toString());
+    appendLog(st.logsWell, "Wi-Fi STA подключен: " + WiFi.localIP().toString());
+    appendLog(st.logsHouse, "Wi-Fi STA подключен: " + WiFi.localIP().toString());
   } else {
-    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
-    appendLog(st.logsHouse, "Wi-Fi STA not connected, AP mode still available");
+    appendLog(st.logsWell, "Wi-Fi STA не подключен, доступен режим AP");
+    appendLog(st.logsHouse, "Wi-Fi STA не подключен, доступен режим AP");
   }
   appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
   appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
@@ -901,6 +1116,9 @@ void setup() {
 
   initConfigFromNamespaces();
 
+  settingsPrefs.begin("settings", false);
+  loadSettingsFromPrefs();
+
   wellPrefs.begin(wellCtrl::PREF_NAMESPACE, false);
   loadWellState();
 
@@ -908,8 +1126,8 @@ void setup() {
 
   initWeb();
 
-  appendLog(st.logsWell, "System start: ESP32 controller online");
-  appendLog(st.logsHouse, "System start: ESP32 controller online");
+  appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
+  appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
 }
 
 void loop() {
