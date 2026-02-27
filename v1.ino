@@ -6,6 +6,9 @@
 
 #include <SoftwareSerial.h>
 #include <avr/wdt.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
 
 // Set to 1 to enable TFT diagnostics on Nano.
 // Default is 0 to keep firmware size below ATmega328P limit.
@@ -67,6 +70,7 @@ const uint8_t WELL_CURRENT_SAMPLES = 120;
 const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
 const unsigned long LEVEL_FILTER_MS = 2000;
 const int LEVEL_THRESH = 700;
+const size_t ESP_CMD_MAX_LEN = 160;
 
 struct LevelFilter {
   bool stableState = false;
@@ -104,6 +108,7 @@ struct NanoState {
   bool houseBlocked = false;
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
+  unsigned long uartRxErrorCount = 0;
 
 } ns;
 
@@ -310,42 +315,57 @@ void applyOutputs() {
   }
 }
 
-void handleCommand(String cmd) {
-  cmd.trim();
-  int pos = 0;
-  while (pos < cmd.length()) {
-    int sep = cmd.indexOf(';', pos);
-    if (sep < 0) sep = cmd.length();
-
-    String token = cmd.substring(pos, sep);
-    int eq = token.indexOf('=');
-    if (eq > 0) {
-      String key = token.substring(0, eq);
-      String val = token.substring(eq + 1);
-      if (key == "RELAY") ns.relayWellOn = val.toInt() == 1;
-      if (key == "VFD_RUN") ns.vfdRun = val.toInt() == 1;
-      if (key == "VFD_FREQ") ns.vfdFreqHz = val.toFloat();
-      if (key == "WELL_MODE") { ns.wellMode = val.toInt(); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "WELL_ALARM") { ns.wellAlarm = val.toInt() == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "WELL_BLOCKED") { ns.wellBlocked = val.toInt() == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "WELL_INTENTION") { ns.wellIntention = val.toInt(); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "HOUSE_MODE") { ns.houseMode = val.toInt(); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "HOUSE_ALARM") { ns.houseAlarm = val.toInt() == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (key == "HOUSE_BLOCKED") { ns.houseBlocked = val.toInt() == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+void handleCommand(char* cmd) {
+  char* token = strtok(cmd, ";");
+  while (token != nullptr) {
+    char* eq = strchr(token, '=');
+    if (eq != nullptr && eq != token) {
+      *eq = '\0';
+      const char* key = token;
+      const char* val = eq + 1;
+      if (strcmp(key, "RELAY") == 0) ns.relayWellOn = atoi(val) == 1;
+      if (strcmp(key, "VFD_RUN") == 0) ns.vfdRun = atoi(val) == 1;
+      if (strcmp(key, "VFD_FREQ") == 0) ns.vfdFreqHz = atof(val);
+      if (strcmp(key, "WELL_MODE") == 0) { ns.wellMode = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "WELL_ALARM") == 0) { ns.wellAlarm = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "WELL_BLOCKED") == 0) { ns.wellBlocked = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "WELL_INTENTION") == 0) { ns.wellIntention = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "HOUSE_MODE") == 0) { ns.houseMode = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "HOUSE_ALARM") == 0) { ns.houseAlarm = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+      if (strcmp(key, "HOUSE_BLOCKED") == 0) { ns.houseBlocked = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
     }
-    pos = sep + 1;
+    token = strtok(nullptr, ";");
   }
 }
 
 void processEspUart() {
-  static String line;
+  static char line[ESP_CMD_MAX_LEN + 1];
+  static size_t idx = 0;
+  static bool droppingFrame = false;
   while (espSerial.available()) {
     char c = (char)espSerial.read();
+
     if (c == '\n') {
-      handleCommand(line);
-      line = "";
-    } else if (c != '\r') {
-      line += c;
+      if (!droppingFrame && idx > 0) {
+        line[idx] = '\0';
+        handleCommand(line);
+      }
+      idx = 0;
+      droppingFrame = false;
+    } else if (c == '\r') {
+      continue;
+    } else if (!isprint((unsigned char)c)) {
+      continue;
+    } else if (droppingFrame) {
+      continue;
+    } else {
+      if (idx >= ESP_CMD_MAX_LEN) {
+        idx = 0;
+        droppingFrame = true;
+        ns.uartRxErrorCount++;
+      } else {
+        line[idx++] = c;
+      }
     }
   }
 }
