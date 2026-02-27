@@ -206,6 +206,7 @@ namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
 constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
 constexpr unsigned long RX_GUARD_MS = 5UL;
+constexpr unsigned long LINK_TIMEOUT_MS = 2000UL;
 constexpr float FREQ_EPS = 0.05f;
 }
 
@@ -227,6 +228,8 @@ struct LinkHealth {
   unsigned long totalPackets = 0;
   unsigned long lastRxByteMs = 0;
 } linkHealth;
+
+bool linkAlive = false;
 
 struct NanoCommandPacket {
   bool relay = false;
@@ -1121,6 +1124,7 @@ String buildJsonState() {
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
   doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
+  doc["link_alive"] = linkAlive;
   doc["link_crc_errors"] = linkHealth.crcErrorCount;
   doc["link_total_packets"] = linkHealth.totalPackets;
 
@@ -1367,6 +1371,24 @@ void setup() {
 void loop() {
   feedTaskWatchdog();
   unsigned long now = millis();
+  static bool linkLossLogged = false;
+
+  linkAlive = (now - linkHealth.lastValidPacketMs) < nanoLink::LINK_TIMEOUT_MS;
+  if (!linkAlive) {
+    tm.valid = false;
+    st.wellRelay = false;
+    st.vfdRun = false;
+    st.wellMode = WellMode::FAIL;
+    st.houseMode = HouseMode::STOPPED;
+
+    if (!linkLossLogged) {
+      appendLog(st.logsWell, "Nano link timeout: потеря телеметрии, насосы остановлены");
+      appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
+      linkLossLogged = true;
+    }
+  } else {
+    linkLossLogged = false;
+  }
 
   readNanoUart();
   feedTaskWatchdog();
