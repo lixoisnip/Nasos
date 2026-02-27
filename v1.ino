@@ -55,6 +55,12 @@ struct NanoState {
   uint8_t housePressureCount = 0;
 } ns;
 
+uint8_t calcXorChecksum(const String &payload) {
+  uint8_t checksum = 0;
+  for (int i = 0; i < payload.length(); i++) checksum ^= (uint8_t)payload[i];
+  return checksum;
+}
+
 void txMode() {
   digitalWrite(PIN_RS485_DE_RE, HIGH);
   delayMicroseconds(100);
@@ -236,22 +242,26 @@ void processEspUart() {
 }
 
 void sendTelemetry(unsigned long now) {
-  if (now - ns.lastTelemetry < 250) return;
+  if (now - ns.lastTelemetry < 100) return;
   ns.lastTelemetry = now;
 
-  espSerial.print("TEL,");
-  espSerial.print(now);
-  espSerial.print(','); espSerial.print(ns.wellCurrent, 3);
-  espSerial.print(','); espSerial.print(ns.wellPressureBar, 3);
-  espSerial.print(','); espSerial.print(ns.houseCurrent, 3);
-  espSerial.print(','); espSerial.print(ns.housePressureBar, 3);
-  espSerial.print(','); espSerial.print(ns.levels[0] ? 1 : 0);
-  espSerial.print(','); espSerial.print(ns.levels[1] ? 1 : 0);
-  espSerial.print(','); espSerial.print(ns.levels[2] ? 1 : 0);
-  espSerial.print(','); espSerial.print(ns.levels[3] ? 1 : 0);
-  espSerial.print(','); espSerial.print(ns.vfdRun ? 1 : 0);
-  espSerial.print(','); espSerial.print(ns.vfdFreqHz, 1);
-  espSerial.println();
+  String payload = "TEL,";
+  payload += String(now);
+  payload += ',' + String(ns.wellCurrent, 3);
+  payload += ',' + String(ns.wellPressureBar, 3);
+  payload += ',' + String(ns.houseCurrent, 3);
+  payload += ',' + String(ns.housePressureBar, 3);
+  payload += ',' + String(ns.levels[0] ? 1 : 0);
+  payload += ',' + String(ns.levels[1] ? 1 : 0);
+  payload += ',' + String(ns.levels[2] ? 1 : 0);
+  payload += ',' + String(ns.levels[3] ? 1 : 0);
+  payload += ',' + String(ns.vfdRun ? 1 : 0);
+  payload += ',' + String(ns.vfdFreqHz, 1);
+
+  uint8_t checksum = calcXorChecksum(payload);
+  char frame[180];
+  snprintf(frame, sizeof(frame), "%s*%02X", payload.c_str(), checksum);
+  espSerial.println(frame);
 }
 
 void setup() {
