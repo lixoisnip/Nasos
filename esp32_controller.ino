@@ -8,6 +8,8 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 // -------- Wi-Fi settings --------
 // 1) STA mode: ESP32 connects to your router.
@@ -54,6 +56,53 @@ struct NetworkConfig {
   String apSsid;
   String apPass;
 };
+
+
+namespace watchdogCfg {
+constexpr uint32_t TIMEOUT_S = 10;
+}
+
+void feedTaskWatchdog() {
+  esp_task_wdt_reset();
+}
+
+void initTaskWatchdog() {
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+  const esp_task_wdt_config_t twdtConfig = {
+    .timeout_ms = watchdogCfg::TIMEOUT_S * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&twdtConfig);
+#else
+  esp_task_wdt_init(watchdogCfg::TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
+String resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "Power-on reset";
+    case ESP_RST_EXT: return "External reset";
+    case ESP_RST_SW: return "Software reset";
+    case ESP_RST_PANIC: return "Exception/panic reset";
+    case ESP_RST_INT_WDT: return "Interrupt watchdog reset";
+    case ESP_RST_TASK_WDT: return "Task watchdog reset";
+    case ESP_RST_WDT: return "Other watchdog reset";
+    case ESP_RST_DEEPSLEEP: return "Wakeup from deep sleep";
+    case ESP_RST_BROWNOUT: return "Brownout reset";
+    case ESP_RST_SDIO: return "SDIO reset";
+    default: return "Unknown reset reason";
+  }
+}
+
+void logResetReason() {
+  const esp_reset_reason_t reason = esp_reset_reason();
+  const String message = "Причина перезапуска: " + resetReasonToString(reason) + " (" + String((int)reason) + ")";
+  appendLog(st.logsWell, message);
+  appendLog(st.logsHouse, message);
+  Serial.println(message);
+}
 
 namespace defaults {
 const WellConfig well = {
@@ -1138,18 +1187,25 @@ void setup() {
 
   initWeb();
 
+  initTaskWatchdog();
+  feedTaskWatchdog();
+  logResetReason();
+
   appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
   appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
 }
 
 void loop() {
+  feedTaskWatchdog();
   unsigned long now = millis();
 
   readNanoUart();
+  feedTaskWatchdog();
   runWellLogic(now);
   runHouseLogic();
   runProtections(now);
   sendNanoCommand();
+  feedTaskWatchdog();
 
   static unsigned long lastWs = 0;
   if (now - lastWs > 1000) {
@@ -1160,4 +1216,5 @@ void loop() {
   saveWellState();
 
   server.handleClient();
+  feedTaskWatchdog();
 }
