@@ -586,7 +586,19 @@ void readNanoUart() {
 }
 
 void sendNanoCommand() {
-  NanoSerial.printf("RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f\n", st.wellRelay ? 1 : 0, st.vfdRun ? 1 : 0, st.vfdFreq);
+  NanoSerial.printf(
+    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WELL_MODE=%d;WELL_ALARM=%d;WELL_BLOCKED=%d;WELL_INTENTION=%d;HOUSE_MODE=%d;HOUSE_ALARM=%d;HOUSE_BLOCKED=%d\n",
+    st.wellRelay ? 1 : 0,
+    st.vfdRun ? 1 : 0,
+    st.vfdFreq,
+    (int)st.wellMode,
+    st.wellAlarm ? 1 : 0,
+    st.wellBlocked ? 1 : 0,
+    (int)st.intention,
+    (int)st.houseMode,
+    st.houseAlarm ? 1 : 0,
+    st.houseBlocked ? 1 : 0
+  );
 }
 
 void runWellLogic(unsigned long now) {
