@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 // -------- Wi-Fi settings --------
 // 1) STA mode: ESP32 connects to your router.
@@ -104,6 +105,9 @@ constexpr float PID_BOOST_ERROR = 2.0f;
 constexpr float PID_BOOST_FACTOR = 2.5f;
 constexpr float PID_INT_MIN = -40.0f;
 constexpr float PID_INT_MAX = 40.0f;
+constexpr const char* PREF_NAMESPACE = "well_state";
+constexpr unsigned long SAVE_INTERVAL_MS = 10UL * 60UL * 1000UL;
+constexpr float SAVE_LITERS_DELTA = 50.0f;
 }
 
 enum class PumpIntention : uint8_t {
@@ -189,6 +193,75 @@ struct Controller {
   String logsHouse;
 } st;
 
+Preferences wellPrefs;
+unsigned long wellStateLastSaveMs = 0;
+float wellStateLastSaveLiters = 0;
+float persistedPauseMs = 0;
+int persistedFailedStartCount = 0;
+PumpIntention persistedIntention = PumpIntention::UNKNOWN;
+
+bool floatChanged(float a, float b, float eps = 0.01f) {
+  return fabs(a - b) > eps;
+}
+
+void saveWellState(bool force = false) {
+  bool changed = force;
+
+  if (floatChanged(st.pauseMs, persistedPauseMs)) {
+    persistedPauseMs = st.pauseMs;
+    changed = true;
+  }
+
+  if (st.failedStartCount != persistedFailedStartCount) {
+    persistedFailedStartCount = st.failedStartCount;
+    changed = true;
+  }
+
+  if (st.intention != persistedIntention) {
+    persistedIntention = st.intention;
+    changed = true;
+  }
+
+  bool litersDeltaReached = fabs(st.totalLiters - wellStateLastSaveLiters) >= wellCtrl::SAVE_LITERS_DELTA;
+  bool intervalReached = millis() - wellStateLastSaveMs >= wellCtrl::SAVE_INTERVAL_MS;
+  bool shouldSaveTotalLiters = force || litersDeltaReached || intervalReached;
+
+  if (!changed && !shouldSaveTotalLiters) return;
+
+  wellPrefs.putFloat("total_liters", st.totalLiters);
+  wellPrefs.putFloat("pause_ms", st.pauseMs);
+  wellPrefs.putInt("failed_starts", st.failedStartCount);
+  wellPrefs.putUChar("intention", static_cast<uint8_t>(st.intention));
+
+  wellStateLastSaveMs = millis();
+  wellStateLastSaveLiters = st.totalLiters;
+}
+
+void loadWellState() {
+  st.totalLiters = wellPrefs.getFloat("total_liters", 0.0f);
+
+  float storedPause = wellPrefs.getFloat("pause_ms", cfg.common.pauseMinMs);
+  if (storedPause < cfg.common.pauseMinMs || storedPause > cfg.common.pauseMaxMs) {
+    storedPause = cfg.common.pauseMinMs;
+  }
+  st.pauseMs = storedPause;
+
+  int storedFailedStarts = wellPrefs.getInt("failed_starts", 0);
+  st.failedStartCount = constrain(storedFailedStarts, 0, wellCtrl::MAX_FAILED_STARTS);
+
+  uint8_t storedIntention = wellPrefs.getUChar("intention", static_cast<uint8_t>(PumpIntention::UNKNOWN));
+  if (storedIntention > static_cast<uint8_t>(PumpIntention::PUMPING_TO_L4)) {
+    storedIntention = static_cast<uint8_t>(PumpIntention::UNKNOWN);
+  }
+  st.intention = static_cast<PumpIntention>(storedIntention);
+
+  persistedPauseMs = st.pauseMs;
+  persistedFailedStartCount = st.failedStartCount;
+  persistedIntention = st.intention;
+  wellStateLastSaveLiters = st.totalLiters;
+  wellStateLastSaveMs = millis();
+}
+
 void resetWellRuntimeTimers() {
   st.wellRunStart = 0;
   st.wellStartAttempt = 0;
@@ -260,6 +333,7 @@ void stopWellPump(unsigned long now, const String& reason, PumpIntention nextInt
   st.wellMode = st.wellBlocked || st.pressureBlock ? WellMode::FAIL : WellMode::WAIT;
   resetWellRuntimeTimers();
   appendLog(st.logsWell, reason);
+  saveWellState();
 }
 
 void initConfigFromNamespaces() {
@@ -349,6 +423,7 @@ void runWellLogic(unsigned long now) {
     if (tm.wellCurrent < wellCtrl::CURRENT_MIN_START) {
       st.wellRelay = false;
       st.failedStartCount++;
+      saveWellState();
       st.wellPauseStart = now;
       st.wellMode = st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS ? WellMode::FAIL : WellMode::WAIT;
       if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
@@ -367,6 +442,7 @@ void runWellLogic(unsigned long now) {
       if (tm.wellPressure < wellCtrl::PRESSURE_MIN_OK) {
         st.wellRelay = false;
         st.failedStartCount++;
+        saveWellState();
         st.wellPauseStart = now;
         st.wellMode = st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS ? WellMode::FAIL : WellMode::WAIT;
         if (st.failedStartCount >= wellCtrl::MAX_FAILED_STARTS) {
@@ -386,6 +462,7 @@ void runWellLogic(unsigned long now) {
       st.wellRunStart = now;
       st.wellMode = WellMode::RUN;
       st.failedStartCount = 0;
+      saveWellState();
       appendLog(st.logsWell, "WELL: run");
     }
   }
@@ -588,13 +665,11 @@ void initWeb() {
     st.wellAlarm = false;
     st.filterWarning = false;
     st.pressureBlock = false;
-    st.failedStartCount = 0;
-    st.pidInt = 0;
-    st.pidLastE = 0;
+    st.wellForceMode = false;
     st.wellMode = WellMode::WAIT;
-    st.pauseMs = cfg.common.pauseMinMs;
     resetWellTimersFull();
-    appendLog(st.logsWell, "WELL: manual reset");
+    appendLog(st.logsWell, "WELL: manual reset alarms/timers");
+    saveWellState(true);
     server.send(200, "text/plain", "OK");
   });
 
@@ -658,6 +733,9 @@ void setup() {
 
   initConfigFromNamespaces();
 
+  wellPrefs.begin(wellCtrl::PREF_NAMESPACE, false);
+  loadWellState();
+
   initWiFi();
 
   initWeb();
@@ -680,6 +758,8 @@ void loop() {
     lastWs = now;
     notifyClients();
   }
+
+  saveWellState();
 
   server.handleClient();
   delay(20);
