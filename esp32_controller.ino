@@ -16,6 +16,78 @@ const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID = "Nasos-ESP32";
 const char* AP_PASS = "12345678";  // min 8 chars for WPA2
 
+struct WellConfig {
+  float dryCurrent;
+  float overloadCurrent;
+  float emergencyCurrent;
+  unsigned long dryDelayMs;
+  unsigned long overloadDelayMs;
+  float targetMinutes;
+  float litersPerMin;
+};
+
+struct HouseConfig {
+  float setpointBar;
+  float hystOn;
+  float hystOff;
+  float minFreq;
+  float maxFreq;
+  float dryCurrent;
+  float overloadCurrent;
+  float emergencyCurrent;
+  unsigned long dryDelayMs;
+  unsigned long overloadDelayMs;
+};
+
+struct CommonConfig {
+  float pauseMinMs;
+  float pauseMaxMs;
+};
+
+struct NetworkConfig {
+  String wifiSsid;
+  String wifiPass;
+  String apSsid;
+  String apPass;
+};
+
+namespace defaults {
+const WellConfig well = {
+  3.3f,
+  4.3f,
+  6.0f,
+  8000UL,
+  5000UL,
+  5.0f,
+  30.0f
+};
+
+const HouseConfig house = {
+  1.0f,
+  0.50f,
+  1.18f,
+  28.0f,
+  50.0f,
+  0.4f,
+  1.3f,
+  1.5f,
+  8000UL,
+  5000UL
+};
+
+const CommonConfig common = {
+  10000.0f,
+  90000.0f
+};
+
+const NetworkConfig network = {
+  WIFI_SSID,
+  WIFI_PASS,
+  AP_SSID,
+  AP_PASS
+};
+}
+
 // -------- UART to Nano --------
 HardwareSerial NanoSerial(2);
 constexpr int NANO_RX_PIN = 16;
@@ -35,42 +107,10 @@ struct Telemetry {
 } tm;
 
 struct Settings {
-  // Well pump
-  float wellDryCurrent = 3.3f;
-  float wellOverloadCurrent = 4.3f;
-  float wellEmergencyCurrent = 6.0f;
-  unsigned long wellDryDelayMs = 8000UL;
-  unsigned long wellOverloadDelayMs = 5000UL;
-  float targetMinutes = 5.0f;
-  float litersPerMin = 30.0f;
-
-  // House pump
-  float setpointBar = 1.0f;
-  float houseHystOn = 0.50f;
-  float houseHystOff = 1.18f;
-  float houseMinFreq = 28.0f;
-  float houseMaxFreq = 50.0f;
-  float houseDryCurrent = 0.4f;
-  float houseOverloadCurrent = 1.3f;
-  float houseEmergencyCurrent = 1.5f;
-  unsigned long houseDryDelayMs = 8000UL;
-  unsigned long houseOverloadDelayMs = 5000UL;
-
-  // Sensor ranges (for calibration/display settings)
-  float wellPressureMinBar = 0.0f;
-  float wellPressureMaxBar = 12.0f;
-  float housePressureMinBar = 0.0f;
-  float housePressureMaxBar = 12.0f;
-  float wellCurrentMinA = 0.0f;
-  float wellCurrentMaxA = 10.0f;
-  float houseCurrentMinA = 0.0f;
-  float houseCurrentMaxA = 10.0f;
-
-  // Wi-Fi
-  String wifiSsid = WIFI_SSID_DEFAULT;
-  String wifiPass = WIFI_PASS_DEFAULT;
-  String apSsid = AP_SSID_DEFAULT;
-  String apPass = AP_PASS_DEFAULT;
+  WellConfig well;
+  HouseConfig house;
+  CommonConfig common;
+  NetworkConfig network;
 } cfg;
 
 struct Controller {
@@ -103,6 +143,13 @@ struct Controller {
   String logsWell;
   String logsHouse;
 } st;
+
+void initConfigFromNamespaces() {
+  cfg.well = defaults::well;
+  cfg.house = defaults::house;
+  cfg.common = defaults::common;
+  cfg.network = defaults::network;
+}
 
 WebServer server(80);
 
@@ -180,11 +227,15 @@ void runWellLogic(unsigned long now) {
   if (st.wellRelay && !st.wellForceMode && tm.levels[3]) {
     st.wellRelay = false;
     st.lastWorkSec = (now - st.wellRunStart) / 1000UL;
-    float liters = st.lastWorkSec * (cfg.litersPerMin / 60.0f);
+    float liters = st.lastWorkSec * (cfg.well.litersPerMin / 60.0f);
     st.totalLiters += liters;
     pushHistory(st.volumeHistory, liters);
     pushHistory(st.workHistory, st.lastWorkSec);
-    st.pauseMs = constrain(((cfg.targetMinutes * 60.0f) - st.lastWorkSec) * 1000.0f, 10000.0f, 90000.0f);
+    st.pauseMs = constrain(
+      ((cfg.well.targetMinutes * 60.0f) - st.lastWorkSec) * 1000.0f,
+      cfg.common.pauseMinMs,
+      cfg.common.pauseMaxMs
+    );
     st.wellPauseStart = now;
     appendLog(st.logsWell, "WELL: stop by L4");
   }
@@ -193,49 +244,49 @@ void runWellLogic(unsigned long now) {
 void runHouseLogic() {
   if (!tm.valid || st.houseBlocked) {
     st.vfdRun = false;
-    st.vfdFreq = cfg.houseMinFreq;
+    st.vfdFreq = cfg.house.minFreq;
     return;
   }
 
   bool hasWater = tm.levels[0] && tm.levels[1];
   if (!st.houseForceMode && !hasWater) {
     st.vfdRun = false;
-    st.vfdFreq = cfg.houseMinFreq;
+    st.vfdFreq = cfg.house.minFreq;
     return;
   }
 
   if (st.houseForceMode) {
     st.vfdRun = true;
   } else {
-    if (!st.vfdRun && tm.housePressure <= cfg.houseHystOn) {
+    if (!st.vfdRun && tm.housePressure <= cfg.house.hystOn) {
       st.vfdRun = true;
       appendLog(st.logsHouse, "HOUSE: start");
     }
-    if (st.vfdRun && tm.housePressure >= cfg.houseHystOff) {
+    if (st.vfdRun && tm.housePressure >= cfg.house.hystOff) {
       st.vfdRun = false;
-      st.vfdFreq = cfg.houseMinFreq;
+      st.vfdFreq = cfg.house.minFreq;
       appendLog(st.logsHouse, "HOUSE: stop by pressure");
     }
   }
 
   if (st.vfdRun) {
-    float error = cfg.setpointBar - tm.housePressure;
-    st.vfdFreq = constrain(cfg.houseMinFreq + error * 20.0f, cfg.houseMinFreq, cfg.houseMaxFreq);
+    float error = cfg.house.setpointBar - tm.housePressure;
+    st.vfdFreq = constrain(cfg.house.minFreq + error * 20.0f, cfg.house.minFreq, cfg.house.maxFreq);
   }
 }
 
 void runProtections(unsigned long now) {
   if (st.wellRelay) {
-    if (tm.wellCurrent >= cfg.wellEmergencyCurrent) {
+    if (tm.wellCurrent >= cfg.well.emergencyCurrent) {
       st.wellBlocked = st.wellAlarm = true;
       st.wellRelay = false;
       st.wellForceMode = false;
       appendLog(st.logsWell, "WELL: emergency overcurrent");
     }
 
-    if (tm.wellCurrent >= cfg.wellOverloadCurrent) {
+    if (tm.wellCurrent >= cfg.well.overloadCurrent) {
       if (!st.wellOverloadStart) st.wellOverloadStart = now;
-      if (now - st.wellOverloadStart > cfg.wellOverloadDelayMs) {
+      if (now - st.wellOverloadStart > cfg.well.overloadDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
         st.wellRelay = false;
         st.wellForceMode = false;
@@ -243,9 +294,9 @@ void runProtections(unsigned long now) {
       }
     } else st.wellOverloadStart = 0;
 
-    if (tm.wellCurrent < cfg.wellDryCurrent) {
+    if (tm.wellCurrent < cfg.well.dryCurrent) {
       if (!st.wellDryStart) st.wellDryStart = now;
-      if (now - st.wellDryStart > cfg.wellDryDelayMs) {
+      if (now - st.wellDryStart > cfg.well.dryDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
         st.wellRelay = false;
         st.wellForceMode = false;
@@ -255,16 +306,16 @@ void runProtections(unsigned long now) {
   }
 
   if (st.vfdRun) {
-    if (tm.houseCurrent >= cfg.houseEmergencyCurrent) {
+    if (tm.houseCurrent >= cfg.house.emergencyCurrent) {
       st.houseBlocked = st.houseAlarm = true;
       st.vfdRun = false;
       st.houseForceMode = false;
       appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
     }
 
-    if (tm.houseCurrent >= cfg.houseOverloadCurrent) {
+    if (tm.houseCurrent >= cfg.house.overloadCurrent) {
       if (!st.houseOverloadStart) st.houseOverloadStart = now;
-      if (now - st.houseOverloadStart > cfg.houseOverloadDelayMs) {
+      if (now - st.houseOverloadStart > cfg.house.overloadDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseForceMode = false;
@@ -272,9 +323,9 @@ void runProtections(unsigned long now) {
       }
     } else st.houseOverloadStart = 0;
 
-    if (tm.houseCurrent < cfg.houseDryCurrent) {
+    if (tm.houseCurrent < cfg.house.dryCurrent) {
       if (!st.houseDryStart) st.houseDryStart = now;
-      if (now - st.houseDryStart > cfg.houseDryDelayMs) {
+      if (now - st.houseDryStart > cfg.house.dryDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseForceMode = false;
@@ -351,7 +402,7 @@ void initWeb() {
     if (server.hasArg("param") && server.hasArg("value")) {
       String p = server.arg("param");
       float v = server.arg("value").toFloat();
-      if (p == "SETPOINT_BAR") st.setpointBar = constrain(v, 0.0f, 2.0f);
+      if (p == "SETPOINT_BAR") cfg.house.setpointBar = constrain(v, 0.0f, 2.0f);
       // CURRENT_DRY kept for compatibility with UI; can be persisted later.
       server.send(200, "text/plain", "OK");
       return;
@@ -401,9 +452,9 @@ void initWeb() {
 
 void initWiFi() {
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP(cfg.network.apSsid.c_str(), cfg.network.apPass.c_str());
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(cfg.network.wifiSsid.c_str(), cfg.network.wifiPass.c_str());
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
 
@@ -421,6 +472,8 @@ void initWiFi() {
 void setup() {
   Serial.begin(115200);
   NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+
+  initConfigFromNamespaces();
 
   initWiFi();
 
