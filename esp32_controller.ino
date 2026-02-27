@@ -197,7 +197,17 @@ constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
 HardwareSerial NanoSerial(2);
 constexpr int NANO_RX_PIN = 16;
 constexpr int NANO_TX_PIN = 17;
-constexpr uint32_t NANO_BAUD = 38400;
+// Для SoftwareSerial на Nano 19200 бод заметно стабильнее при двустороннем обмене.
+// Если останутся ошибки/потери, на Nano лучше перейти на NeoSWSerial/AltSoftSerial.
+// ВАЖНО: на стороне Nano должна быть такая же скорость UART.
+constexpr uint32_t NANO_BAUD = 19200;
+
+namespace nanoLink {
+constexpr unsigned long CMD_PERIOD_MS = 80UL;
+constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
+constexpr unsigned long RX_GUARD_MS = 5UL;
+constexpr float FREQ_EPS = 0.05f;
+}
 
 struct Telemetry {
   unsigned long ts = 0;
@@ -215,7 +225,21 @@ struct LinkHealth {
   unsigned long lastValidPacketMs = 0;
   unsigned long crcErrorCount = 0;
   unsigned long totalPackets = 0;
+  unsigned long lastRxByteMs = 0;
 } linkHealth;
+
+struct NanoCommandPacket {
+  bool relay = false;
+  bool vfdRun = false;
+  float vfdFreq = 0;
+  uint8_t wellMode = 0;
+  bool wellAlarm = false;
+  bool wellBlocked = false;
+  uint8_t wellIntention = 0;
+  uint8_t houseMode = 0;
+  bool houseAlarm = false;
+  bool houseBlocked = false;
+};
 
 struct Settings {
   WellConfig well;
@@ -711,6 +735,7 @@ void readNanoUart() {
   static String line;
   while (NanoSerial.available()) {
     char c = (char)NanoSerial.read();
+    linkHealth.lastRxByteMs = millis();
     if (c == '\n') {
       parseNanoLine(line);
       line = "";
@@ -720,20 +745,77 @@ void readNanoUart() {
   }
 }
 
-void sendNanoCommand() {
+NanoCommandPacket buildNanoCommandPacket() {
+  NanoCommandPacket packet;
+  packet.relay = st.wellRelay;
+  packet.vfdRun = st.vfdRun;
+  packet.vfdFreq = st.vfdFreq;
+  packet.wellMode = (uint8_t)st.wellMode;
+  packet.wellAlarm = st.wellAlarm;
+  packet.wellBlocked = st.wellBlocked;
+  packet.wellIntention = (uint8_t)st.intention;
+  packet.houseMode = (uint8_t)st.houseMode;
+  packet.houseAlarm = st.houseAlarm;
+  packet.houseBlocked = st.houseBlocked;
+  return packet;
+}
+
+bool nanoPacketChanged(const NanoCommandPacket& a, const NanoCommandPacket& b) {
+  return a.relay != b.relay ||
+         a.vfdRun != b.vfdRun ||
+         fabsf(a.vfdFreq - b.vfdFreq) > nanoLink::FREQ_EPS ||
+         a.wellMode != b.wellMode ||
+         a.wellAlarm != b.wellAlarm ||
+         a.wellBlocked != b.wellBlocked ||
+         a.wellIntention != b.wellIntention ||
+         a.houseMode != b.houseMode ||
+         a.houseAlarm != b.houseAlarm ||
+         a.houseBlocked != b.houseBlocked;
+}
+
+void sendNanoControlPacket(const NanoCommandPacket& packet) {
   NanoSerial.printf(
     "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WELL_MODE=%d;WELL_ALARM=%d;WELL_BLOCKED=%d;WELL_INTENTION=%d;HOUSE_MODE=%d;HOUSE_ALARM=%d;HOUSE_BLOCKED=%d\n",
-    st.wellRelay ? 1 : 0,
-    st.vfdRun ? 1 : 0,
-    st.vfdFreq,
-    (int)st.wellMode,
-    st.wellAlarm ? 1 : 0,
-    st.wellBlocked ? 1 : 0,
-    (int)st.intention,
-    (int)st.houseMode,
-    st.houseAlarm ? 1 : 0,
-    st.houseBlocked ? 1 : 0
+    packet.relay ? 1 : 0,
+    packet.vfdRun ? 1 : 0,
+    packet.vfdFreq,
+    (int)packet.wellMode,
+    packet.wellAlarm ? 1 : 0,
+    packet.wellBlocked ? 1 : 0,
+    (int)packet.wellIntention,
+    (int)packet.houseMode,
+    packet.houseAlarm ? 1 : 0,
+    packet.houseBlocked ? 1 : 0
   );
+}
+
+void sendNanoHeartbeat(unsigned long now) {
+  NanoSerial.printf("HB=%lu\n", now);
+}
+
+void serviceNanoTx(unsigned long now) {
+  static unsigned long lastControlTxMs = 0;
+  static unsigned long lastHeartbeatTxMs = 0;
+  static bool hasLastPacket = false;
+  static NanoCommandPacket lastPacket;
+
+  const bool rxBusy = (now - linkHealth.lastRxByteMs) < nanoLink::RX_GUARD_MS;
+  if (rxBusy) return;
+
+  if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
+    NanoCommandPacket current = buildNanoCommandPacket();
+    if (!hasLastPacket || nanoPacketChanged(current, lastPacket)) {
+      sendNanoControlPacket(current);
+      lastPacket = current;
+      hasLastPacket = true;
+    }
+    lastControlTxMs = now;
+  }
+
+  if (now - lastHeartbeatTxMs >= nanoLink::HEARTBEAT_PERIOD_MS) {
+    sendNanoHeartbeat(now);
+    lastHeartbeatTxMs = now;
+  }
 }
 
 void runWellLogic(unsigned long now) {
@@ -1291,7 +1373,7 @@ void loop() {
   runWellLogic(now);
   runHouseLogic();
   runProtections(now);
-  sendNanoCommand();
+  serviceNanoTx(now);
   feedTaskWatchdog();
 
   static unsigned long lastWs = 0;
