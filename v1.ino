@@ -8,6 +8,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
+#include <avr/wdt.h>
 
 // Original project pins (unchanged wiring)
 #define RELAY_WELL        3
@@ -279,6 +280,11 @@ void handleFlashing(unsigned long now) {
   tft.setCursor(135, 10); tft.print("W:");
 }
 
+
+void feedWatchdog() {
+  wdt_reset();
+}
+
 uint8_t calcXorChecksum(const String &payload) {
   uint8_t checksum = 0;
   for (int i = 0; i < payload.length(); i++) checksum ^= (uint8_t)payload[i];
@@ -307,6 +313,7 @@ uint16_t calculateCRC(uint8_t *data, uint8_t length) {
 }
 
 void writeReg(uint16_t addr, uint16_t val) {
+  feedWatchdog();
   uint8_t frame[8];
   frame[0] = 0x08;
   frame[1] = 0x06;
@@ -324,6 +331,7 @@ void writeReg(uint16_t addr, uint16_t val) {
   Serial.flush();
   rxMode();
   delay(20);
+  feedWatchdog();
 }
 
 void vfdStart() { writeReg(0x9CA7, 0x0001); }
@@ -335,9 +343,10 @@ void setFrequency(float hz) {
 }
 
 void initVFD() {
-  writeReg(0x9C41, 0x0002); delay(150);
-  writeReg(0x9C40, 0x0005); delay(150);
-  writeReg(0x9CA6, 0x0000); delay(150);
+  feedWatchdog();
+  writeReg(0x9C41, 0x0002); delay(150); feedWatchdog();
+  writeReg(0x9C40, 0x0005); delay(150); feedWatchdog();
+  writeReg(0x9CA6, 0x0000); delay(150); feedWatchdog();
   vfdStop();
 }
 
@@ -513,24 +522,33 @@ void setup() {
   long sum = 0;
   for (int i = 0; i < 600; i++) {
     sum += analogRead(ACS_PIN);
+    if ((i % 50) == 0) feedWatchdog();
     delay(2);
   }
   ns.currentZeroOffset = sum / 600.0f;
   if (ns.currentZeroOffset < 400 || ns.currentZeroOffset > 600) ns.currentZeroOffset = 512.0f;
 
   initVFD();
+
+  wdt_enable(WDTO_4S);
+  feedWatchdog();
 }
 
 void loop() {
+  feedWatchdog();
   unsigned long now = millis();
   processEspUart();
+  feedWatchdog();
   readInputs(now);
   applyOutputs();
+  feedWatchdog();
   sendTelemetry(now);
 
   if (now - ns.lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
     ns.lastDisplayUpdate = now;
     updateDisplay(now);
+    feedWatchdog();
   }
   handleFlashing(now);
+  feedWatchdog();
 }
