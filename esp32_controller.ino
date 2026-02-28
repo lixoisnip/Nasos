@@ -35,6 +35,12 @@ enum class HouseMode : uint8_t {
   STOPPED
 };
 
+enum class ManualMode : uint8_t {
+  AUTO,
+  FORCE_ON,
+  FORCE_OFF
+};
+
 // -------- Wi-Fi settings --------
 // 1) STA mode: ESP32 connects to your router.
 // 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
@@ -268,8 +274,8 @@ struct Controller {
   bool houseBlocked = false;
   bool houseAlarm = false;
 
-  bool wellForceMode = false;
-  bool houseForceMode = false;
+  ManualMode wellManualMode = ManualMode::AUTO;
+  ManualMode houseManualMode = ManualMode::AUTO;
 
   unsigned long wellRunStart = 0;
   unsigned long wellPauseStart = 0;
@@ -335,6 +341,15 @@ const char* wellModeLabel(WellMode mode) {
   return "WAIT";
 }
 
+const char* manualModeLabel(ManualMode mode) {
+  switch (mode) {
+    case ManualMode::AUTO: return "AUTO";
+    case ManualMode::FORCE_ON: return "FORCE ON";
+    case ManualMode::FORCE_OFF: return "FORCE OFF";
+  }
+  return "AUTO";
+}
+
 const char* houseModeLabel(HouseMode mode) {
   switch (mode) {
     case HouseMode::WAIT_WATER: return "WAIT";
@@ -355,38 +370,37 @@ void initEspDisplay() {
   espTft.println("ESP32 DISPLAY");
 }
 
+void drawDisplayLine(int y, const String& text, uint16_t color) {
+  static String prev[10];
+  static uint16_t prevColor[10] = {0};
+  int idx = y / 25;
+  if (idx < 0 || idx >= 10) return;
+  if (prev[idx] == text && prevColor[idx] == color) return;
+
+  espTft.fillRect(0, y, 240, 24, ST77XX_BLACK);
+  espTft.setCursor(10, y + 2);
+  espTft.setTextColor(color);
+  espTft.print(text);
+
+  prev[idx] = text;
+  prevColor[idx] = color;
+}
+
 void updateEspDisplay() {
-  espTft.fillRect(0, 40, 240, 280, ST77XX_BLACK);
   espTft.setTextSize(2);
-  espTft.setTextColor(ST77XX_WHITE);
+  drawDisplayLine(40, String("Well: ") + wellModeLabel(st.wellMode) + " " + manualModeLabel(st.wellManualMode), ST77XX_WHITE);
+  drawDisplayLine(65, String("I1: ") + String(tm.wellCurrent, 1) + "A", ST77XX_WHITE);
+  drawDisplayLine(90, String("P1: ") + String(tm.wellPressure, 2) + "b", ST77XX_WHITE);
 
-  espTft.setCursor(10, 45);
-  espTft.printf("Well: %s", wellModeLabel(st.wellMode));
-  espTft.setCursor(10, 70);
-  espTft.printf("I1: %.1fA", tm.wellCurrent);
-  espTft.setCursor(10, 95);
-  espTft.printf("P1: %.2fb", tm.wellPressure);
+  drawDisplayLine(125, String("House: ") + houseModeLabel(st.houseMode) + " " + manualModeLabel(st.houseManualMode), ST77XX_WHITE);
+  drawDisplayLine(150, String("I2: ") + String(tm.houseCurrent, 1) + "A", ST77XX_WHITE);
+  drawDisplayLine(175, String("P2: ") + String(tm.housePressure, 2) + "b", ST77XX_WHITE);
+  drawDisplayLine(200, String("VFD: ") + (st.vfdRun ? "ON " : "OFF ") + String(st.vfdFreq, 1) + "Hz", ST77XX_WHITE);
 
-  espTft.setCursor(10, 130);
-  espTft.printf("House: %s", houseModeLabel(st.houseMode));
-  espTft.setCursor(10, 155);
-  espTft.printf("I2: %.1fA", tm.houseCurrent);
-  espTft.setCursor(10, 180);
-  espTft.printf("P2: %.2fb", tm.housePressure);
-  espTft.setCursor(10, 205);
-  espTft.printf("VFD: %s %.1fHz", st.vfdRun ? "ON" : "OFF", st.vfdFreq);
-
-  espTft.setCursor(10, 240);
-  espTft.printf("L1:%d L2:%d L3:%d L4:%d",
-                tm.levels[0] ? 1 : 0,
-                tm.levels[1] ? 1 : 0,
-                tm.levels[2] ? 1 : 0,
-                tm.levels[3] ? 1 : 0);
+  drawDisplayLine(235, String("L1:") + (tm.levels[0] ? 1 : 0) + " L2:" + (tm.levels[1] ? 1 : 0) + " L3:" + (tm.levels[2] ? 1 : 0) + " L4:" + (tm.levels[3] ? 1 : 0), ST77XX_WHITE);
 
   bool alarm = st.wellAlarm || st.houseAlarm || st.wellBlocked || st.houseBlocked || st.pressureBlock;
-  espTft.setTextColor(alarm ? ST77XX_RED : ST77XX_GREEN);
-  espTft.setCursor(10, 270);
-  espTft.printf("ALARM: %s", alarm ? "YES" : "NO");
+  drawDisplayLine(260, String("ALARM: ") + (alarm ? "YES" : "NO"), alarm ? ST77XX_RED : ST77XX_GREEN);
 }
 #else
 void initEspDisplay() {}
@@ -571,6 +585,11 @@ void saveSettingsToPrefs() {
   settingsPrefs.putULong("c_lvl_ms", cfg.common.levelFilterMs);
   settingsPrefs.putULong("c_init_ms", cfg.common.initDelayMs);
   settingsPrefs.putFloat("c_thresh", cfg.common.thresh);
+
+  settingsPrefs.putString("n_sta_ssid", cfg.network.wifiSsid);
+  settingsPrefs.putString("n_sta_pass", cfg.network.wifiPass);
+  settingsPrefs.putString("n_ap_ssid", cfg.network.apSsid);
+  settingsPrefs.putString("n_ap_pass", cfg.network.apPass);
 }
 
 void loadSettingsFromPrefs() {
@@ -598,6 +617,11 @@ void loadSettingsFromPrefs() {
   cfg.common.levelFilterMs = settingsPrefs.getULong("c_lvl_ms", cfg.common.levelFilterMs);
   cfg.common.initDelayMs = settingsPrefs.getULong("c_init_ms", cfg.common.initDelayMs);
   cfg.common.thresh = settingsPrefs.getFloat("c_thresh", cfg.common.thresh);
+
+  cfg.network.wifiSsid = settingsPrefs.getString("n_sta_ssid", cfg.network.wifiSsid);
+  cfg.network.wifiPass = settingsPrefs.getString("n_sta_pass", cfg.network.wifiPass);
+  cfg.network.apSsid = settingsPrefs.getString("n_ap_ssid", cfg.network.apSsid);
+  cfg.network.apPass = settingsPrefs.getString("n_ap_pass", cfg.network.apPass);
 }
 
 bool applySingleSetting(const String& key, float value) {
@@ -661,6 +685,12 @@ String buildJsonSettings() {
   c3["LEVEL_FILTER_MS"] = cfg.common.levelFilterMs;
   c3["INIT_DELAY_MS"] = cfg.common.initDelayMs;
   c3["THRESH"] = cfg.common.thresh;
+
+  JsonObject net = doc.createNestedObject("network");
+  net["wifiSsid"] = cfg.network.wifiSsid;
+  net["wifiPass"] = cfg.network.wifiPass;
+  net["apSsid"] = cfg.network.apSsid;
+  net["apPass"] = cfg.network.apPass;
 
   String out;
   serializeJson(doc, out);
@@ -856,7 +886,9 @@ void runWellLogic(unsigned long now) {
   }
 
   updateWellPumpNeed();
-  bool needPump = st.wellForceMode || st.needPump;
+  bool forceOn = st.wellManualMode == ManualMode::FORCE_ON;
+  bool forceOff = st.wellManualMode == ManualMode::FORCE_OFF;
+  bool needPump = forceOn || (!forceOff && st.needPump);
 
   if (st.wellMode == WellMode::WAIT && needPump && !st.wellRelay && (now - st.wellPauseStart >= (unsigned long)st.pauseMs)) {
     st.wellRelay = true;
@@ -864,7 +896,7 @@ void runWellLogic(unsigned long now) {
     st.startCurrentOk = false;
     st.startPressureOk = false;
     st.wellMode = WellMode::STARTING;
-    appendLog(st.logsWell, st.wellForceMode ? "Скважина: принудительный запуск" : "Скважина: запуск");
+    appendLog(st.logsWell, forceOn ? "Скважина: принудительный запуск" : "Скважина: запуск");
   }
 
   if (st.wellMode == WellMode::STARTING && now - st.wellStartAttempt >= wellCtrl::CURRENT_CHECK_DELAY) {
@@ -915,7 +947,7 @@ void runWellLogic(unsigned long now) {
     }
   }
 
-  if (st.wellMode == WellMode::RUN && !st.wellForceMode && tm.levels[1] && tm.levels[3]) {
+  if (st.wellMode == WellMode::RUN && st.wellManualMode != ManualMode::FORCE_ON && tm.levels[1] && tm.levels[3]) {
     stopWellPump(now, "Скважина: остановка — достигнут верхний уровень L4", PumpIntention::TARGET_REACHED, true);
   }
 }
@@ -936,7 +968,7 @@ void runHouseLogic() {
   bool L2 = tm.levels[1];
   bool fullWater = L1 && L2;
 
-  if (!st.houseForceMode) {
+  if (st.houseManualMode != ManualMode::FORCE_ON) {
     if (!L1) {
       st.houseMode = HouseMode::WAIT_WATER;
       st.vfdRun = false;
@@ -957,13 +989,22 @@ void runHouseLogic() {
     st.houseMode = st.vfdRun ? HouseMode::RUNNING : HouseMode::READY;
   }
 
-  if (!st.houseForceMode && !fullWater && !st.vfdRun) {
+  if (st.houseManualMode != ManualMode::FORCE_ON && !fullWater && !st.vfdRun) {
     st.vfdRun = false;
     st.vfdFreq = cfg.house.minFreq;
     return;
   }
 
-  if (st.houseForceMode) {
+  if (st.houseManualMode == ManualMode::FORCE_OFF) {
+    st.vfdRun = false;
+    st.vfdFreq = cfg.house.minFreq;
+    st.houseMode = HouseMode::STOPPED;
+    st.housePressureDryStartAt = 0;
+    st.housePidLastAt = 0;
+    return;
+  }
+
+  if (st.houseManualMode == ManualMode::FORCE_ON) {
     st.vfdRun = true;
   } else {
     if (!st.vfdRun && tm.housePressure <= cfg.house.hystOn) {
@@ -1034,7 +1075,7 @@ void runProtections(unsigned long now) {
     if (tm.wellCurrent >= cfg.well.emergencyCurrent) {
       st.wellBlocked = st.wellAlarm = true;
       st.wellRelay = false;
-      st.wellForceMode = false;
+      st.wellManualMode = ManualMode::AUTO;
       appendLog(st.logsWell, "Скважина: авария — аварийная перегрузка по току");
     }
 
@@ -1043,7 +1084,7 @@ void runProtections(unsigned long now) {
       if (now - st.wellOverloadStart > cfg.well.overloadDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
         st.wellRelay = false;
-        st.wellForceMode = false;
+        st.wellManualMode = ManualMode::AUTO;
         appendLog(st.logsWell, "Скважина: авария — перегрузка по току");
       }
     } else st.wellOverloadStart = 0;
@@ -1052,7 +1093,7 @@ void runProtections(unsigned long now) {
       if (!st.wellDryStart) st.wellDryStart = now;
       if (now - st.wellDryStart > cfg.well.dryDelayMs) {
         st.wellBlocked = st.wellAlarm = true;
-        st.wellForceMode = false;
+        st.wellManualMode = ManualMode::AUTO;
         stopWellPump(now, "Скважина: сухой ход — ток ниже порога", PumpIntention::PUMPING_TO_L4, true);
       }
     } else st.wellDryStart = 0;
@@ -1064,7 +1105,7 @@ void runProtections(unsigned long now) {
     if (tm.houseCurrent >= cfg.house.emergencyCurrent) {
       st.houseBlocked = st.houseAlarm = true;
       st.vfdRun = false;
-      st.houseForceMode = false;
+      st.houseManualMode = ManualMode::AUTO;
       st.houseMode = HouseMode::STOPPED;
       appendLog(st.logsHouse, "Дом: авария — аварийная перегрузка по току");
     }
@@ -1074,7 +1115,7 @@ void runProtections(unsigned long now) {
       if (now - st.houseOverloadStart > cfg.house.overloadDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "Дом: авария — перегрузка по току");
       }
@@ -1085,7 +1126,7 @@ void runProtections(unsigned long now) {
       if (now - st.houseDryStart > cfg.house.dryDelayMs) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "Дом: сухой ход — ток ниже порога");
       }
@@ -1097,7 +1138,7 @@ void runProtections(unsigned long now) {
       } else if (now - st.houseStartAt >= houseCtrl::DRY_PRESSURE_START_TIMEOUT) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
       }
@@ -1108,7 +1149,7 @@ void runProtections(unsigned long now) {
       if (now - st.housePressureDryStartAt > houseCtrl::DRY_PRESSURE_WORK_TIMEOUT) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::STOPPED;
         appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 10 с");
       }
@@ -1143,8 +1184,10 @@ String buildJsonState() {
   doc["pressure_block"] = st.pressureBlock;
   doc["house_alarm"] = st.houseAlarm;
   doc["house_mode"] = (int)st.houseMode;
-  doc["well_force"] = st.wellForceMode;
-  doc["house_force"] = st.houseForceMode;
+  doc["well_force"] = st.wellManualMode == ManualMode::FORCE_ON;
+  doc["house_force"] = st.houseManualMode == ManualMode::FORCE_ON;
+  doc["well_manual_mode"] = (int)st.wellManualMode;
+  doc["house_manual_mode"] = (int)st.houseManualMode;
   doc["well_blocked"] = st.wellBlocked;
   doc["house_blocked"] = st.houseBlocked;
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
@@ -1241,6 +1284,14 @@ void initWeb() {
     JsonObject common = doc["common"];
     for (JsonPair kv : common) applySingleSetting(String("common.") + kv.key().c_str(), kv.value().as<float>());
 
+    JsonObject network = doc["network"];
+    if (!network.isNull()) {
+      if (network.containsKey("wifiSsid")) cfg.network.wifiSsid = String((const char*)network["wifiSsid"]);
+      if (network.containsKey("wifiPass")) cfg.network.wifiPass = String((const char*)network["wifiPass"]);
+      if (network.containsKey("apSsid")) cfg.network.apSsid = String((const char*)network["apSsid"]);
+      if (network.containsKey("apPass")) cfg.network.apPass = String((const char*)network["apPass"]);
+    }
+
     saveSettingsToPrefs();
     server.send(200, "application/json", buildJsonSettings());
   });
@@ -1251,22 +1302,29 @@ void initWeb() {
 
     if (pump == "well") {
       if (action == "reset_alarm") {
-        st.wellRelay = false;
         st.wellBlocked = false;
         st.wellAlarm = false;
-        st.filterWarning = false;
         st.pressureBlock = false;
-        st.wellForceMode = false;
+        st.wellManualMode = ManualMode::AUTO;
         st.wellMode = WellMode::WAIT;
         resetWellTimersFull();
         appendLog(st.logsWell, "Скважина: ручной сброс аварии");
         saveWellState(true);
       } else if (action == "force_on") {
-        st.wellForceMode = true;
-        appendLog(st.logsWell, "Скважина: включен принудительный режим");
+        st.wellManualMode = ManualMode::FORCE_ON;
+        if (st.wellBlocked || st.pressureBlock) {
+          appendLog(st.logsWell, "Скважина: принудительный запуск отклонен — активна аварийная блокировка");
+        } else {
+          st.wellPauseStart = 0;
+          appendLog(st.logsWell, "Скважина: включен принудительный режим");
+        }
       } else if (action == "force_off") {
-        st.wellForceMode = false;
-        if (st.wellRelay) stopWellPump(millis(), "Скважина: принудительный режим отключен", st.intention, false);
+        st.wellManualMode = ManualMode::FORCE_OFF;
+        if (st.wellRelay) stopWellPump(millis(), "Скважина: принудительно выключен", st.intention, false);
+        appendLog(st.logsWell, "Скважина: установлен принудительный ВЫКЛ");
+      } else if (action == "auto") {
+        st.wellManualMode = ManualMode::AUTO;
+        appendLog(st.logsWell, "Скважина: возвращен автоматический режим");
       } else {
         server.send(400, "text/plain", "Unknown action");
         return;
@@ -1275,17 +1333,20 @@ void initWeb() {
       if (action == "reset_alarm") {
         st.houseBlocked = false;
         st.houseAlarm = false;
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::READY;
         appendLog(st.logsHouse, "Дом: ручной сброс аварии");
       } else if (action == "force_on") {
-        st.houseForceMode = true;
+        st.houseManualMode = ManualMode::FORCE_ON;
         appendLog(st.logsHouse, "Дом: включен принудительный режим");
       } else if (action == "force_off") {
-        st.houseForceMode = false;
+        st.houseManualMode = ManualMode::FORCE_OFF;
         st.vfdRun = false;
         st.houseMode = HouseMode::STOPPED;
-        appendLog(st.logsHouse, "Дом: принудительный режим отключен");
+        appendLog(st.logsHouse, "Дом: установлен принудительный ВЫКЛ");
+      } else if (action == "auto") {
+        st.houseManualMode = ManualMode::AUTO;
+        appendLog(st.logsHouse, "Дом: возвращен автоматический режим");
       } else {
         server.send(400, "text/plain", "Unknown action");
         return;
@@ -1309,7 +1370,7 @@ void initWeb() {
     st.wellAlarm = false;
     st.filterWarning = false;
     st.pressureBlock = false;
-    st.wellForceMode = false;
+    st.wellManualMode = ManualMode::AUTO;
     st.wellMode = WellMode::WAIT;
     resetWellTimersFull();
     appendLog(st.logsWell, "Скважина: ручной сброс аварии и таймеров");
