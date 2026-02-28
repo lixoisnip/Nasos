@@ -215,7 +215,7 @@ constexpr int NANO_TX_PIN = 17;
 // Для SoftwareSerial на Nano 19200 бод заметно стабильнее при двустороннем обмене.
 // Если останутся ошибки/потери, на Nano лучше перейти на NeoSWSerial/AltSoftSerial.
 // ВАЖНО: на стороне Nano должна быть такая же скорость UART.
-constexpr uint32_t NANO_BAUD = 19200;
+constexpr uint32_t NANO_BAUD = 19200;  // MUST match on both sides
 
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;

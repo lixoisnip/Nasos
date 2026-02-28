@@ -395,7 +395,7 @@ void sendTelemetry(unsigned long now) {
 
 void setup() {
   Serial.begin(9600);      // RS485 VFD
-  espSerial.begin(38400);  // link to ESP32
+  espSerial.begin(19200);  // link to ESP32 // MUST match on both sides
 
   pinMode(RELAY_WELL, OUTPUT);
   digitalWrite(RELAY_WELL, HIGH);
