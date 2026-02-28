@@ -84,6 +84,7 @@
           <p>Давление: <b id="house_pressure">0 bar</b></p>
           <p>Авария: <b id="house_alarm">Нет</b></p>
           <p>Принудительный режим: <b id="house_force">OFF</b></p>
+          <p>Режим автомата: <b id="house_mode_detail">—</b></p>
           <div class="d-flex gap-2 flex-wrap">
             <button class="btn btn-warning btn-sm" onclick="pumpAction('house','reset_alarm')">Сброс аварии</button>
             <button class="btn btn-success btn-sm" onclick="pumpAction('house','force_on')">Принудительно ВКЛ</button>
@@ -171,6 +172,20 @@
     return 'Авто';
   }
 
+
+  function houseModeLabel(mode) {
+    switch (Number(mode)) {
+      case 0: return 'Ожидание воды';
+      case 1: return 'Запуск';
+      case 2: return 'Готов';
+      case 3: return 'Работа';
+      case 4: return 'Остановка';
+      case 5: return 'Остановлен';
+      case 6: return 'Авария';
+      default: return 'Неизвестно';
+    }
+  }
+
   function applyPumpState(cardId, labelId, status, cssClass, blinking) {
     const card = document.getElementById(cardId);
     card.classList.remove('pump-auto', 'pump-run-auto', 'pump-wait', 'pump-force-on', 'pump-force-off', 'pump-alarm', 'blink');
@@ -195,7 +210,9 @@
     document.getElementById('house_force').innerText = forceLabel(houseManual);
 
     const wellInRun = Number(data.well_mode) === 2;
-    const houseInRun = Number(data.house_mode) === 2 && (data.house_force || (data.house_pressure || 0) > 0);
+    const houseMode = Number(data.house_mode ?? 0);
+    const houseInRun = houseMode === 3;
+    document.getElementById('house_mode_detail').innerText = houseModeLabel(houseMode);
 
     if (data.well_alarm || data.well_blocked || data.pressure_block) {
       applyPumpState('wellCard', 'well_status', 'Авария', 'pump-alarm', true);
@@ -209,16 +226,19 @@
       applyPumpState('wellCard', 'well_status', 'Ждёт', 'pump-auto', false);
     }
 
-    if (data.house_alarm || data.house_blocked) {
+    if (data.house_alarm || data.house_blocked || houseMode === 6) {
       applyPumpState('houseCard', 'house_status', 'Авария', 'pump-alarm', true);
     } else if (houseManual === 1) {
-      applyPumpState('houseCard', 'house_status', 'В работе', 'pump-force-on', false);
+      const manualStatus = houseMode === 1 ? 'Принудительный запуск' : 'Принудительно включен';
+      applyPumpState('houseCard', 'house_status', manualStatus, 'pump-force-on', false);
     } else if (houseManual === 2) {
       applyPumpState('houseCard', 'house_status', 'Отключен', 'pump-force-off', false);
     } else if (houseInRun) {
       applyPumpState('houseCard', 'house_status', 'В работе авт.', 'pump-run-auto', false);
+    } else if (houseMode === 1 || houseMode === 4 || houseMode === 5 || houseMode === 0) {
+      applyPumpState('houseCard', 'house_status', houseModeLabel(houseMode), 'pump-wait', false);
     } else {
-      applyPumpState('houseCard', 'house_status', 'Ждёт', 'pump-auto', false);
+      applyPumpState('houseCard', 'house_status', 'Готов', 'pump-auto', false);
     }
 
     for (let i = 0; i < 4; i++) {
