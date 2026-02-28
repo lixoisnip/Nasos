@@ -81,6 +81,18 @@ struct NetworkConfig {
   String apPass;
 };
 
+struct NanoCommandPacket {
+  bool relay = false;
+  bool vfdRun = false;
+  float vfdFreq = 0;
+  uint8_t wellMode = 0;
+  bool wellAlarm = false;
+  bool wellBlocked = false;
+  uint8_t wellIntention = 0;
+  uint8_t houseMode = 0;
+  bool houseAlarm = false;
+  bool houseBlocked = false;
+};
 
 namespace watchdogCfg {
 constexpr uint32_t TIMEOUT_S = 10;
@@ -235,19 +247,6 @@ struct LinkHealth {
 } linkHealth;
 
 bool linkAlive = false;
-
-struct NanoCommandPacket {
-  bool relay = false;
-  bool vfdRun = false;
-  float vfdFreq = 0;
-  uint8_t wellMode = 0;
-  bool wellAlarm = false;
-  bool wellBlocked = false;
-  uint8_t wellIntention = 0;
-  uint8_t houseMode = 0;
-  bool houseAlarm = false;
-  bool houseBlocked = false;
-};
 
 struct Settings {
   WellConfig well;
