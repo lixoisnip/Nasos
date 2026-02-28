@@ -24,9 +24,13 @@
 
 ## Подключение Nano ↔ ESP32
 
-- `Nano D5 (TX SoftwareSerial)` → `ESP32 GPIO16 (RX2)`
-- `Nano D4 (RX SoftwareSerial)` ← `ESP32 GPIO17 (TX2)`
+- `Nano D5 (TX, 5V логика)` → **понижение уровня до 3.3V** → `ESP32 GPIO16 (RX2)`
+  - Вариант 1: готовый `level shifter` 5V→3.3V.
+  - Вариант 2: резистивный делитель (например, `10k/20k`).
+- `Nano D4 (RX SoftwareSerial)` ← `ESP32 GPIO17 (TX2, 3.3V)` — можно подключать напрямую.
 - `GND Nano` ↔ `GND ESP32`
+
+> ⚠️ **Важно:** входы ESP32 не 5V-tolerant. Не подавайте 5V сигнал с Nano TX напрямую на `GPIO16 (RX2)`, иначе возможны ошибки связи и риск повреждения входа ESP32.
 
 ## API ESP32
 

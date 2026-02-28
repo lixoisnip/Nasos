@@ -1153,6 +1153,7 @@ String buildJsonState() {
   doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
   doc["link_alive"] = linkAlive;
   doc["link_crc_errors"] = linkHealth.crcErrorCount;
+  doc["link_rx_frame_errors"] = linkHealth.rxFrameErrorCount;
   doc["link_total_packets"] = linkHealth.totalPackets;
 
   JsonArray lv = doc.createNestedArray("levels");
