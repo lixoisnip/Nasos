@@ -16,6 +16,16 @@
     .small-note { font-size: .85rem; color: #6c757d; }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
+    .pump-card { transition: background-color .25s ease; }
+    .pump-state { font-weight: 700; }
+    .pump-auto { background: #ffffff; }
+    .pump-run-auto { background: #d8ecff; }
+    .pump-wait { background: #fff6db; }
+    .pump-force-on { background: #d1f7d6; }
+    .pump-force-off { background: #ffd5d5; }
+    .pump-alarm { background: #ffb3b3; }
+    .blink { animation: alarm-blink 1s step-start infinite; }
+    @keyframes alarm-blink { 50% { opacity: .35; } }
   </style>
 </head>
 <body>
@@ -49,8 +59,8 @@
       </div>
 
       <div class="col-12 col-lg-4">
-        <div class="card p-3 h-100">
-          <h5>Скважинный насос</h5>
+        <div class="card p-3 h-100 pump-card" id="wellCard">
+          <h5>Скважинный насос — <span class="pump-state" id="well_status">Ждёт</span></h5>
           <p>Ток: <b id="well_current">0 A</b></p>
           <p>Давление: <b id="well_pressure">0 bar</b></p>
           <p>Работа: <b id="last_work_sec">0 s</b></p>
@@ -61,14 +71,15 @@
           <div class="d-flex gap-2 flex-wrap">
             <button class="btn btn-warning btn-sm" onclick="pumpAction('well','reset_alarm')">Сброс аварии</button>
             <button class="btn btn-success btn-sm" onclick="pumpAction('well','force_on')">Принудительно ВКЛ</button>
-            <button class="btn btn-secondary btn-sm" onclick="pumpAction('well','force_off')">Принудительно ВЫКЛ</button>
+            <button class="btn btn-danger btn-sm" onclick="pumpAction('well','force_off')">Принудительно ВЫКЛ</button>
+            <button class="btn btn-outline-primary btn-sm" onclick="pumpAction('well','auto')">Авто режим</button>
           </div>
         </div>
       </div>
 
       <div class="col-12 col-lg-5">
-        <div class="card p-3 h-100">
-          <h5>Домашний насос</h5>
+        <div class="card p-3 h-100 pump-card" id="houseCard">
+          <h5>Домашний насос — <span class="pump-state" id="house_status">Ждёт</span></h5>
           <p>Ток: <b id="house_current">0 A</b></p>
           <p>Давление: <b id="house_pressure">0 bar</b></p>
           <p>Авария: <b id="house_alarm">Нет</b></p>
@@ -76,7 +87,8 @@
           <div class="d-flex gap-2 flex-wrap">
             <button class="btn btn-warning btn-sm" onclick="pumpAction('house','reset_alarm')">Сброс аварии</button>
             <button class="btn btn-success btn-sm" onclick="pumpAction('house','force_on')">Принудительно ВКЛ</button>
-            <button class="btn btn-secondary btn-sm" onclick="pumpAction('house','force_off')">Принудительно ВЫКЛ</button>
+            <button class="btn btn-danger btn-sm" onclick="pumpAction('house','force_off')">Принудительно ВЫКЛ</button>
+            <button class="btn btn-outline-primary btn-sm" onclick="pumpAction('house','auto')">Авто режим</button>
           </div>
         </div>
       </div>
@@ -140,12 +152,31 @@
       ['LEVEL_FILTER_MS', 'Общее: LEVEL_FILTER_MS', 'number', '1'],
       ['INIT_DELAY_MS', 'Общее: INIT_DELAY_MS', 'number', '1'],
       ['THRESH', 'Общее: THRESH', 'number', '0.01']
+    ],
+    network: [
+      ['wifiSsid', 'WiFi STA: имя сети', 'text', ''],
+      ['wifiPass', 'WiFi STA: пароль', 'password', '']
     ]
   };
 
   function showTab(id) {
     document.querySelectorAll('.tab-pane').forEach(x => x.classList.remove('active'));
     document.getElementById(id).classList.add('active');
+  }
+
+
+  function forceLabel(mode) {
+    if (mode === 1) return 'В работе';
+    if (mode === 2) return 'Отключен';
+    return 'Авто';
+  }
+
+  function applyPumpState(cardId, labelId, status, cssClass, blinking) {
+    const card = document.getElementById(cardId);
+    card.classList.remove('pump-auto', 'pump-run-auto', 'pump-wait', 'pump-force-on', 'pump-force-off', 'pump-alarm', 'blink');
+    card.classList.add(cssClass);
+    if (blinking) card.classList.add('blink');
+    document.getElementById(labelId).innerText = status;
   }
 
   function renderState(data) {
@@ -158,8 +189,37 @@
     document.getElementById('total_liters').innerText = `${Math.round(data.total_liters || 0)} L`;
     document.getElementById('well_alarm').innerText = data.well_alarm ? 'Да' : 'Нет';
     document.getElementById('house_alarm').innerText = data.house_alarm ? 'Да' : 'Нет';
-    document.getElementById('well_force').innerText = data.well_force ? 'ON' : 'OFF';
-    document.getElementById('house_force').innerText = data.house_force ? 'ON' : 'OFF';
+    const wellManual = Number(data.well_manual_mode ?? 0);
+    const houseManual = Number(data.house_manual_mode ?? 0);
+    document.getElementById('well_force').innerText = forceLabel(wellManual);
+    document.getElementById('house_force').innerText = forceLabel(houseManual);
+
+    const wellInRun = Number(data.well_mode) === 2;
+    const houseInRun = Number(data.house_mode) === 2 && (data.house_force || (data.house_pressure || 0) > 0);
+
+    if (data.well_alarm || data.well_blocked || data.pressure_block) {
+      applyPumpState('wellCard', 'well_status', 'Авария', 'pump-alarm', true);
+    } else if (wellManual === 1) {
+      applyPumpState('wellCard', 'well_status', 'В работе', 'pump-force-on', false);
+    } else if (wellManual === 2) {
+      applyPumpState('wellCard', 'well_status', 'Отключен', 'pump-force-off', false);
+    } else if (wellInRun) {
+      applyPumpState('wellCard', 'well_status', 'В работе авт.', 'pump-run-auto', false);
+    } else {
+      applyPumpState('wellCard', 'well_status', 'Ждёт', 'pump-auto', false);
+    }
+
+    if (data.house_alarm || data.house_blocked) {
+      applyPumpState('houseCard', 'house_status', 'Авария', 'pump-alarm', true);
+    } else if (houseManual === 1) {
+      applyPumpState('houseCard', 'house_status', 'В работе', 'pump-force-on', false);
+    } else if (houseManual === 2) {
+      applyPumpState('houseCard', 'house_status', 'Отключен', 'pump-force-off', false);
+    } else if (houseInRun) {
+      applyPumpState('houseCard', 'house_status', 'В работе авт.', 'pump-run-auto', false);
+    } else {
+      applyPumpState('houseCard', 'house_status', 'Ждёт', 'pump-auto', false);
+    }
 
     for (let i = 0; i < 4; i++) {
       const levelIndex = 3 - i;
@@ -227,11 +287,17 @@
 
   async function saveSettings(e) {
     e.preventDefault();
-    const payload = { cfg: {}, cfgHouse: {}, common: {} };
+    const payload = { cfg: {}, cfgHouse: {}, common: {}, network: {} };
     Object.entries(fieldGroups).forEach(([group, fields]) => {
       fields.forEach(([key]) => {
-        const v = Number(document.getElementById(`${group}_${key}`).value);
-        payload[group][key] = Number.isFinite(v) ? v : 0;
+        const el = document.getElementById(`${group}_${key}`);
+        if (!el) return;
+        if (el.type === 'number') {
+          const v = Number(el.value);
+          payload[group][key] = Number.isFinite(v) ? v : 0;
+        } else {
+          payload[group][key] = el.value || '';
+        }
       });
     });
 
