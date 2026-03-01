@@ -245,6 +245,7 @@ constexpr unsigned long CMD_PERIOD_MS = 80UL;
 constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
 constexpr unsigned long RX_GUARD_MS = 5UL;
 constexpr unsigned long LINK_TIMEOUT_MS = 2000UL;
+constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
 constexpr size_t MAX_FRAME_LEN = 160;
 }
@@ -270,6 +271,8 @@ struct LinkHealth {
 } linkHealth;
 
 bool linkAlive = false;
+bool hasEverReceivedTelemetry = false;
+unsigned long controllerBootMs = 0;
 
 struct Settings {
   WellConfig well;
@@ -798,6 +801,7 @@ void parseNanoLine(char* line) {
   tm.vfdFreqFeedback = vals[10];
   tm.valid = true;
   linkHealth.lastValidPacketMs = millis();
+  hasEverReceivedTelemetry = true;
 }
 
 void readNanoUart() {
@@ -907,6 +911,10 @@ void serviceNanoTx(unsigned long now) {
 }
 
 void runWellLogic(unsigned long now) {
+  if (st.wellMode == WellMode::FAIL && tm.valid && !st.wellBlocked && !st.pressureBlock) {
+    st.wellMode = WellMode::WAIT;
+  }
+
   if (!tm.valid || st.wellBlocked || st.pressureBlock) {
     st.wellRelay = false;
     if (st.wellBlocked || st.pressureBlock) st.wellMode = WellMode::FAIL;
@@ -1652,14 +1660,20 @@ void setup() {
 
   appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
   appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
+
+  controllerBootMs = millis();
 }
 
 void loop() {
   feedTaskWatchdog();
   unsigned long now = millis();
   static bool linkLossLogged = false;
+  static bool startupGraceLogged = false;
 
-  linkAlive = (now - linkHealth.lastValidPacketMs) < nanoLink::LINK_TIMEOUT_MS;
+  readNanoUart();
+
+  const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
+  linkAlive = startupGraceActive || ((now - linkHealth.lastValidPacketMs) < nanoLink::LINK_TIMEOUT_MS);
   if (!linkAlive) {
     tm.valid = false;
     st.wellRelay = false;
@@ -1672,11 +1686,18 @@ void loop() {
       appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
       linkLossLogged = true;
     }
+    startupGraceLogged = false;
   } else {
-    linkLossLogged = false;
+    if (startupGraceActive && !hasEverReceivedTelemetry && !startupGraceLogged && (now - controllerBootMs) > 1500UL) {
+      appendLog(st.logsWell, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
+      appendLog(st.logsHouse, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
+      startupGraceLogged = true;
+    } else if (hasEverReceivedTelemetry) {
+      linkLossLogged = false;
+      startupGraceLogged = false;
+    }
   }
 
-  readNanoUart();
   feedTaskWatchdog();
   runWellLogic(now);
   runHouseLogic();
