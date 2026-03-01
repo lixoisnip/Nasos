@@ -44,6 +44,12 @@ enum class ManualMode : uint8_t {
   FORCE_OFF
 };
 
+enum class HouseAutoRestartReason : uint8_t {
+  NONE,
+  OVERLOAD,
+  DRY_RUN
+};
+
 // -------- Wi-Fi settings --------
 // 1) STA mode: ESP32 connects to your router.
 // 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
@@ -221,6 +227,8 @@ constexpr unsigned long SLEEP_QUALIFY_MS = 30000UL;
 constexpr float PRESSURE_SLEEP_BAND = 0.10f;
 constexpr float SLEEP_DERIVATIVE_MAX = 0.02f;
 constexpr float SLEEP_FREQ_BAND = 1.0f;
+constexpr uint8_t AUTO_RESTART_MAX = 3;
+constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL;
 }
 
 // -------- UART to Nano --------
@@ -305,6 +313,10 @@ struct Controller {
   bool housePressureRiseOk = false;
   float housePidIntegral = 0;
   float houseTargetFreq = 28.0f;
+  uint8_t houseAutoRestartAttempts = 0;
+  unsigned long houseAutoRestartAt = 0;
+  bool houseAutoRestartPending = false;
+  HouseAutoRestartReason houseAutoRestartReason = HouseAutoRestartReason::NONE;
   HouseMode houseMode = HouseMode::WAIT_WATER;
 
   unsigned long lastWorkSec = 0;
@@ -991,6 +1003,9 @@ void runHouseLogic() {
     st.houseStartAt = 0;
     st.houseSleepQualStartAt = 0;
     st.housePressureRiseOk = false;
+    st.houseAutoRestartPending = false;
+    st.houseAutoRestartAt = 0;
+    st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
     return;
   }
 
@@ -1006,6 +1021,9 @@ void runHouseLogic() {
       st.housePressureDryStartAt = 0;
       st.housePidLastAt = 0;
       st.houseSleepQualStartAt = 0;
+      st.houseAutoRestartPending = false;
+      st.houseAutoRestartAt = 0;
+      st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
       return;
     }
 
@@ -1034,6 +1052,9 @@ void runHouseLogic() {
     st.housePidLastAt = 0;
     st.houseSleepQualStartAt = 0;
     st.houseLastStopAt = now;
+    st.houseAutoRestartPending = false;
+    st.houseAutoRestartAt = 0;
+    st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
     return;
   }
 
@@ -1048,6 +1069,9 @@ void runHouseLogic() {
       st.housePidLastAt = 0;
       st.houseFreqLastStepAt = 0;
       st.houseSleepQualStartAt = 0;
+      st.houseAutoRestartPending = false;
+      st.houseAutoRestartAt = 0;
+      st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
     }
     st.houseMode = HouseMode::RUNNING;
   } else {
@@ -1064,6 +1088,9 @@ void runHouseLogic() {
       st.houseSleepQualStartAt = 0;
       st.housePidIntegral = 0;
       st.houseTargetFreq = cfg.house.minFreq;
+      st.houseAutoRestartPending = false;
+      st.houseAutoRestartAt = 0;
+      st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
       appendLog(st.logsHouse, "Дом: запуск насоса");
     }
   }
@@ -1085,13 +1112,6 @@ void runHouseLogic() {
           st.houseMode = HouseMode::RUNNING;
           st.housePidLastAt = now;
           appendLog(st.logsHouse, "Дом: старт успешен, переход в режим RUNNING");
-        } else {
-          st.houseBlocked = st.houseAlarm = true;
-          st.vfdRun = false;
-          st.houseManualMode = ManualMode::AUTO;
-          st.houseMode = HouseMode::FAULT;
-          appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
-          return;
         }
       }
       return;
@@ -1143,6 +1163,39 @@ void runHouseLogic() {
     st.housePressureDryStartAt = 0;
     st.houseSleepQualStartAt = 0;
   }
+
+  if (st.vfdRun && st.houseMode == HouseMode::RUNNING && !st.houseAlarm) {
+    st.houseAutoRestartAttempts = 0;
+    st.houseAutoRestartPending = false;
+    st.houseAutoRestartAt = 0;
+    st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+  }
+}
+
+void runHouseAutoRestart(unsigned long now) {
+  if (!st.houseAutoRestartPending || st.houseBlocked || st.houseManualMode == ManualMode::FORCE_OFF) return;
+  if (st.houseAutoRestartReason == HouseAutoRestartReason::NONE) return;
+  if (now < st.houseAutoRestartAt) return;
+
+  st.houseAutoRestartPending = false;
+  st.houseAutoRestartAt = 0;
+  st.houseAlarm = false;
+  st.houseMode = HouseMode::STARTING;
+  st.vfdRun = true;
+  st.vfdFreq = cfg.house.minFreq;
+  st.houseStartAt = now;
+  st.houseInitialPressure = tm.housePressure;
+  st.housePressureRiseOk = false;
+  st.housePressureDryStartAt = 0;
+  st.housePidLastAt = 0;
+  st.houseFreqLastStepAt = 0;
+  st.houseSleepQualStartAt = 0;
+  st.housePidIntegral = 0;
+  st.houseTargetFreq = cfg.house.minFreq;
+  st.houseOverloadStart = 0;
+  st.houseDryStart = 0;
+
+  appendLog(st.logsHouse, "Дом: автоперезапуск " + String(st.houseAutoRestartAttempts) + "/" + String(houseCtrl::AUTO_RESTART_MAX));
 }
 
 void runProtections(unsigned long now) {
@@ -1195,22 +1248,58 @@ void runProtections(unsigned long now) {
     if (!ignoreStartCurrent && tm.houseCurrent >= cfg.house.overloadCurrent) {
       if (!st.houseOverloadStart) st.houseOverloadStart = now;
       if (now - st.houseOverloadStart > cfg.house.overloadDelayMs) {
-        st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseManualMode = ManualMode::AUTO;
-        st.houseMode = HouseMode::FAULT;
-        appendLog(st.logsHouse, "Дом: авария — перегрузка по току");
+        st.houseMode = HouseMode::STOPPED;
+        st.houseAlarm = true;
+        st.houseOverloadStart = 0;
+        st.houseDryStart = 0;
+        st.housePressureDryStartAt = 0;
+        st.houseStartAt = 0;
+        st.housePressureRiseOk = false;
+        st.houseAutoRestartReason = HouseAutoRestartReason::OVERLOAD;
+        if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
+          st.houseAutoRestartAttempts++;
+          st.houseAutoRestartPending = true;
+          st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
+          appendLog(st.logsHouse, "Дом: авария — перегрузка по току");
+        } else {
+          st.houseBlocked = true;
+          st.houseMode = HouseMode::FAULT;
+          st.houseAutoRestartPending = false;
+          st.houseAutoRestartAt = 0;
+          st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+          appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+        }
       }
     } else st.houseOverloadStart = 0;
 
     if (!ignoreStartCurrent && tm.houseCurrent < cfg.house.dryCurrent) {
       if (!st.houseDryStart) st.houseDryStart = now;
       if (now - st.houseDryStart > cfg.house.dryDelayMs) {
-        st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseManualMode = ManualMode::AUTO;
-        st.houseMode = HouseMode::FAULT;
-        appendLog(st.logsHouse, "Дом: сухой ход — ток ниже порога");
+        st.houseMode = HouseMode::STOPPED;
+        st.houseAlarm = true;
+        st.houseOverloadStart = 0;
+        st.houseDryStart = 0;
+        st.housePressureDryStartAt = 0;
+        st.houseStartAt = 0;
+        st.housePressureRiseOk = false;
+        st.houseAutoRestartReason = HouseAutoRestartReason::DRY_RUN;
+        if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
+          st.houseAutoRestartAttempts++;
+          st.houseAutoRestartPending = true;
+          st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
+          appendLog(st.logsHouse, "Дом: сухой ход — ток ниже порога");
+        } else {
+          st.houseBlocked = true;
+          st.houseMode = HouseMode::FAULT;
+          st.houseAutoRestartPending = false;
+          st.houseAutoRestartAt = 0;
+          st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+          appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+        }
       }
     } else st.houseDryStart = 0;
 
@@ -1218,11 +1307,29 @@ void runProtections(unsigned long now) {
       if (tm.housePressure > st.houseInitialPressure + houseCtrl::PRESSURE_RISE_THRESHOLD) {
         st.housePressureRiseOk = true;
       } else if (now - st.houseStartAt >= houseCtrl::DRY_PRESSURE_START_TIMEOUT) {
-        st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseManualMode = ManualMode::AUTO;
-        st.houseMode = HouseMode::FAULT;
-        appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
+        st.houseMode = HouseMode::STOPPED;
+        st.houseAlarm = true;
+        st.houseOverloadStart = 0;
+        st.houseDryStart = 0;
+        st.housePressureDryStartAt = 0;
+        st.houseStartAt = 0;
+        st.housePressureRiseOk = false;
+        st.houseAutoRestartReason = HouseAutoRestartReason::DRY_RUN;
+        if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
+          st.houseAutoRestartAttempts++;
+          st.houseAutoRestartPending = true;
+          st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
+          appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
+        } else {
+          st.houseBlocked = true;
+          st.houseMode = HouseMode::FAULT;
+          st.houseAutoRestartPending = false;
+          st.houseAutoRestartAt = 0;
+          st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+          appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+        }
       }
     }
 
@@ -1272,6 +1379,10 @@ String buildJsonState() {
   doc["house_manual_mode"] = (int)st.houseManualMode;
   doc["well_blocked"] = st.wellBlocked;
   doc["house_blocked"] = st.houseBlocked;
+  doc["house_auto_restart_attempts"] = st.houseAutoRestartAttempts;
+  doc["house_auto_restart_pending"] = st.houseAutoRestartPending;
+  doc["house_auto_restart_at"] = st.houseAutoRestartAt;
+  doc["house_auto_restart_reason"] = (int)st.houseAutoRestartReason;
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
@@ -1417,6 +1528,10 @@ void initWeb() {
         st.houseAlarm = false;
         st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::READY;
+        st.houseAutoRestartAttempts = 0;
+        st.houseAutoRestartPending = false;
+        st.houseAutoRestartAt = 0;
+        st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
         appendLog(st.logsHouse, "Дом: ручной сброс аварии");
       } else if (action == "force_on") {
         st.houseManualMode = ManualMode::FORCE_ON;
@@ -1566,6 +1681,7 @@ void loop() {
   runWellLogic(now);
   runHouseLogic();
   runProtections(now);
+  runHouseAutoRestart(now);
   serviceNanoTx(now);
   feedTaskWatchdog();
 
