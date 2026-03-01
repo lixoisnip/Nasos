@@ -229,6 +229,7 @@ constexpr float SLEEP_DERIVATIVE_MAX = 0.02f;
 constexpr float SLEEP_FREQ_BAND = 1.0f;
 constexpr uint8_t AUTO_RESTART_MAX = 3;
 constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL;
+constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
 }
 
 // -------- UART to Nano --------
@@ -317,6 +318,7 @@ struct Controller {
   float housePidIntegral = 0;
   float houseTargetFreq = 28.0f;
   uint8_t houseAutoRestartAttempts = 0;
+  unsigned long houseAutoRestartOkSince = 0;
   unsigned long houseAutoRestartAt = 0;
   bool houseAutoRestartPending = false;
   HouseAutoRestartReason houseAutoRestartReason = HouseAutoRestartReason::NONE;
@@ -1160,6 +1162,8 @@ void runHouseLogic() {
         st.houseLastStopAt = now;
         st.housePidLastAt = 0;
         st.houseSleepQualStartAt = 0;
+        st.houseAutoRestartAttempts = 0;
+        st.houseAutoRestartOkSince = 0;
         appendLog(st.logsHouse, "Дом: остановка по sleep-логике (нет расхода)");
       }
     } else {
@@ -1170,13 +1174,20 @@ void runHouseLogic() {
     st.housePidLastAt = 0;
     st.housePressureDryStartAt = 0;
     st.houseSleepQualStartAt = 0;
+    st.houseAutoRestartOkSince = 0;
   }
 
   if (st.vfdRun && st.houseMode == HouseMode::RUNNING && !st.houseAlarm) {
-    st.houseAutoRestartAttempts = 0;
+    if (!st.houseAutoRestartOkSince) st.houseAutoRestartOkSince = now;
+    if (st.houseAutoRestartAttempts > 0 && (now - st.houseAutoRestartOkSince) >= houseCtrl::RESTART_RESET_OK_MS) {
+      st.houseAutoRestartAttempts = 0;
+      appendLog(st.logsHouse, "Дом: сброс счетчика автоперезапуска после стабильной работы");
+    }
     st.houseAutoRestartPending = false;
     st.houseAutoRestartAt = 0;
     st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+  } else {
+    st.houseAutoRestartOkSince = 0;
   }
 }
 
@@ -1537,6 +1548,7 @@ void initWeb() {
         st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::READY;
         st.houseAutoRestartAttempts = 0;
+        st.houseAutoRestartOkSince = 0;
         st.houseAutoRestartPending = false;
         st.houseAutoRestartAt = 0;
         st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
