@@ -1147,6 +1147,19 @@ void runHouseLogic() {
       st.vfdFreq = constrain(st.vfdFreq, cfg.house.minFreq, cfg.house.maxFreq);
     }
 
+    if (st.houseManualMode != ManualMode::FORCE_ON && tm.housePressure >= cfg.house.hystOff) {
+      st.houseMode = HouseMode::STOPPING;
+      st.vfdRun = false;
+      st.vfdFreq = cfg.house.minFreq;
+      st.houseLastStopAt = now;
+      st.housePidLastAt = 0;
+      st.housePidIntegral = 0;
+      st.houseTargetFreq = cfg.house.minFreq;
+      st.houseSleepQualStartAt = 0;
+      appendLog(st.logsHouse, "Дом: остановка по верхнему порогу давления");
+      return;
+    }
+
     bool minRunDone = (now - st.houseStartAt) >= houseCtrl::MIN_RUN_MS;
     bool lowSpeed = st.vfdFreq <= (cfg.house.minFreq + houseCtrl::SLEEP_FREQ_BAND);
     bool pressureHigh = tm.housePressure >= (cfg.house.setpointBar + houseCtrl::PRESSURE_SLEEP_BAND);
