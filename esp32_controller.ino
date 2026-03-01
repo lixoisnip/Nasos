@@ -241,6 +241,18 @@ constexpr int NANO_TX_PIN = 17;
 // ВАЖНО: на стороне Nano должна быть такая же скорость UART.
 constexpr uint32_t NANO_BAUD = 19200;  // MUST match on both sides
 
+namespace telemetryCurrent {
+constexpr float WELL_GAIN = 1.0f;
+constexpr float HOUSE_GAIN = 1.0f;
+constexpr float ZERO_CUTOFF_A = 0.10f;
+}
+
+float normalizeTelemetryCurrent(float amps, float gain) {
+  float normalized = amps * gain;
+  if (normalized < telemetryCurrent::ZERO_CUTOFF_A) return 0.0f;
+  return normalized;
+}
+
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
 constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
@@ -791,9 +803,9 @@ void parseNanoLine(char* line) {
   if (idx < 11) return;
 
   tm.ts = (unsigned long)vals[0];
-  tm.wellCurrent = vals[1];
+  tm.wellCurrent = normalizeTelemetryCurrent(vals[1], telemetryCurrent::WELL_GAIN);
   tm.wellPressure = vals[2];
-  tm.houseCurrent = vals[3];
+  tm.houseCurrent = normalizeTelemetryCurrent(vals[3], telemetryCurrent::HOUSE_GAIN);
   tm.housePressure = vals[4];
   tm.levels[0] = vals[5] > 0.5f;
   tm.levels[1] = vals[6] > 0.5f;
