@@ -108,6 +108,21 @@
           <button class="btn btn-outline-danger btn-sm" onclick="clearLogs('house')">Очистить</button>
         </div>
       </div>
+      <div class="col-12">
+        <div class="card p-3">
+          <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <h5 class="mb-0">Контрольные события</h5>
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+              <div class="form-check m-0">
+                <input class="form-check-input" type="checkbox" id="events_only_critical">
+                <label class="form-check-label" for="events_only_critical">Показывать только аварии/рестарты</label>
+              </div>
+              <button class="btn btn-outline-danger btn-sm" onclick="clearEvents()">Очистить</button>
+            </div>
+          </div>
+          <pre id="logs_events" style="max-height:240px; overflow:auto; white-space:pre-wrap; margin-top:12px"></pre>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -159,6 +174,50 @@
       ['wifiPass', 'WiFi STA: пароль', 'password', '']
     ]
   };
+  const MAX_EVENT_LINES = 300;
+  let lastEventTs = 0;
+  let eventLines = [];
+
+  function isCriticalEventCode(code) {
+    const normalized = String(code || '').toUpperCase();
+    return normalized.includes('ALARM')
+      || normalized.includes('AVAR')
+      || normalized.includes('RESTART')
+      || normalized.includes('RESET')
+      || normalized.includes('BOOT')
+      || normalized.includes('PANIC')
+      || normalized.includes('FAULT');
+  }
+
+  function formatEventLine(event) {
+    const ts = Number(event?.ts ?? event?.timestamp ?? 0);
+    const src = String(event?.src ?? event?.pump ?? event?.source ?? '').trim();
+    const code = String(event?.code ?? event?.event ?? '').trim();
+    const p = Number(event?.p ?? event?.pressure);
+    const i = Number(event?.i ?? event?.current);
+    const parts = [`[${Number.isFinite(ts) ? ts : 0}]`];
+    if (src) parts.push(src);
+    if (code) parts.push(code);
+    if (Number.isFinite(p)) parts.push(`p=${p.toFixed(2)}`);
+    if (Number.isFinite(i)) parts.push(`i=${i.toFixed(1)}`);
+    return parts.join(' ');
+  }
+
+  function trimEvents() {
+    if (eventLines.length > MAX_EVENT_LINES) {
+      eventLines = eventLines.slice(eventLines.length - MAX_EVENT_LINES);
+    }
+  }
+
+  function redrawEvents() {
+    const onlyCritical = document.getElementById('events_only_critical')?.checked;
+    const lines = onlyCritical
+      ? eventLines.filter((line) => isCriticalEventCode(line.code)).map((line) => line.text)
+      : eventLines.map((line) => line.text);
+    const pre = document.getElementById('logs_events');
+    pre.textContent = lines.join('\n');
+    pre.scrollTop = pre.scrollHeight;
+  }
 
   function showTab(id) {
     document.querySelectorAll('.tab-pane').forEach(x => x.classList.remove('active'));
@@ -265,9 +324,57 @@
     document.getElementById('logs_house').innerText = await (await fetch('/logs_house')).text();
   }
 
+  async function loadEvents() {
+    try {
+      const res = await fetch(`/events?since=${lastEventTs}`);
+      if (!res.ok) return;
+      const payload = await res.json();
+      const events = Array.isArray(payload) ? payload : (Array.isArray(payload.events) ? payload.events : []);
+      if (!events.length) return;
+
+      const pre = document.getElementById('logs_events');
+      const onlyCritical = document.getElementById('events_only_critical')?.checked;
+      let appended = false;
+
+      events.forEach((event) => {
+        const ts = Number(event?.ts ?? event?.timestamp ?? 0);
+        if (Number.isFinite(ts) && ts > lastEventTs) lastEventTs = ts;
+
+        const line = {
+          code: String(event?.code ?? event?.event ?? ''),
+          text: formatEventLine(event)
+        };
+        eventLines.push(line);
+
+        if (!onlyCritical || isCriticalEventCode(line.code)) {
+          pre.textContent += `${pre.textContent ? '\n' : ''}${line.text}`;
+          appended = true;
+        }
+      });
+
+      trimEvents();
+      const visibleLines = pre.textContent ? pre.textContent.split('\n').length : 0;
+      if (onlyCritical || visibleLines > MAX_EVENT_LINES) {
+        redrawEvents();
+      } else if (appended) {
+        pre.scrollTop = pre.scrollHeight;
+      }
+    } catch (e) {
+      console.error('events load failed', e);
+    }
+  }
+
   async function clearLogs(type) {
     await fetch(`/clear_logs_${type}`, { method: 'POST' });
     await loadLogs();
+  }
+
+  async function clearEvents() {
+    await fetch('/clear_events', { method: 'POST' });
+    lastEventTs = 0;
+    eventLines = [];
+    document.getElementById('logs_events').textContent = '';
+    await loadEvents();
   }
 
   async function pumpAction(pump, action) {
@@ -335,9 +442,12 @@
   }
 
   setInterval(pollState, 1000);
+  setInterval(loadEvents, 3000);
   pollState();
   loadLogs();
+  loadEvents();
   loadSettings();
+  document.getElementById('events_only_critical').addEventListener('change', redrawEvents);
 </script>
 </body>
 </html>
