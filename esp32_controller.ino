@@ -8,6 +8,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <ctype.h>
@@ -232,14 +233,10 @@ constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL;
 constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
 }
 
-// -------- UART to Nano --------
-HardwareSerial NanoSerial(2);
-constexpr int NANO_RX_PIN = 16;
-constexpr int NANO_TX_PIN = 17;
-// Для SoftwareSerial на Nano 19200 бод заметно стабильнее при двустороннем обмене.
-// Если останутся ошибки/потери, на Nano лучше перейти на NeoSWSerial/AltSoftSerial.
-// ВАЖНО: на стороне Nano должна быть такая же скорость UART.
-constexpr uint32_t NANO_BAUD = 19200;  // MUST match on both sides
+// -------- I2C to Nano --------
+constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
+constexpr int I2C_SDA_PIN = 21;
+constexpr int I2C_SCL_PIN = 22;
 
 namespace telemetryCurrent {
 constexpr float WELL_GAIN = 1.0f;
@@ -256,11 +253,10 @@ float normalizeTelemetryCurrent(float amps, float gain) {
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
 constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
-constexpr unsigned long RX_GUARD_MS = 5UL;
 constexpr unsigned long LINK_TIMEOUT_MS = 2000UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
-constexpr size_t MAX_FRAME_LEN = 160;
+constexpr size_t MAX_FRAME_LEN = 96;
 }
 
 struct Telemetry {
@@ -818,37 +814,22 @@ void parseNanoLine(char* line) {
   hasEverReceivedTelemetry = true;
 }
 
-void readNanoUart() {
-  static char line[nanoLink::MAX_FRAME_LEN + 1];
-  static size_t idx = 0;
-  static bool droppingFrame = false;
-  while (NanoSerial.available()) {
-    char c = (char)NanoSerial.read();
-    linkHealth.lastRxByteMs = millis();
+void readNanoI2c() {
+  char line[nanoLink::MAX_FRAME_LEN + 1] = {0};
+  size_t idx = 0;
 
-    if (c == '\n') {
-      if (!droppingFrame && idx > 0) {
-        line[idx] = '\0';
-        parseNanoLine(line);
-      }
-      idx = 0;
-      droppingFrame = false;
-    } else if (c == '\r') {
-      continue;
-    } else if (!isprint((unsigned char)c)) {
-      continue;
-    } else if (droppingFrame) {
-      continue;
-    } else {
-      if (idx >= nanoLink::MAX_FRAME_LEN) {
-        idx = 0;
-        droppingFrame = true;
-        linkHealth.rxFrameErrorCount++;
-      } else {
-        line[idx++] = c;
-      }
-    }
+  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, (int)nanoLink::MAX_FRAME_LEN);
+  if (received <= 0) return;
+
+  while (Wire.available() && idx < nanoLink::MAX_FRAME_LEN) {
+    char c = (char)Wire.read();
+    if (isprint((unsigned char)c)) line[idx++] = c;
   }
+  line[idx] = '\0';
+  if (idx == 0) return;
+
+  linkHealth.lastRxByteMs = millis();
+  parseNanoLine(line);
 }
 
 NanoCommandPacket buildNanoCommandPacket() {
@@ -880,8 +861,11 @@ bool nanoPacketChanged(const NanoCommandPacket& a, const NanoCommandPacket& b) {
 }
 
 void sendNanoControlPacket(const NanoCommandPacket& packet) {
-  NanoSerial.printf(
-    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WELL_MODE=%d;WELL_ALARM=%d;WELL_BLOCKED=%d;WELL_INTENTION=%d;HOUSE_MODE=%d;HOUSE_ALARM=%d;HOUSE_BLOCKED=%d\n",
+  char payload[nanoLink::MAX_FRAME_LEN + 1];
+  snprintf(
+    payload,
+    sizeof(payload),
+    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WELL_MODE=%d;WELL_ALARM=%d;WELL_BLOCKED=%d;WELL_INTENTION=%d;HOUSE_MODE=%d;HOUSE_ALARM=%d;HOUSE_BLOCKED=%d",
     packet.relay ? 1 : 0,
     packet.vfdRun ? 1 : 0,
     packet.vfdFreq,
@@ -893,10 +877,18 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
     packet.houseAlarm ? 1 : 0,
     packet.houseBlocked ? 1 : 0
   );
+
+  Wire.beginTransmission(NANO_I2C_ADDRESS);
+  Wire.write((const uint8_t*)payload, strlen(payload));
+  Wire.endTransmission();
 }
 
 void sendNanoHeartbeat(unsigned long now) {
-  NanoSerial.printf("HB=%lu\n", now);
+  char payload[24];
+  snprintf(payload, sizeof(payload), "HB=%lu", now);
+  Wire.beginTransmission(NANO_I2C_ADDRESS);
+  Wire.write((const uint8_t*)payload, strlen(payload));
+  Wire.endTransmission();
 }
 
 void serviceNanoTx(unsigned long now) {
@@ -904,9 +896,6 @@ void serviceNanoTx(unsigned long now) {
   static unsigned long lastHeartbeatTxMs = 0;
   static bool hasLastPacket = false;
   static NanoCommandPacket lastPacket;
-
-  const bool rxBusy = (now - linkHealth.lastRxByteMs) < nanoLink::RX_GUARD_MS;
-  if (rxBusy) return;
 
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
@@ -1676,7 +1665,7 @@ void initWiFi() {
 
 void setup() {
   Serial.begin(115200);
-  NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000UL);
 
   initConfigFromNamespaces();
 
@@ -1707,7 +1696,7 @@ void loop() {
   static bool linkLossLogged = false;
   static bool startupGraceLogged = false;
 
-  readNanoUart();
+  readNanoI2c();
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   linkAlive = startupGraceActive || ((now - linkHealth.lastValidPacketMs) < nanoLink::LINK_TIMEOUT_MS);

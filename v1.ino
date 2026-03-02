@@ -4,7 +4,7 @@
 // while all control logic is moved to ESP32.
 // =====================================================
 
-#include <SoftwareSerial.h>
+#include <Wire.h>
 #include <avr/wdt.h>
 #include <ctype.h>
 #include <string.h>
@@ -61,16 +61,18 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 #define Y4 (Y3+Z3)
 #define Y5 (Y4+Z4)
 
-// UART to ESP32 (SoftwareSerial to avoid conflict with RS485 on Serial)
-#define ESP_RX_PIN        4
-#define ESP_TX_PIN        5
-SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
+// I2C link to ESP32 (Nano as slave)
+constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
+constexpr size_t I2C_RX_MAX_LEN = 96;
+constexpr size_t I2C_TX_MAX_LEN = 96;
+volatile bool i2cCommandReady = false;
+char i2cCommandBuffer[I2C_RX_MAX_LEN + 1] = {0};
+char i2cTelemetryBuffer[I2C_TX_MAX_LEN + 1] = {0};
 
 const uint8_t WELL_CURRENT_SAMPLES = 120;
 const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
 const unsigned long LEVEL_FILTER_MS = 2000;
 const int LEVEL_THRESH = 700;
-const size_t ESP_CMD_MAX_LEN = 160;
 
 struct LevelFilter {
   bool stableState = false;
@@ -108,7 +110,7 @@ struct NanoState {
   bool houseBlocked = false;
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
-  unsigned long uartRxErrorCount = 0;
+  unsigned long linkRxErrorCount = 0;
 
 } ns;
 
@@ -338,39 +340,37 @@ void handleCommand(char* cmd) {
   }
 }
 
-void processEspUart() {
-  static char line[ESP_CMD_MAX_LEN + 1];
-  static size_t idx = 0;
-  static bool droppingFrame = false;
-  while (espSerial.available()) {
-    char c = (char)espSerial.read();
-
-    if (c == '\n') {
-      if (!droppingFrame && idx > 0) {
-        line[idx] = '\0';
-        handleCommand(line);
-      }
-      idx = 0;
-      droppingFrame = false;
-    } else if (c == '\r') {
-      continue;
-    } else if (!isprint((unsigned char)c)) {
-      continue;
-    } else if (droppingFrame) {
-      continue;
-    } else {
-      if (idx >= ESP_CMD_MAX_LEN) {
-        idx = 0;
-        droppingFrame = true;
-        ns.uartRxErrorCount++;
-      } else {
-        line[idx++] = c;
-      }
+void onI2cReceive(int count) {
+  if (count <= 0) return;
+  size_t idx = 0;
+  while (Wire.available()) {
+    char c = (char)Wire.read();
+    if (idx < I2C_RX_MAX_LEN && isprint((unsigned char)c)) {
+      i2cCommandBuffer[idx++] = c;
     }
   }
+  i2cCommandBuffer[idx] = '\0';
+  i2cCommandReady = idx > 0;
 }
 
-void sendTelemetry(unsigned long now) {
+void onI2cRequest() {
+  Wire.write((const uint8_t*)i2cTelemetryBuffer, strnlen(i2cTelemetryBuffer, I2C_TX_MAX_LEN));
+}
+
+void processEspI2c() {
+  if (!i2cCommandReady) return;
+
+  char localCmd[I2C_RX_MAX_LEN + 1];
+  noInterrupts();
+  strncpy(localCmd, i2cCommandBuffer, I2C_RX_MAX_LEN);
+  localCmd[I2C_RX_MAX_LEN] = '\0';
+  i2cCommandReady = false;
+  interrupts();
+
+  handleCommand(localCmd);
+}
+
+void updateTelemetryFrame(unsigned long now) {
   if (now - ns.lastTelemetry < 100) return;
   ns.lastTelemetry = now;
 
@@ -388,14 +388,20 @@ void sendTelemetry(unsigned long now) {
   payload += ',' + String(ns.vfdFreqHz, 1);
 
   uint8_t checksum = calcXorChecksum(payload);
-  char frame[180];
-  snprintf(frame, sizeof(frame), "%s*%02X", payload.c_str(), checksum);
-  espSerial.println(frame);
+  noInterrupts();
+  snprintf(i2cTelemetryBuffer, sizeof(i2cTelemetryBuffer), "%s*%02X", payload.c_str(), checksum);
+  interrupts();
+}
+
+void sendTelemetry(unsigned long now) {
+  updateTelemetryFrame(now);
 }
 
 void setup() {
   Serial.begin(9600);      // RS485 VFD
-  espSerial.begin(19200);  // link to ESP32 // MUST match on both sides
+  Wire.begin(NANO_I2C_ADDRESS);
+  Wire.onReceive(onI2cReceive);
+  Wire.onRequest(onI2cRequest);
 
   pinMode(RELAY_WELL, OUTPUT);
   digitalWrite(RELAY_WELL, HIGH);
@@ -421,7 +427,7 @@ void setup() {
 void loop() {
   feedWatchdog();
   unsigned long now = millis();
-  processEspUart();
+  processEspI2c();
   feedWatchdog();
   readInputs(now);
   applyOutputs();
