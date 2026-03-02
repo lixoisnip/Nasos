@@ -461,6 +461,52 @@ bool floatChanged(float a, float b, float eps = 0.01f) {
   return fabs(a - b) > eps;
 }
 
+struct EventLogRecord {
+  unsigned long ts = 0;
+  uint8_t src = 0;
+  char code[12] = {0};
+  float v1 = 0;
+  float v2 = 0;
+};
+
+namespace eventLog {
+constexpr size_t CAPACITY = 200;
+constexpr uint8_t SRC_WELL = 1;
+constexpr uint8_t SRC_HOUSE = 2;
+constexpr uint8_t SRC_LINK = 3;
+
+EventLogRecord records[CAPACITY];
+size_t head = 0;
+size_t count = 0;
+
+const char* srcToString(uint8_t src) {
+  switch (src) {
+    case SRC_WELL: return "well";
+    case SRC_HOUSE: return "house";
+    case SRC_LINK: return "link";
+    default: return "unknown";
+  }
+}
+
+void clear() {
+  head = 0;
+  count = 0;
+}
+}
+
+void appendEventLog(uint8_t src, const char* code, float v1 = 0.0f, float v2 = 0.0f) {
+  EventLogRecord& rec = eventLog::records[eventLog::head];
+  rec.ts = millis();
+  rec.src = src;
+  strncpy(rec.code, code ? code : "", sizeof(rec.code) - 1);
+  rec.code[sizeof(rec.code) - 1] = '\0';
+  rec.v1 = v1;
+  rec.v2 = v2;
+
+  eventLog::head = (eventLog::head + 1) % eventLog::CAPACITY;
+  if (eventLog::count < eventLog::CAPACITY) eventLog::count++;
+}
+
 void saveWellState(bool force = false) {
   bool changed = force;
 
@@ -588,6 +634,7 @@ void stopWellPump(unsigned long now, const String& reason, PumpIntention nextInt
   st.intention = nextIntention;
   st.wellPauseStart = now;
   st.wellMode = st.wellBlocked || st.pressureBlock ? WellMode::FAIL : WellMode::WAIT;
+  appendEventLog(eventLog::SRC_WELL, st.wellMode == WellMode::FAIL ? "W_FAIL" : "W_WAIT", tm.wellPressure, tm.wellCurrent);
   resetWellRuntimeTimers();
   appendLog(st.logsWell, reason);
   saveWellState();
@@ -916,6 +963,7 @@ void serviceNanoTx(unsigned long now) {
 void runWellLogic(unsigned long now) {
   if (st.wellMode == WellMode::FAIL && tm.valid && !st.wellBlocked && !st.pressureBlock) {
     st.wellMode = WellMode::WAIT;
+    appendEventLog(eventLog::SRC_WELL, "W_WAIT", 0, 0);
   }
 
   if (!tm.valid || st.wellBlocked || st.pressureBlock) {
@@ -936,6 +984,7 @@ void runWellLogic(unsigned long now) {
     st.startPressureOk = false;
     st.wellMode = WellMode::STARTING;
     appendLog(st.logsWell, forceOn ? "Скважина: принудительный запуск" : "Скважина: запуск");
+    appendEventLog(eventLog::SRC_WELL, "W_START", tm.wellPressure, tm.wellCurrent);
   }
 
   if (st.wellMode == WellMode::STARTING && now - st.wellStartAttempt >= wellCtrl::CURRENT_CHECK_DELAY) {
@@ -949,6 +998,7 @@ void runWellLogic(unsigned long now) {
         st.wellBlocked = true;
         st.wellAlarm = true;
         appendLog(st.logsWell, "Скважина: блокировка — нет тока после 3 попыток запуска");
+        appendEventLog(eventLog::SRC_WELL, "W_ALM", tm.wellCurrent, 1);
       } else {
         appendLog(st.logsWell, "Скважина: неудачный запуск — ток не появился");
       }
@@ -968,6 +1018,7 @@ void runWellLogic(unsigned long now) {
           st.wellBlocked = true;
           st.wellAlarm = true;
           appendLog(st.logsWell, "Скважина: блокировка — давление не выросло после 3 попыток");
+          appendEventLog(eventLog::SRC_WELL, "W_ALM", tm.wellPressure, 2);
         } else {
           appendLog(st.logsWell, "Скважина: неудачный запуск — давление не выросло");
         }
@@ -983,6 +1034,7 @@ void runWellLogic(unsigned long now) {
       st.failedStartCount = 0;
       saveWellState();
       appendLog(st.logsWell, "Скважина: насос работает");
+      appendEventLog(eventLog::SRC_WELL, "W_RUN", tm.wellPressure, tm.wellCurrent);
     }
   }
 
@@ -1103,6 +1155,7 @@ void runHouseLogic() {
       st.houseAutoRestartAt = 0;
       st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
       appendLog(st.logsHouse, "Дом: запуск насоса");
+      appendEventLog(eventLog::SRC_HOUSE, "H_START", tm.housePressure, st.vfdFreq);
     }
   }
 
@@ -1123,6 +1176,7 @@ void runHouseLogic() {
           st.houseMode = HouseMode::RUNNING;
           st.housePidLastAt = now;
           appendLog(st.logsHouse, "Дом: старт успешен, переход в режим RUNNING");
+          appendEventLog(eventLog::SRC_HOUSE, "H_RUN", tm.housePressure, st.vfdFreq);
         }
       }
       return;
@@ -1229,6 +1283,7 @@ void runHouseAutoRestart(unsigned long now) {
   st.houseDryStart = 0;
 
   appendLog(st.logsHouse, "Дом: автоперезапуск " + String(st.houseAutoRestartAttempts) + "/" + String(houseCtrl::AUTO_RESTART_MAX));
+  appendEventLog(eventLog::SRC_HOUSE, "H_RETRY", st.houseAutoRestartAttempts, st.houseAutoRestartReason);
 }
 
 void runProtections(unsigned long now) {
@@ -1296,6 +1351,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartPending = true;
           st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
           appendLog(st.logsHouse, "Дом: авария — перегрузка по току");
+          appendEventLog(eventLog::SRC_HOUSE, "H_ALM_OVR", tm.houseCurrent, st.houseAutoRestartAttempts);
         } else {
           st.houseBlocked = true;
           st.houseMode = HouseMode::FAULT;
@@ -1303,6 +1359,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+          appendEventLog(eventLog::SRC_HOUSE, "H_FAULT", st.houseAutoRestartAttempts, st.houseAutoRestartReason);
         }
       }
     } else st.houseOverloadStart = 0;
@@ -1325,6 +1382,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartPending = true;
           st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
           appendLog(st.logsHouse, "Дом: сухой ход — ток ниже порога");
+          appendEventLog(eventLog::SRC_HOUSE, "H_ALM_DRY", tm.houseCurrent, st.houseAutoRestartAttempts);
         } else {
           st.houseBlocked = true;
           st.houseMode = HouseMode::FAULT;
@@ -1332,6 +1390,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+          appendEventLog(eventLog::SRC_HOUSE, "H_FAULT", st.houseAutoRestartAttempts, st.houseAutoRestartReason);
         }
       }
     } else st.houseDryStart = 0;
@@ -1355,6 +1414,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartPending = true;
           st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
           appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
+          appendEventLog(eventLog::SRC_HOUSE, "H_ALM_DRY", tm.housePressure, st.houseAutoRestartAttempts);
         } else {
           st.houseBlocked = true;
           st.houseMode = HouseMode::FAULT;
@@ -1362,6 +1422,7 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
+          appendEventLog(eventLog::SRC_HOUSE, "H_FAULT", st.houseAutoRestartAttempts, st.houseAutoRestartReason);
         }
       }
     }
@@ -1469,6 +1530,40 @@ void initWeb() {
     server.send(200, "text/plain; charset=utf-8", st.logsHouse);
   });
 
+  server.on("/events", HTTP_GET, []() {
+    const unsigned long since = server.hasArg("since") ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0UL;
+    size_t limit = eventLog::count;
+    if (server.hasArg("limit")) {
+      limit = (size_t)strtoul(server.arg("limit").c_str(), nullptr, 10);
+      if (limit > eventLog::count) limit = eventLog::count;
+    }
+
+    StaticJsonDocument<12288> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    const size_t start = (eventLog::head + eventLog::CAPACITY - eventLog::count) % eventLog::CAPACITY;
+    for (size_t i = 0; i < eventLog::count; i++) {
+      const EventLogRecord& rec = eventLog::records[(start + i) % eventLog::CAPACITY];
+      if (rec.ts <= since) continue;
+      if (arr.size() >= limit) break;
+      JsonObject item = arr.createNestedObject();
+      item["ts"] = rec.ts;
+      item["src"] = eventLog::srcToString(rec.src);
+      item["code"] = rec.code;
+      item["v1"] = rec.v1;
+      item["v2"] = rec.v2;
+    }
+
+    String out;
+    serializeJson(arr, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/clear_events", HTTP_POST, []() {
+    eventLog::clear();
+    server.send(200, "text/plain", "OK");
+  });
+
+
   server.on("/settings", HTTP_GET, []() {
     server.send(200, "application/json", buildJsonSettings());
   });
@@ -1535,6 +1630,7 @@ void initWeb() {
         st.wellMode = WellMode::WAIT;
         resetWellTimersFull();
         appendLog(st.logsWell, "Скважина: ручной сброс аварии");
+        appendEventLog(eventLog::SRC_WELL, "W_RESET", 0, 0);
         saveWellState(true);
       } else if (action == "force_on") {
         st.wellManualMode = ManualMode::FORCE_ON;
@@ -1567,6 +1663,7 @@ void initWeb() {
         st.houseAutoRestartAt = 0;
         st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
         appendLog(st.logsHouse, "Дом: ручной сброс аварии");
+        appendEventLog(eventLog::SRC_HOUSE, "H_RESET", 0, 0);
       } else if (action == "force_on") {
         st.houseManualMode = ManualMode::FORCE_ON;
         appendLog(st.logsHouse, "Дом: включен принудительный режим");
@@ -1663,6 +1760,51 @@ void initWiFi() {
   appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
 }
 
+
+void trackStateEvents() {
+  static bool initialized = false;
+  static WellMode prevWellMode = WellMode::WAIT;
+  static HouseMode prevHouseMode = HouseMode::WAIT_WATER;
+  static bool prevWellAlarm = false;
+  static bool prevHouseAlarm = false;
+  static bool prevHouseAutoRestartPending = false;
+
+  if (!initialized) {
+    prevWellMode = st.wellMode;
+    prevHouseMode = st.houseMode;
+    prevWellAlarm = st.wellAlarm;
+    prevHouseAlarm = st.houseAlarm;
+    prevHouseAutoRestartPending = st.houseAutoRestartPending;
+    initialized = true;
+    return;
+  }
+
+  if (st.wellMode != prevWellMode) {
+    appendEventLog(eventLog::SRC_WELL, "W_MODE", static_cast<uint8_t>(st.wellMode), static_cast<uint8_t>(prevWellMode));
+    prevWellMode = st.wellMode;
+  }
+
+  if (st.houseMode != prevHouseMode) {
+    appendEventLog(eventLog::SRC_HOUSE, "H_MODE", static_cast<uint8_t>(st.houseMode), static_cast<uint8_t>(prevHouseMode));
+    prevHouseMode = st.houseMode;
+  }
+
+  if (st.wellAlarm != prevWellAlarm) {
+    appendEventLog(eventLog::SRC_WELL, "W_ALRM", st.wellAlarm ? 1.0f : 0.0f, tm.wellCurrent);
+    prevWellAlarm = st.wellAlarm;
+  }
+
+  if (st.houseAlarm != prevHouseAlarm) {
+    appendEventLog(eventLog::SRC_HOUSE, "H_ALRM", st.houseAlarm ? 1.0f : 0.0f, tm.houseCurrent);
+    prevHouseAlarm = st.houseAlarm;
+  }
+
+  if (st.houseAutoRestartPending != prevHouseAutoRestartPending) {
+    appendEventLog(eventLog::SRC_HOUSE, "H_RETRY", st.houseAutoRestartPending ? 1.0f : 0.0f, st.houseAutoRestartAttempts);
+    prevHouseAutoRestartPending = st.houseAutoRestartPending;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000UL);
@@ -1710,6 +1852,7 @@ void loop() {
     if (!linkLossLogged) {
       appendLog(st.logsWell, "Nano link timeout: потеря телеметрии, насосы остановлены");
       appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
+      appendEventLog(eventLog::SRC_LINK, "LINK_LOST", millis() - linkHealth.lastValidPacketMs, 0);
       linkLossLogged = true;
     }
     startupGraceLogged = false;
@@ -1729,6 +1872,7 @@ void loop() {
   runHouseLogic();
   runProtections(now);
   runHouseAutoRestart(now);
+  trackStateEvents();
   serviceNanoTx(now);
   feedTaskWatchdog();
 
