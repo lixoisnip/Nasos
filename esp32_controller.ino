@@ -1308,7 +1308,8 @@ void runHouseAutoRestart(unsigned long now) {
   st.houseDryStart = 0;
 
   appendLog(st.logsHouse, "Дом: автоперезапуск " + String(st.houseAutoRestartAttempts) + "/" + String(houseCtrl::AUTO_RESTART_MAX));
-  appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_RETRY, st.houseAutoRestartAttempts, st.houseAutoRestartReason);
+  appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_RETRY, st.houseAutoRestartAttempts,
+                 static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
 }
 
 void runProtections(unsigned long now) {
@@ -1384,7 +1385,8 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts, st.houseAutoRestartReason);
+          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts,
+                         static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
         }
       }
     } else st.houseOverloadStart = 0;
@@ -1415,7 +1417,8 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts, st.houseAutoRestartReason);
+          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts,
+                         static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
         }
       }
     } else st.houseDryStart = 0;
@@ -1447,7 +1450,8 @@ void runProtections(unsigned long now) {
           st.houseAutoRestartAt = 0;
           st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
           appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts, st.houseAutoRestartReason);
+          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts,
+                         static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
         }
       }
     }
