@@ -178,6 +178,34 @@
   let lastEventTs = 0;
   let eventLines = [];
 
+  const EVENT_LABELS = {
+    EV_WELL_WAIT: 'Скважина: ожидание',
+    EV_WELL_FAIL: 'Скважина: аварийный WAIT/FAIL',
+    EV_WELL_START: 'Скважина: запуск',
+    EV_WELL_START_OK: 'Скважина: запуск успешен',
+    EV_WELL_START_NO_CURRENT: 'Скважина: нет тока после запуска',
+    EV_WELL_START_NO_PRESSURE: 'Скважина: давление не выросло после запуска',
+    EV_WELL_DRY: 'Скважина: сухой ход',
+    EV_WELL_RESET: 'Скважина: ручной сброс',
+    EV_WELL_MODE: 'Скважина: смена режима',
+    EV_WELL_ALARM_STATE: 'Скважина: изменение флага аварии',
+    EV_HOUSE_START: 'Дом: запуск',
+    EV_HOUSE_PI_START: 'Дом: переход в RUNNING (ПИ)',
+    EV_HOUSE_RETRY: 'Дом: автоперезапуск/состояние ретрая',
+    EV_HOUSE_OVERLOAD: 'Дом: перегрузка по току',
+    EV_HOUSE_DRY: 'Дом: сухой ход',
+    EV_HOUSE_BLOCKED: 'Дом: блокировка',
+    EV_HOUSE_RESET: 'Дом: ручной сброс',
+    EV_HOUSE_MODE: 'Дом: смена режима',
+    EV_HOUSE_ALARM_STATE: 'Дом: изменение флага аварии',
+    EV_LINK_LOST: 'Связь с Nano потеряна'
+  };
+
+  function eventLabel(code) {
+    const key = String(code || '').trim();
+    return EVENT_LABELS[key] || '';
+  }
+
   function isCriticalEventCode(code) {
     const normalized = String(code || '').toUpperCase();
     return normalized.includes('ALARM')
@@ -186,20 +214,26 @@
       || normalized.includes('RESET')
       || normalized.includes('BOOT')
       || normalized.includes('PANIC')
-      || normalized.includes('FAULT');
+      || normalized.includes('FAULT')
+      || normalized.includes('DRY')
+      || normalized.includes('OVERLOAD')
+      || normalized.includes('BLOCKED')
+      || normalized.includes('LINK_LOST');
   }
 
   function formatEventLine(event) {
     const ts = Number(event?.ts ?? event?.timestamp ?? 0);
     const src = String(event?.src ?? event?.pump ?? event?.source ?? '').trim();
     const code = String(event?.code ?? event?.event ?? '').trim();
-    const p = Number(event?.p ?? event?.pressure);
-    const i = Number(event?.i ?? event?.current);
+    const label = eventLabel(code);
+    const v1 = Number(event?.v1 ?? event?.p ?? event?.pressure);
+    const v2 = Number(event?.v2 ?? event?.i ?? event?.current);
     const parts = [`[${Number.isFinite(ts) ? ts : 0}]`];
     if (src) parts.push(src);
-    if (code) parts.push(code);
-    if (Number.isFinite(p)) parts.push(`p=${p.toFixed(2)}`);
-    if (Number.isFinite(i)) parts.push(`i=${i.toFixed(1)}`);
+    parts.push(`code=${code || '-'}`);
+    if (label) parts.push(`label="${label}"`);
+    parts.push(`v1=${Number.isFinite(v1) ? v1.toFixed(2) : '-'}`);
+    parts.push(`v2=${Number.isFinite(v2) ? v2.toFixed(2) : '-'}`);
     return parts.join(' ');
   }
 
