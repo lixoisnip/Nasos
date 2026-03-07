@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 // -------- Controller enums --------
 enum class PumpIntention : uint8_t {
@@ -766,6 +767,39 @@ bool applySingleSetting(const String& key, float value) {
 
   if (cfg.house.minFreq > cfg.house.maxFreq) cfg.house.maxFreq = cfg.house.minFreq;
   if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
+  return true;
+}
+
+bool tryParseStrictFloat(const String& raw, float& outValue, String& reason) {
+  String trimmed = raw;
+  trimmed.trim();
+  if (trimmed.length() == 0) {
+    reason = "empty value";
+    return false;
+  }
+
+  const char* begin = trimmed.c_str();
+  char* end = nullptr;
+  outValue = strtof(begin, &end);
+
+  if (end == begin) {
+    reason = "not a number";
+    return false;
+  }
+
+  while (*end != '\0') {
+    if (!isspace((unsigned char)*end)) {
+      reason = "invalid trailing characters";
+      return false;
+    }
+    end++;
+  }
+
+  if (!isfinite(outValue)) {
+    reason = "number is not finite";
+    return false;
+  }
+
   return true;
 }
 
@@ -1602,12 +1636,21 @@ void initWeb() {
       server.send(400, "text/plain", "Missing param/value");
       return;
     }
-    String p = server.arg("param");
-    float v = server.arg("value").toFloat();
-    if (!applySingleSetting(p, v)) {
-      server.send(400, "text/plain", "Unknown parameter");
+
+    const String p = server.arg("param");
+    const String rawValue = server.arg("value");
+    float v = 0.0f;
+    String parseReason;
+    if (!tryParseStrictFloat(rawValue, v, parseReason)) {
+      server.send(400, "text/plain", "Parameter '" + p + "' rejected: " + parseReason + " (value='" + rawValue + "')");
       return;
     }
+
+    if (!applySingleSetting(p, v)) {
+      server.send(400, "text/plain", "Parameter '" + p + "' rejected: unknown parameter");
+      return;
+    }
+
     saveSettingsToPrefs();
     server.send(200, "application/json", buildJsonSettings());
   });
