@@ -446,6 +446,16 @@
     renderSettingsForm(json);
   }
 
+
+  async function readErrorText(res, fallback) {
+    try {
+      const txt = (await res.text()).trim();
+      return txt || fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
   async function saveSettings(e) {
     e.preventDefault();
     const payload = { cfg: {}, cfgHouse: {}, common: {}, network: {} };
@@ -471,7 +481,8 @@
       alert('Параметры сохранены.');
       renderSettingsForm(await res.json());
     } else {
-      alert('Ошибка сохранения параметров.');
+      const errText = await readErrorText(res, 'Ошибка сохранения параметров.');
+      alert(`Ошибка сохранения параметров: ${errText}`);
     }
   }
 
