@@ -150,6 +150,9 @@ struct NanoState {
 } ns;
 
 const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
+const unsigned long I2C_SANITY_CHECK_INTERVAL_MS = 5000;
+const unsigned long L1_L2_STUCK_WINDOW_MS = 45000;
+const unsigned long WIRING_WARNING_RATE_LIMIT_MS = 15000;
 
 const float WELL_CURRENT_DRY = 3.3f;
 const float WELL_CURRENT_OVERLOAD = 4.3f;
@@ -387,6 +390,48 @@ unsigned long nanoShortFrameCount = 0;
 unsigned long nanoBadHeaderCount = 0;
 unsigned long nanoBadCrcCount = 0;
 unsigned long nanoParseRejectCount = 0;
+unsigned long nanoLastErrorSnapshot = 0;
+unsigned long nanoLastLevelTransitionAt = 0;
+unsigned long nanoLastSanityCheckAt = 0;
+unsigned long nanoLastWiringWarningAt = 0;
+bool nanoLastL1 = false;
+bool nanoLastL2 = false;
+
+void printBootPinWarningBanner() {
+  Serial.println();
+  Serial.println(F("=============================================="));
+  Serial.println(F("WARNING: I2C mode active (A4/A5 reserved)"));
+  Serial.println(F("Level pin mapping: L1=D4, L2=D5, L3=A6, L4=A7"));
+  Serial.println(F("Legacy A4/A5 level wiring is NOT compatible."));
+  Serial.println(F("=============================================="));
+}
+
+void checkI2cLevelWiringSanity(unsigned long now) {
+  if (now - nanoLastSanityCheckAt < I2C_SANITY_CHECK_INTERVAL_MS) return;
+  nanoLastSanityCheckAt = now;
+
+  const unsigned long errorTotal = nanoCommandSeqGapCount + nanoShortFrameCount + nanoBadHeaderCount +
+                                   nanoBadCrcCount + nanoParseRejectCount;
+  const unsigned long errorDelta = errorTotal - nanoLastErrorSnapshot;
+  nanoLastErrorSnapshot = errorTotal;
+
+  if (ns.levels[0] != nanoLastL1 || ns.levels[1] != nanoLastL2) {
+    nanoLastLevelTransitionAt = now;
+    nanoLastL1 = ns.levels[0];
+    nanoLastL2 = ns.levels[1];
+  }
+
+  const bool i2cUnstable = errorDelta >= 2;
+  const bool l1l2Stuck = (now - nanoLastLevelTransitionAt) >= L1_L2_STUCK_WINDOW_MS;
+  if (!i2cUnstable || !l1l2Stuck) return;
+
+  if (now - nanoLastWiringWarningAt < WIRING_WARNING_RATE_LIMIT_MS) return;
+  nanoLastWiringWarningAt = now;
+
+  Serial.println(F("[WIRING WARNING] I2C traffic unstable and L1/L2 look stuck/invalid."));
+  Serial.println(F("[WIRING WARNING] Verify level sensor wiring: L1=D4, L2=D5 (NOT A4/A5)."));
+  Serial.println(F("[WIRING WARNING] Legacy A4/A5 level wiring conflicts with I2C SDA/SCL."));
+}
 
 bool applyCommandFrame(const uint8_t* frame, size_t len, unsigned long now) {
   if (len != nanoProto::COMMAND_FRAME_LEN) {
@@ -529,6 +574,11 @@ void setup() {
   pinMode(L1, INPUT);
   pinMode(L2, INPUT);
 
+  printBootPinWarningBanner();
+  nanoLastLevelTransitionAt = millis();
+  nanoLastL1 = readLevelPin(L1);
+  nanoLastL2 = readLevelPin(L2);
+
   long sum = 0;
   for (int i = 0; i < 600; i++) {
     sum += analogRead(ACS_PIN);
@@ -553,6 +603,7 @@ void loop() {
   applyOutputs();
   feedWatchdog();
   sendTelemetry(now);
+  checkI2cLevelWiringSanity(now);
 
   feedWatchdog();
 }
