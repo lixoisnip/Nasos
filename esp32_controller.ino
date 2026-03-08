@@ -109,6 +109,8 @@ struct NanoCommandPacket {
   uint8_t houseMode = 0;
   bool houseAlarm = false;
   bool houseBlocked = false;
+  unsigned long levelFilterMs = 0;
+  float levelThresh = 0;
 };
 
 namespace watchdogCfg {
@@ -253,7 +255,7 @@ float normalizeTelemetryCurrent(float amps, float gain) {
 
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
-constexpr uint8_t VERSION = 1;
+constexpr uint8_t VERSION = 2;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
 constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
@@ -270,7 +272,7 @@ constexpr unsigned long CMD_PERIOD_MS = 80UL;
 constexpr unsigned long HEARTBEAT_PERIOD_MS = 1000UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
-constexpr uint8_t COMMAND_FRAME_LEN = 14;
+constexpr uint8_t COMMAND_FRAME_LEN = 18;
 constexpr uint8_t TELEMETRY_FRAME_LEN = 16;
 constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
 constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
@@ -284,6 +286,8 @@ struct NanoCommandPayload {
   uint8_t wellIntention = 0;
   uint8_t houseMode = 0;
   uint8_t flags = 0;
+  uint16_t levelFilterMs = 0;
+  uint16_t levelThreshRaw = 0;
 } __attribute__((packed));
 
 struct NanoTelemetryPayload {
@@ -1053,6 +1057,8 @@ NanoCommandPacket buildNanoCommandPacket() {
   packet.houseMode = (uint8_t)st.houseMode;
   packet.houseAlarm = st.houseAlarm;
   packet.houseBlocked = st.houseBlocked;
+  packet.levelFilterMs = cfg.common.levelFilterMs;
+  packet.levelThresh = cfg.common.thresh;
   return packet;
 }
 
@@ -1065,6 +1071,9 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
   payload.wellIntention = packet.wellIntention;
   payload.houseMode = packet.houseMode;
   payload.flags = 0;
+  payload.levelFilterMs = (uint16_t)constrain(packet.levelFilterMs, 0UL, 30000UL);
+  const float boundedLevelThresh = constrain(packet.levelThresh, 0.0f, 5.0f);
+  payload.levelThreshRaw = (uint16_t)lroundf((boundedLevelThresh / 5.0f) * 1023.0f);
   if (packet.wellAlarm) payload.flags |= nanoProto::FLAG_WELL_ALARM;
   if (packet.wellBlocked) payload.flags |= nanoProto::FLAG_WELL_BLOCKED;
   if (packet.houseAlarm) payload.flags |= nanoProto::FLAG_HOUSE_ALARM;
