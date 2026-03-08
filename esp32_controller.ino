@@ -152,6 +152,47 @@ String resetReasonToString(esp_reset_reason_t reason) {
 }
 
 namespace defaults {
+/*
+Baseline table (Osnova.ino -> esp32_controller.ino)
+WELL (cfg):
+  TARGET_MIN(5.0) -> defaults::well.targetMinutes(5.0)
+  L_PER_MIN(30.0) -> defaults::well.litersPerMin(30.0)
+  CURRENT_DRY(3.3) -> defaults::well.dryCurrent(3.3)
+  CURRENT_OVERLOAD(4.3) -> defaults::well.overloadCurrent(4.3)
+  CURRENT_EMERGENCY(6.0) -> defaults::well.emergencyCurrent(6.0)
+  DRY_DELAY_MS(8000) -> defaults::well.dryDelayMs(8000)
+  OVERLOAD_DELAY_MS(5000) -> defaults::well.overloadDelayMs(5000)
+  CURRENT_MIN_START(2.9) -> wellCtrl::CURRENT_MIN_START(2.9)
+  PRESSURE_MIN_OK(0.30) -> wellCtrl::PRESSURE_MIN_OK(0.30)
+  PRESSURE_WARNING(1.20) -> wellCtrl::PRESSURE_WARNING(1.20)
+  PRESSURE_BLOCK(1.50) -> wellCtrl::PRESSURE_BLOCK(1.50)
+  PRESSURE_CHECK_DELAY(8000) -> wellCtrl::PRESSURE_CHECK_DELAY(8000)
+  MAX_FAILED_STARTS(3) -> wellCtrl::MAX_FAILED_STARTS(3)
+  START CURRENT CHECK(15000 runtime check in STARTING) -> wellCtrl::CURRENT_CHECK_DELAY(15000)
+
+HOUSE (cfgHouse):
+  SETPOINT_BAR(1.00) -> defaults::house.setpointBar(1.00)
+  HYST_ON(0.50) -> defaults::house.hystOn(0.50)
+  HYST_OFF(1.18) -> defaults::house.hystOff(1.18)
+  MIN_FREQ(28.0) -> defaults::house.minFreq(28.0)
+  MAX_FREQ(50.0) -> defaults::house.maxFreq(50.0)
+  CURRENT_DRY(0.4) -> defaults::house.dryCurrent(0.4)
+  CURRENT_OVERLOAD(1.3) -> defaults::house.overloadCurrent(1.3)
+  CURRENT_EMERGENCY(1.5) -> defaults::house.emergencyCurrent(1.5)
+  DRY_DELAY_MS(8000) -> defaults::house.dryDelayMs(8000)
+  OVERLOAD_DELAY_MS(5000) -> defaults::house.overloadDelayMs(5000)
+  DRY_PRESSURE_START_TIMEOUT(10000) -> houseCtrl::DRY_PRESSURE_START_TIMEOUT(10000)
+  DRY_PRESSURE_WORK_TIMEOUT(15000) -> houseCtrl::DRY_PRESSURE_WORK_TIMEOUT(15000)
+  PRESSURE_RISE_THRESHOLD(0.1) -> houseCtrl::PRESSURE_RISE_THRESHOLD(0.1)
+  PID_PERIOD(300) -> houseCtrl::PID_PERIOD(300)
+  FREQ_STEP_DELAY(500) -> houseCtrl::FREQ_STEP_DELAY(500)
+
+COMMON:
+  MIN_PAUSE(10 min) -> defaults::common.pauseMinMs(600000 ms)
+  MAX_PAUSE(90 min) -> defaults::common.pauseMaxMs(5400000 ms)
+  LEVEL_FILTER_MS(2000) -> defaults::common.levelFilterMs(2000)
+  INIT_DELAY_MS(6000) -> defaults::common.initDelayMs(6000)
+*/
 const WellConfig well = {
   3.3f,
   4.3f,
@@ -176,10 +217,10 @@ const HouseConfig house = {
 };
 
 const CommonConfig common = {
-  10000.0f,
-  90000.0f,
-  200UL,
-  3000UL,
+  600000.0f,
+  5400000.0f,
+  2000UL,
+  6000UL,
   0.10f
 };
 
@@ -214,15 +255,15 @@ constexpr float SAVE_LITERS_DELTA = 50.0f;
 
 namespace houseCtrl {
 constexpr unsigned long PID_PERIOD = 300UL;
-constexpr float PID_KP = 18.0f;
-constexpr float PID_KI = 2.8f;
-constexpr float INTEGRAL_LIMIT = 6.0f;
+constexpr float PID_KP = 18.0f;      // Intentional deviation: ESP32 PID is normalized for VFD Hz control (Osnova used PWM-like scale 260.0). Risk: reverting blindly can cause unstable pressure oscillation.
+constexpr float PID_KI = 2.8f;       // Intentional deviation: retuned integrator for 300ms loop and filtered telemetry. Risk: too low -> chronic undershoot, too high -> overshoot/hunting.
+constexpr float INTEGRAL_LIMIT = 6.0f; // Intentional deviation: narrower anti-windup than Osnova(18.0) for safer recovery after dry-run faults. Risk: may slow recovery under high demand.
 constexpr float FREQ_STEP = 1.5f;
-constexpr unsigned long FREQ_STEP_DELAY = 180UL;
+constexpr unsigned long FREQ_STEP_DELAY = 500UL;
 
-constexpr float PRESSURE_RISE_THRESHOLD = 0.08f;
-constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 8000UL;
-constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 12000UL;
+constexpr float PRESSURE_RISE_THRESHOLD = 0.10f;
+constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;
+constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 15000UL;
 
 constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
 constexpr unsigned long MIN_OFF_MS = 30000UL;
@@ -231,8 +272,8 @@ constexpr unsigned long SLEEP_QUALIFY_MS = 30000UL;
 constexpr float PRESSURE_SLEEP_BAND = 0.10f;
 constexpr float SLEEP_DERIVATIVE_MAX = 0.02f;
 constexpr float SLEEP_FREQ_BAND = 1.0f;
-constexpr uint8_t AUTO_RESTART_MAX = 3;
-constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL;
+constexpr uint8_t AUTO_RESTART_MAX = 3;               // Intentional deviation: Osnova had no dedicated auto-restart counter for house faults; capped retries prevent endless cycling. Risk: repeated attempts can still stress motor during persistent fault.
+constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL; // Intentional deviation: short cooldown to restore household pressure quickly after transient trips. Risk: if source fault persists, retries happen sooner.
 constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
 }
 
@@ -786,6 +827,9 @@ void loadSettingsFromPrefs() {
   cfg.common.levelFilterMs = settingsPrefs.getULong("c_lvl_ms", cfg.common.levelFilterMs);
   cfg.common.initDelayMs = settingsPrefs.getULong("c_init_ms", cfg.common.initDelayMs);
   cfg.common.thresh = settingsPrefs.getFloat("c_thresh", cfg.common.thresh);
+  cfg.common.pauseMinMs = constrain(cfg.common.pauseMinMs, 600000.0f, 7200000.0f);
+  cfg.common.pauseMaxMs = constrain(cfg.common.pauseMaxMs, 600000.0f, 10800000.0f);
+  if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
 
   cfg.network.wifiSsid = settingsPrefs.getString("n_sta_ssid", cfg.network.wifiSsid);
   cfg.network.wifiPass = settingsPrefs.getString("n_sta_pass", cfg.network.wifiPass);
@@ -813,8 +857,8 @@ bool applySingleSetting(const String& key, float value) {
   else if (key == "cfgHouse.dryDelayMs") cfg.house.dryDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
   else if (key == "cfgHouse.overloadDelayMs") cfg.house.overloadDelayMs = (unsigned long)constrain(value, 100.0f, 120000.0f);
 
-  else if (key == "common.pauseMinMs") cfg.common.pauseMinMs = constrain(value, 1000.0f, 300000.0f);
-  else if (key == "common.pauseMaxMs") cfg.common.pauseMaxMs = constrain(value, 1000.0f, 600000.0f);
+  else if (key == "common.pauseMinMs") cfg.common.pauseMinMs = constrain(value, 600000.0f, 7200000.0f);
+  else if (key == "common.pauseMaxMs") cfg.common.pauseMaxMs = constrain(value, 600000.0f, 10800000.0f);
   else if (key == "LEVEL_FILTER_MS" || key == "common.LEVEL_FILTER_MS") cfg.common.levelFilterMs = (unsigned long)constrain(value, 0.0f, 30000.0f);
   else if (key == "INIT_DELAY_MS" || key == "common.INIT_DELAY_MS") cfg.common.initDelayMs = (unsigned long)constrain(value, 0.0f, 60000.0f);
   else if (key == "THRESH" || key == "common.THRESH") cfg.common.thresh = constrain(value, 0.0f, 5.0f);
@@ -2019,6 +2063,7 @@ void loop() {
   readNanoI2c();
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
+  const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
   const bool telemetryFresh = (now - linkHealth.lastValidPacketMs) < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
   linkAlive = (startupGraceActive || telemetryFresh) && txHealthy;
@@ -2052,9 +2097,23 @@ void loop() {
     }
   }
 
+  static bool startupInitLogged = false;
+  if (startupInitActive) {
+    st.wellRelay = false;
+    st.vfdRun = false;
+    if (!startupInitLogged) {
+      appendLog(st.logsWell, "Защитная задержка запуска активна (INIT_DELAY_MS)");
+      appendLog(st.logsHouse, "Защитная задержка запуска активна (INIT_DELAY_MS)");
+      startupInitLogged = true;
+    }
+  } else {
+    startupInitLogged = false;
+    feedTaskWatchdog();
+    runWellLogic(now);
+    runHouseLogic();
+  }
+
   feedTaskWatchdog();
-  runWellLogic(now);
-  runHouseLogic();
   runProtections(now);
   runHouseAutoRestart(now);
   trackStateEvents();
