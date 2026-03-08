@@ -6,7 +6,6 @@
 
 #include <Wire.h>
 #include <avr/wdt.h>
-#include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -65,11 +64,45 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 
 // I2C link to ESP32 (Nano as slave)
 constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
-constexpr size_t I2C_RX_MAX_LEN = 96;
-constexpr size_t I2C_TX_MAX_LEN = 96;
+namespace nanoProto {
+constexpr uint8_t MAGIC = 0xA5;
+constexpr uint8_t VERSION = 1;
+constexpr uint8_t MSG_COMMAND = 1;
+constexpr uint8_t MSG_TELEMETRY = 2;
+constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
+constexpr uint8_t FLAG_WELL_BLOCKED = 1 << 1;
+constexpr uint8_t FLAG_HOUSE_ALARM = 1 << 2;
+constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
+constexpr uint8_t STATUS_VFD_RUN = 1 << 0;
+constexpr uint8_t STATUS_CMD_STALE = 1 << 1;
+constexpr uint8_t STATUS_LINK_OK = 1 << 2;
+constexpr uint8_t COMMAND_FRAME_LEN = 14;   // 4-byte header + 8-byte payload + 2-byte CRC
+constexpr uint8_t TELEMETRY_FRAME_LEN = 16; // 4-byte header + 10-byte payload + 2-byte CRC
+constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
+}
+
 volatile bool i2cCommandReady = false;
-char i2cCommandBuffer[I2C_RX_MAX_LEN + 1] = {0};
-char i2cTelemetryBuffer[I2C_TX_MAX_LEN + 1] = {0};
+volatile uint8_t i2cCommandFrame[nanoProto::COMMAND_FRAME_LEN] = {0};
+volatile uint8_t i2cTelemetryFrame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
+
+struct NanoCommandPayload {
+  uint8_t relay = 0;
+  uint8_t vfdRun = 0;
+  int16_t vfdFreqDeciHz = 0;
+  uint8_t wellMode = 0;
+  uint8_t wellIntention = 0;
+  uint8_t houseMode = 0;
+  uint8_t flags = 0;
+} __attribute__((packed));
+
+struct NanoTelemetryPayload {
+  int16_t wellCurrentCentiA = 0;
+  int16_t wellPressureCentiBar = 0;
+  int16_t houseCurrentCentiA = 0;
+  int16_t housePressureCentiBar = 0;
+  uint8_t levelsMask = 0;
+  uint8_t statusBits = 0;
+} __attribute__((packed));
 
 const uint8_t WELL_CURRENT_SAMPLES = 120;
 const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
@@ -163,11 +196,6 @@ void feedWatchdog() {
   wdt_reset();
 }
 
-uint8_t calcXorChecksum(const String &payload) {
-  uint8_t checksum = 0;
-  for (int i = 0; i < payload.length(); i++) checksum ^= (uint8_t)payload[i];
-  return checksum;
-}
 
 void txMode() {
   digitalWrite(PIN_RS485_DE_RE, HIGH);
@@ -324,79 +352,161 @@ void applyOutputs() {
   }
 }
 
-void handleCommand(char* cmd) {
-  char* token = strtok(cmd, ";");
-  while (token != nullptr) {
-    char* eq = strchr(token, '=');
-    if (eq != nullptr && eq != token) {
-      *eq = '\0';
-      const char* key = token;
-      const char* val = eq + 1;
-      if (strcmp(key, "RELAY") == 0) ns.relayWellOn = atoi(val) == 1;
-      if (strcmp(key, "VFD_RUN") == 0) ns.vfdRun = atoi(val) == 1;
-      if (strcmp(key, "VFD_FREQ") == 0) ns.vfdFreqHz = atof(val);
-      if (strcmp(key, "WELL_MODE") == 0) { ns.wellMode = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "WELL_ALARM") == 0) { ns.wellAlarm = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "WELL_BLOCKED") == 0) { ns.wellBlocked = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "WELL_INTENTION") == 0) { ns.wellIntention = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "HOUSE_MODE") == 0) { ns.houseMode = atoi(val); ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "HOUSE_ALARM") == 0) { ns.houseAlarm = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
-      if (strcmp(key, "HOUSE_BLOCKED") == 0) { ns.houseBlocked = atoi(val) == 1; ns.statusFromEsp = true; ns.statusUpdatedAt = millis(); }
+uint16_t calcCrc16(const uint8_t* data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x0001) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
     }
-    token = strtok(nullptr, ";");
   }
+  return crc;
+}
+
+void writeU16LE(uint8_t* dst, uint16_t value) {
+  dst[0] = (uint8_t)(value & 0xFF);
+  dst[1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+uint16_t readU16LE(const uint8_t* src) {
+  return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+int16_t clampScaled(float value, float scale) {
+  long scaled = lroundf(value * scale);
+  if (scaled < -32768L) scaled = -32768L;
+  if (scaled > 32767L) scaled = 32767L;
+  return (int16_t)scaled;
+}
+
+volatile uint8_t nanoLastCommandSeq = 0;
+volatile bool nanoCommandSeqValid = false;
+unsigned long nanoLastCommandAt = 0;
+unsigned long nanoCommandSeqGapCount = 0;
+unsigned long nanoShortFrameCount = 0;
+unsigned long nanoBadHeaderCount = 0;
+unsigned long nanoBadCrcCount = 0;
+unsigned long nanoParseRejectCount = 0;
+
+bool applyCommandFrame(const uint8_t* frame, size_t len, unsigned long now) {
+  if (len != nanoProto::COMMAND_FRAME_LEN) {
+    nanoParseRejectCount++;
+    return false;
+  }
+
+  NanoCommandPayload payload;
+  memcpy(&payload, frame + 4, sizeof(payload));
+
+  ns.relayWellOn = payload.relay != 0;
+  ns.vfdRun = payload.vfdRun != 0;
+  ns.vfdFreqHz = payload.vfdFreqDeciHz / 10.0f;
+  ns.wellMode = payload.wellMode;
+  ns.wellIntention = payload.wellIntention;
+  ns.houseMode = payload.houseMode;
+  ns.wellAlarm = (payload.flags & nanoProto::FLAG_WELL_ALARM) != 0;
+  ns.wellBlocked = (payload.flags & nanoProto::FLAG_WELL_BLOCKED) != 0;
+  ns.houseAlarm = (payload.flags & nanoProto::FLAG_HOUSE_ALARM) != 0;
+  ns.houseBlocked = (payload.flags & nanoProto::FLAG_HOUSE_BLOCKED) != 0;
+  ns.statusFromEsp = true;
+  ns.statusUpdatedAt = now;
+  nanoLastCommandAt = now;
+  return true;
 }
 
 void onI2cReceive(int count) {
   if (count <= 0) return;
-  size_t idx = 0;
-  while (Wire.available()) {
-    char c = (char)Wire.read();
-    if (idx < I2C_RX_MAX_LEN && isprint((unsigned char)c)) {
-      i2cCommandBuffer[idx++] = c;
-    }
+
+  uint8_t raw[nanoProto::COMMAND_FRAME_LEN] = {0};
+  uint8_t idx = 0;
+  while (Wire.available() && idx < sizeof(raw)) raw[idx++] = (uint8_t)Wire.read();
+  while (Wire.available()) { (void)Wire.read(); idx++; }
+
+  if (idx != nanoProto::COMMAND_FRAME_LEN) {
+    nanoShortFrameCount++;
+    return;
   }
-  i2cCommandBuffer[idx] = '\0';
-  i2cCommandReady = idx > 0;
+
+  if (raw[0] != nanoProto::MAGIC || raw[1] != nanoProto::VERSION || raw[2] != nanoProto::MSG_COMMAND) {
+    nanoBadHeaderCount++;
+    return;
+  }
+
+  uint16_t rxCrc = readU16LE(raw + nanoProto::COMMAND_FRAME_LEN - 2);
+  uint16_t calc = calcCrc16(raw, nanoProto::COMMAND_FRAME_LEN - 2);
+  if (rxCrc != calc) {
+    nanoBadCrcCount++;
+    return;
+  }
+
+  if (nanoCommandSeqValid && (uint8_t)(nanoLastCommandSeq + 1) != raw[3]) nanoCommandSeqGapCount++;
+  nanoLastCommandSeq = raw[3];
+  nanoCommandSeqValid = true;
+
+  noInterrupts();
+  memcpy((void*)i2cCommandFrame, raw, nanoProto::COMMAND_FRAME_LEN);
+  i2cCommandReady = true;
+  interrupts();
 }
 
 void onI2cRequest() {
-  Wire.write((const uint8_t*)i2cTelemetryBuffer, strnlen(i2cTelemetryBuffer, I2C_TX_MAX_LEN));
+  noInterrupts();
+  Wire.write((const uint8_t*)i2cTelemetryFrame, nanoProto::TELEMETRY_FRAME_LEN);
+  interrupts();
 }
 
-void processEspI2c() {
-  if (!i2cCommandReady) return;
+void processEspI2c(unsigned long now) {
+  if (i2cCommandReady) {
+    uint8_t local[nanoProto::COMMAND_FRAME_LEN] = {0};
+    noInterrupts();
+    memcpy(local, (const void*)i2cCommandFrame, nanoProto::COMMAND_FRAME_LEN);
+    i2cCommandReady = false;
+    interrupts();
 
-  char localCmd[I2C_RX_MAX_LEN + 1];
-  noInterrupts();
-  strncpy(localCmd, i2cCommandBuffer, I2C_RX_MAX_LEN);
-  localCmd[I2C_RX_MAX_LEN] = '\0';
-  i2cCommandReady = false;
-  interrupts();
+    if (!applyCommandFrame(local, sizeof(local), now)) {
+      nanoParseRejectCount++;
+    }
+  }
 
-  handleCommand(localCmd);
+  if (nanoLastCommandAt != 0 && (now - nanoLastCommandAt) > nanoProto::COMMAND_TIMEOUT_MS) {
+    ns.relayWellOn = false;
+    ns.vfdRun = false;
+    ns.vfdFreqHz = 0.0f;
+  }
 }
 
 void updateTelemetryFrame(unsigned long now) {
   if (now - ns.lastTelemetry < 100) return;
   ns.lastTelemetry = now;
 
-  String payload = "TEL,";
-  payload += String(now);
-  payload += ',' + String(ns.wellCurrent, 3);
-  payload += ',' + String(ns.wellPressureBar, 3);
-  payload += ',' + String(ns.houseCurrent, 3);
-  payload += ',' + String(ns.housePressureBar, 3);
-  payload += ',' + String(ns.levels[0] ? 1 : 0);
-  payload += ',' + String(ns.levels[1] ? 1 : 0);
-  payload += ',' + String(ns.levels[2] ? 1 : 0);
-  payload += ',' + String(ns.levels[3] ? 1 : 0);
-  payload += ',' + String(ns.vfdRun ? 1 : 0);
-  payload += ',' + String(ns.vfdFreqHz, 1);
+  NanoTelemetryPayload payload;
+  payload.wellCurrentCentiA = clampScaled(ns.wellCurrent, 100.0f);
+  payload.wellPressureCentiBar = clampScaled(ns.wellPressureBar, 100.0f);
+  payload.houseCurrentCentiA = clampScaled(ns.houseCurrent, 100.0f);
+  payload.housePressureCentiBar = clampScaled(ns.housePressureBar, 100.0f);
+  payload.levelsMask = (ns.levels[0] ? 1 : 0) |
+                       (ns.levels[1] ? 2 : 0) |
+                       (ns.levels[2] ? 4 : 0) |
+                       (ns.levels[3] ? 8 : 0);
+  payload.statusBits = 0;
+  if (ns.vfdRun) payload.statusBits |= nanoProto::STATUS_VFD_RUN;
+  if (nanoLastCommandAt != 0 && (now - nanoLastCommandAt) <= nanoProto::COMMAND_TIMEOUT_MS) {
+    payload.statusBits |= nanoProto::STATUS_LINK_OK;
+  } else {
+    payload.statusBits |= nanoProto::STATUS_CMD_STALE;
+  }
 
-  uint8_t checksum = calcXorChecksum(payload);
+  uint8_t frame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
+  frame[0] = nanoProto::MAGIC;
+  frame[1] = nanoProto::VERSION;
+  frame[2] = nanoProto::MSG_TELEMETRY;
+  static uint8_t txSeq = 0;
+  frame[3] = txSeq++;
+  memcpy(frame + 4, &payload, sizeof(payload));
+  uint16_t crc = calcCrc16(frame, nanoProto::TELEMETRY_FRAME_LEN - 2);
+  writeU16LE(frame + nanoProto::TELEMETRY_FRAME_LEN - 2, crc);
+
   noInterrupts();
-  snprintf(i2cTelemetryBuffer, sizeof(i2cTelemetryBuffer), "%s*%02X", payload.c_str(), checksum);
+  memcpy((void*)i2cTelemetryFrame, frame, nanoProto::TELEMETRY_FRAME_LEN);
   interrupts();
 }
 
@@ -437,7 +547,7 @@ void setup() {
 void loop() {
   feedWatchdog();
   unsigned long now = millis();
-  processEspI2c();
+  processEspI2c(now);
   feedWatchdog();
   readInputs(now);
   applyOutputs();

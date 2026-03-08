@@ -251,14 +251,47 @@ float normalizeTelemetryCurrent(float amps, float gain) {
   return normalized;
 }
 
+namespace nanoProto {
+constexpr uint8_t MAGIC = 0xA5;
+constexpr uint8_t VERSION = 1;
+constexpr uint8_t MSG_COMMAND = 1;
+constexpr uint8_t MSG_TELEMETRY = 2;
+constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
+constexpr uint8_t FLAG_WELL_BLOCKED = 1 << 1;
+constexpr uint8_t FLAG_HOUSE_ALARM = 1 << 2;
+constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
+constexpr uint8_t STATUS_VFD_RUN = 1 << 0;
+constexpr uint8_t STATUS_CMD_STALE = 1 << 1;
+constexpr uint8_t STATUS_LINK_OK = 1 << 2;
+}
+
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
-constexpr unsigned long HEARTBEAT_PERIOD_MS = 800UL;
-constexpr unsigned long LINK_TIMEOUT_MS = 2000UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
-constexpr size_t MAX_FRAME_LEN = 96;
+constexpr uint8_t COMMAND_FRAME_LEN = 14;
+constexpr uint8_t TELEMETRY_FRAME_LEN = 16;
+constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
 }
+
+struct NanoCommandPayload {
+  uint8_t relay = 0;
+  uint8_t vfdRun = 0;
+  int16_t vfdFreqDeciHz = 0;
+  uint8_t wellMode = 0;
+  uint8_t wellIntention = 0;
+  uint8_t houseMode = 0;
+  uint8_t flags = 0;
+} __attribute__((packed));
+
+struct NanoTelemetryPayload {
+  int16_t wellCurrentCentiA = 0;
+  int16_t wellPressureCentiBar = 0;
+  int16_t houseCurrentCentiA = 0;
+  int16_t housePressureCentiBar = 0;
+  uint8_t levelsMask = 0;
+  uint8_t statusBits = 0;
+} __attribute__((packed));
 
 struct Telemetry {
   unsigned long ts = 0;
@@ -268,16 +301,23 @@ struct Telemetry {
   float housePressure = 0;
   bool levels[4] = {false, false, false, false};
   bool vfdRunFeedback = false;
+  bool cmdStale = false;
+  bool linkOk = false;
   float vfdFreqFeedback = 0;
   bool valid = false;
 } tm;
 
 struct LinkHealth {
   unsigned long lastValidPacketMs = 0;
-  unsigned long crcErrorCount = 0;
   unsigned long totalPackets = 0;
-  unsigned long lastRxByteMs = 0;
-  unsigned long rxFrameErrorCount = 0;
+  unsigned long shortFrameCount = 0;
+  unsigned long badHeaderCount = 0;
+  unsigned long badCrcCount = 0;
+  unsigned long parseRejectCount = 0;
+  unsigned long seqGapCount = 0;
+  uint8_t lastTelemetrySeq = 0;
+  bool telemetrySeqValid = false;
+  uint8_t txSeq = 0;
 } linkHealth;
 
 bool linkAlive = false;
@@ -864,78 +904,92 @@ void pushHistory(float* arr, float value) {
   arr[19] = value;
 }
 
-uint8_t calcXorChecksum(const String& payload) {
-  uint8_t checksum = 0;
-  for (int i = 0; i < payload.length(); i++) checksum ^= (uint8_t)payload[i];
-  return checksum;
+uint16_t calcCrc16(const uint8_t* data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x0001) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+    }
+  }
+  return crc;
 }
 
-uint8_t calcXorChecksum(const char* payload, size_t len) {
-  uint8_t checksum = 0;
-  for (size_t i = 0; i < len; i++) checksum ^= (uint8_t)payload[i];
-  return checksum;
+void writeU16LE(uint8_t* dst, uint16_t value) {
+  dst[0] = (uint8_t)(value & 0xFF);
+  dst[1] = (uint8_t)((value >> 8) & 0xFF);
 }
 
-void parseNanoLine(char* line) {
-  char* star = strrchr(line, '*');
-  if (star == nullptr || star == line || *(star + 1) == '\0') return;
+uint16_t readU16LE(const uint8_t* src) {
+  return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
 
-  *star = '\0';
-  char* checksumText = star + 1;
-  uint8_t expected = (uint8_t)strtoul(checksumText, nullptr, 16);
-  uint8_t actual = calcXorChecksum(line, strlen(line));
+int16_t clampScaled(float value, float scale) {
+  long scaled = lroundf(value * scale);
+  if (scaled < -32768L) scaled = -32768L;
+  if (scaled > 32767L) scaled = 32767L;
+  return (int16_t)scaled;
+}
 
-  linkHealth.totalPackets++;
-  if (actual != expected) {
-    linkHealth.crcErrorCount++;
-    return;
-  }
-
-  if (strncmp(line, "TEL,", 4) != 0) return;
-
-  float vals[11] = {0};
-  int idx = 0;
-  char* cursor = line + 4;
-  while (idx < 11 && cursor != nullptr && *cursor != '\0') {
-    char* comma = strchr(cursor, ',');
-    if (comma != nullptr) *comma = '\0';
-    vals[idx++] = atof(cursor);
-    cursor = (comma != nullptr) ? (comma + 1) : nullptr;
-  }
-  if (idx < 11) return;
-
-  tm.ts = (unsigned long)vals[0];
-  tm.wellCurrent = normalizeTelemetryCurrent(vals[1], telemetryCurrent::WELL_GAIN);
-  tm.wellPressure = vals[2];
-  tm.houseCurrent = normalizeTelemetryCurrent(vals[3], telemetryCurrent::HOUSE_GAIN);
-  tm.housePressure = vals[4];
-  tm.levels[0] = vals[5] > 0.5f;
-  tm.levels[1] = vals[6] > 0.5f;
-  tm.levels[2] = vals[7] > 0.5f;
-  tm.levels[3] = vals[8] > 0.5f;
-  tm.vfdRunFeedback = vals[9] > 0.5f;
-  tm.vfdFreqFeedback = vals[10];
+bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long now) {
+  tm.ts = now;
+  tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
+  tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
+  tm.houseCurrent = normalizeTelemetryCurrent(payload.houseCurrentCentiA / 100.0f, telemetryCurrent::HOUSE_GAIN);
+  tm.housePressure = payload.housePressureCentiBar / 100.0f;
+  tm.levels[0] = (payload.levelsMask & 0x01) != 0;
+  tm.levels[1] = (payload.levelsMask & 0x02) != 0;
+  tm.levels[2] = (payload.levelsMask & 0x04) != 0;
+  tm.levels[3] = (payload.levelsMask & 0x08) != 0;
+  tm.vfdRunFeedback = (payload.statusBits & nanoProto::STATUS_VFD_RUN) != 0;
+  tm.cmdStale = (payload.statusBits & nanoProto::STATUS_CMD_STALE) != 0;
+  tm.linkOk = (payload.statusBits & nanoProto::STATUS_LINK_OK) != 0;
+  tm.vfdFreqFeedback = st.vfdFreq;
   tm.valid = true;
-  linkHealth.lastValidPacketMs = millis();
+  linkHealth.lastValidPacketMs = now;
   hasEverReceivedTelemetry = true;
+  return true;
 }
 
 void readNanoI2c() {
-  char line[nanoLink::MAX_FRAME_LEN + 1] = {0};
-  size_t idx = 0;
-
-  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, (int)nanoLink::MAX_FRAME_LEN);
+  uint8_t frame[nanoLink::TELEMETRY_FRAME_LEN] = {0};
+  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, (int)nanoLink::TELEMETRY_FRAME_LEN);
   if (received <= 0) return;
 
-  while (Wire.available() && idx < nanoLink::MAX_FRAME_LEN) {
-    char c = (char)Wire.read();
-    if (isprint((unsigned char)c)) line[idx++] = c;
-  }
-  line[idx] = '\0';
-  if (idx == 0) return;
+  uint8_t idx = 0;
+  while (Wire.available() && idx < sizeof(frame)) frame[idx++] = (uint8_t)Wire.read();
+  while (Wire.available()) { (void)Wire.read(); idx++; }
 
-  linkHealth.lastRxByteMs = millis();
-  parseNanoLine(line);
+  linkHealth.totalPackets++;
+  if (idx != nanoLink::TELEMETRY_FRAME_LEN) {
+    linkHealth.shortFrameCount++;
+    return;
+  }
+
+  if (frame[0] != nanoProto::MAGIC || frame[1] != nanoProto::VERSION || frame[2] != nanoProto::MSG_TELEMETRY) {
+    linkHealth.badHeaderCount++;
+    return;
+  }
+
+  uint16_t rxCrc = readU16LE(frame + nanoLink::TELEMETRY_FRAME_LEN - 2);
+  uint16_t calc = calcCrc16(frame, nanoLink::TELEMETRY_FRAME_LEN - 2);
+  if (rxCrc != calc) {
+    linkHealth.badCrcCount++;
+    return;
+  }
+
+  const uint8_t seq = frame[3];
+  if (linkHealth.telemetrySeqValid && (uint8_t)(linkHealth.lastTelemetrySeq + 1) != seq) {
+    linkHealth.seqGapCount++;
+  }
+  linkHealth.lastTelemetrySeq = seq;
+  linkHealth.telemetrySeqValid = true;
+
+  NanoTelemetryPayload payload;
+  memcpy(&payload, frame + 4, sizeof(payload));
+  if (!decodeTelemetryPayload(payload, millis())) {
+    linkHealth.parseRejectCount++;
+  }
 }
 
 NanoCommandPacket buildNanoCommandPacket() {
@@ -953,69 +1007,41 @@ NanoCommandPacket buildNanoCommandPacket() {
   return packet;
 }
 
-bool nanoPacketChanged(const NanoCommandPacket& a, const NanoCommandPacket& b) {
-  return a.relay != b.relay ||
-         a.vfdRun != b.vfdRun ||
-         fabsf(a.vfdFreq - b.vfdFreq) > nanoLink::FREQ_EPS ||
-         a.wellMode != b.wellMode ||
-         a.wellAlarm != b.wellAlarm ||
-         a.wellBlocked != b.wellBlocked ||
-         a.wellIntention != b.wellIntention ||
-         a.houseMode != b.houseMode ||
-         a.houseAlarm != b.houseAlarm ||
-         a.houseBlocked != b.houseBlocked;
-}
-
 void sendNanoControlPacket(const NanoCommandPacket& packet) {
-  char payload[nanoLink::MAX_FRAME_LEN + 1];
-  snprintf(
-    payload,
-    sizeof(payload),
-    "RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f;WELL_MODE=%d;WELL_ALARM=%d;WELL_BLOCKED=%d;WELL_INTENTION=%d;HOUSE_MODE=%d;HOUSE_ALARM=%d;HOUSE_BLOCKED=%d",
-    packet.relay ? 1 : 0,
-    packet.vfdRun ? 1 : 0,
-    packet.vfdFreq,
-    (int)packet.wellMode,
-    packet.wellAlarm ? 1 : 0,
-    packet.wellBlocked ? 1 : 0,
-    (int)packet.wellIntention,
-    (int)packet.houseMode,
-    packet.houseAlarm ? 1 : 0,
-    packet.houseBlocked ? 1 : 0
-  );
+  NanoCommandPayload payload;
+  payload.relay = packet.relay ? 1 : 0;
+  payload.vfdRun = packet.vfdRun ? 1 : 0;
+  payload.vfdFreqDeciHz = clampScaled(packet.vfdFreq, 10.0f);
+  payload.wellMode = packet.wellMode;
+  payload.wellIntention = packet.wellIntention;
+  payload.houseMode = packet.houseMode;
+  payload.flags = 0;
+  if (packet.wellAlarm) payload.flags |= nanoProto::FLAG_WELL_ALARM;
+  if (packet.wellBlocked) payload.flags |= nanoProto::FLAG_WELL_BLOCKED;
+  if (packet.houseAlarm) payload.flags |= nanoProto::FLAG_HOUSE_ALARM;
+  if (packet.houseBlocked) payload.flags |= nanoProto::FLAG_HOUSE_BLOCKED;
+
+  uint8_t frame[nanoLink::COMMAND_FRAME_LEN] = {0};
+  frame[0] = nanoProto::MAGIC;
+  frame[1] = nanoProto::VERSION;
+  frame[2] = nanoProto::MSG_COMMAND;
+  frame[3] = linkHealth.txSeq++;
+  memcpy(frame + 4, &payload, sizeof(payload));
+  uint16_t crc = calcCrc16(frame, nanoLink::COMMAND_FRAME_LEN - 2);
+  writeU16LE(frame + nanoLink::COMMAND_FRAME_LEN - 2, crc);
 
   Wire.beginTransmission(NANO_I2C_ADDRESS);
-  Wire.write((const uint8_t*)payload, strlen(payload));
-  Wire.endTransmission();
-}
-
-void sendNanoHeartbeat(unsigned long now) {
-  char payload[24];
-  snprintf(payload, sizeof(payload), "HB=%lu", now);
-  Wire.beginTransmission(NANO_I2C_ADDRESS);
-  Wire.write((const uint8_t*)payload, strlen(payload));
+  Wire.write(frame, nanoLink::COMMAND_FRAME_LEN);
   Wire.endTransmission();
 }
 
 void serviceNanoTx(unsigned long now) {
   static unsigned long lastControlTxMs = 0;
-  static unsigned long lastHeartbeatTxMs = 0;
-  static bool hasLastPacket = false;
-  static NanoCommandPacket lastPacket;
 
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
-    if (!hasLastPacket || nanoPacketChanged(current, lastPacket)) {
-      sendNanoControlPacket(current);
-      lastPacket = current;
-      hasLastPacket = true;
-    }
+    sendNanoControlPacket(current);
     lastControlTxMs = now;
-  }
-
-  if (now - lastHeartbeatTxMs >= nanoLink::HEARTBEAT_PERIOD_MS) {
-    sendNanoHeartbeat(now);
-    lastHeartbeatTxMs = now;
   }
 }
 
@@ -1545,9 +1571,13 @@ String buildJsonState() {
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
   doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
   doc["link_alive"] = linkAlive;
-  doc["link_crc_errors"] = linkHealth.crcErrorCount;
-  doc["link_rx_frame_errors"] = linkHealth.rxFrameErrorCount;
   doc["link_total_packets"] = linkHealth.totalPackets;
+  doc["link_short_frames"] = linkHealth.shortFrameCount;
+  doc["link_bad_header"] = linkHealth.badHeaderCount;
+  doc["link_bad_crc"] = linkHealth.badCrcCount;
+  doc["link_parse_reject"] = linkHealth.parseRejectCount;
+  doc["link_seq_gaps"] = linkHealth.seqGapCount;
+  doc["telemetry_cmd_stale"] = tm.cmdStale;
 
   JsonArray lv = doc.createNestedArray("levels");
   for (int i = 0; i < 4; i++) lv.add(tm.levels[i]);
@@ -1913,7 +1943,8 @@ void loop() {
   readNanoI2c();
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
-  linkAlive = startupGraceActive || ((now - linkHealth.lastValidPacketMs) < nanoLink::LINK_TIMEOUT_MS);
+  const bool telemetryFresh = (now - linkHealth.lastValidPacketMs) < nanoLink::TELEMETRY_STALE_MS;
+  linkAlive = startupGraceActive || telemetryFresh;
   if (!linkAlive) {
     tm.valid = false;
     st.wellRelay = false;
