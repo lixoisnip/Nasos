@@ -267,11 +267,13 @@ constexpr uint8_t STATUS_LINK_OK = 1 << 2;
 
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
+constexpr unsigned long HEARTBEAT_PERIOD_MS = 1000UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
 constexpr uint8_t COMMAND_FRAME_LEN = 14;
 constexpr uint8_t TELEMETRY_FRAME_LEN = 16;
 constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
+constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
 }
 
 struct NanoCommandPayload {
@@ -309,15 +311,24 @@ struct Telemetry {
 
 struct LinkHealth {
   unsigned long lastValidPacketMs = 0;
+  unsigned long lastGoodRxMs = 0;
   unsigned long totalPackets = 0;
   unsigned long shortFrameCount = 0;
+  unsigned long shortReadCount = 0;
+  unsigned long invalidFrameCount = 0;
   unsigned long badHeaderCount = 0;
   unsigned long badCrcCount = 0;
   unsigned long parseRejectCount = 0;
   unsigned long seqGapCount = 0;
+  unsigned long txErrorCount = 0;
   uint8_t lastTelemetrySeq = 0;
+  uint8_t lastTxErrCode = 0;
   bool telemetrySeqValid = false;
+  bool txErrorBurstActive = false;
   uint8_t txSeq = 0;
+  unsigned long lastTxErrorLogMs = 0;
+  unsigned long lastShortReadLogMs = 0;
+  unsigned long lastInvalidFrameLogMs = 0;
 } linkHealth;
 
 bool linkAlive = false;
@@ -947,14 +958,44 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   tm.vfdFreqFeedback = st.vfdFreq;
   tm.valid = true;
   linkHealth.lastValidPacketMs = now;
+  linkHealth.lastGoodRxMs = now;
   hasEverReceivedTelemetry = true;
   return true;
 }
 
+void appendLinkLogThrottled(const String& message, unsigned long& lastLogMs) {
+  const unsigned long now = millis();
+  if (lastLogMs != 0 && (now - lastLogMs) < nanoLink::LOG_THROTTLE_MS) return;
+  appendLog(st.logsWell, message);
+  appendLog(st.logsHouse, message);
+  lastLogMs = now;
+}
+
+void recordNanoTxResult(uint8_t err, const char* context) {
+  if (err == 0) {
+    linkHealth.lastTxErrCode = 0;
+    linkHealth.txErrorBurstActive = false;
+    return;
+  }
+
+  linkHealth.txErrorCount++;
+  linkHealth.lastTxErrCode = err;
+  if (!linkHealth.txErrorBurstActive) {
+    const String msg = String("Nano I2C TX error (") + context + "): code=" + String(err);
+    appendLinkLogThrottled(msg, linkHealth.lastTxErrorLogMs);
+    linkHealth.txErrorBurstActive = true;
+  }
+}
+
 void readNanoI2c() {
   uint8_t frame[nanoLink::TELEMETRY_FRAME_LEN] = {0};
-  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, (int)nanoLink::TELEMETRY_FRAME_LEN);
+  const int expected = (int)nanoLink::TELEMETRY_FRAME_LEN;
+  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, expected);
   if (received <= 0) return;
+  if (received != expected) {
+    linkHealth.shortReadCount++;
+    appendLinkLogThrottled(String("Nano I2C short read: requested=") + String(expected) + ", received=" + String(received), linkHealth.lastShortReadLogMs);
+  }
 
   uint8_t idx = 0;
   while (Wire.available() && idx < sizeof(frame)) frame[idx++] = (uint8_t)Wire.read();
@@ -962,19 +1003,25 @@ void readNanoI2c() {
 
   linkHealth.totalPackets++;
   if (idx != nanoLink::TELEMETRY_FRAME_LEN) {
+    linkHealth.shortReadCount++;
     linkHealth.shortFrameCount++;
+    appendLinkLogThrottled(String("Nano I2C short frame: expected=") + String(nanoLink::TELEMETRY_FRAME_LEN) + ", actual=" + String(idx), linkHealth.lastShortReadLogMs);
     return;
   }
 
   if (frame[0] != nanoProto::MAGIC || frame[1] != nanoProto::VERSION || frame[2] != nanoProto::MSG_TELEMETRY) {
+    linkHealth.invalidFrameCount++;
     linkHealth.badHeaderCount++;
+    appendLinkLogThrottled("Nano I2C invalid frame: bad header", linkHealth.lastInvalidFrameLogMs);
     return;
   }
 
   uint16_t rxCrc = readU16LE(frame + nanoLink::TELEMETRY_FRAME_LEN - 2);
   uint16_t calc = calcCrc16(frame, nanoLink::TELEMETRY_FRAME_LEN - 2);
   if (rxCrc != calc) {
+    linkHealth.invalidFrameCount++;
     linkHealth.badCrcCount++;
+    appendLinkLogThrottled("Nano I2C invalid frame: CRC mismatch", linkHealth.lastInvalidFrameLogMs);
     return;
   }
 
@@ -988,7 +1035,9 @@ void readNanoI2c() {
   NanoTelemetryPayload payload;
   memcpy(&payload, frame + 4, sizeof(payload));
   if (!decodeTelemetryPayload(payload, millis())) {
+    linkHealth.invalidFrameCount++;
     linkHealth.parseRejectCount++;
+    appendLinkLogThrottled("Nano I2C invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
   }
 }
 
@@ -1032,16 +1081,29 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
 
   Wire.beginTransmission(NANO_I2C_ADDRESS);
   Wire.write(frame, nanoLink::COMMAND_FRAME_LEN);
-  Wire.endTransmission();
+  uint8_t err = Wire.endTransmission();
+  recordNanoTxResult(err, "command");
+}
+
+void sendNanoHeartbeat() {
+  Wire.beginTransmission(NANO_I2C_ADDRESS);
+  uint8_t err = Wire.endTransmission();
+  recordNanoTxResult(err, "heartbeat");
 }
 
 void serviceNanoTx(unsigned long now) {
   static unsigned long lastControlTxMs = 0;
+  static unsigned long lastHeartbeatTxMs = 0;
 
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
     sendNanoControlPacket(current);
     lastControlTxMs = now;
+  }
+
+  if (now - lastHeartbeatTxMs >= nanoLink::HEARTBEAT_PERIOD_MS) {
+    sendNanoHeartbeat();
+    lastHeartbeatTxMs = now;
   }
 }
 
@@ -1538,7 +1600,7 @@ void runProtections(unsigned long now) {
 }
 
 String buildJsonState() {
-  StaticJsonDocument<3072> doc;
+  StaticJsonDocument<3328> doc;
   doc["well_current"] = tm.wellCurrent;
   doc["well_pressure"] = tm.wellPressure;
   doc["house_current"] = tm.houseCurrent;
@@ -1570,7 +1632,12 @@ String buildJsonState() {
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
   doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
+  doc["lastGoodRxMs"] = linkHealth.lastGoodRxMs;
   doc["link_alive"] = linkAlive;
+  doc["txErrorCount"] = linkHealth.txErrorCount;
+  doc["shortReadCount"] = linkHealth.shortReadCount;
+  doc["invalidFrameCount"] = linkHealth.invalidFrameCount;
+  doc["lastTxErrCode"] = linkHealth.lastTxErrCode;
   doc["link_total_packets"] = linkHealth.totalPackets;
   doc["link_short_frames"] = linkHealth.shortFrameCount;
   doc["link_bad_header"] = linkHealth.badHeaderCount;
@@ -1691,7 +1758,7 @@ void initWeb() {
       return;
     }
 
-    StaticJsonDocument<3072> doc;
+    StaticJsonDocument<3328> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
       server.send(400, "text/plain", "Bad JSON");
@@ -1944,7 +2011,8 @@ void loop() {
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool telemetryFresh = (now - linkHealth.lastValidPacketMs) < nanoLink::TELEMETRY_STALE_MS;
-  linkAlive = startupGraceActive || telemetryFresh;
+  const bool txHealthy = !linkHealth.txErrorBurstActive;
+  linkAlive = (startupGraceActive || telemetryFresh) && txHealthy;
   if (!linkAlive) {
     tm.valid = false;
     st.wellRelay = false;
@@ -1953,8 +2021,13 @@ void loop() {
     st.houseMode = HouseMode::STOPPED;
 
     if (!linkLossLogged) {
-      appendLog(st.logsWell, "Nano link timeout: потеря телеметрии, насосы остановлены");
-      appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
+      if (!txHealthy) {
+        appendLog(st.logsWell, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
+        appendLog(st.logsHouse, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
+      } else {
+        appendLog(st.logsWell, "Nano link timeout: потеря телеметрии, насосы остановлены");
+        appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
+      }
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, millis() - linkHealth.lastValidPacketMs, 0);
       linkLossLogged = true;
     }
