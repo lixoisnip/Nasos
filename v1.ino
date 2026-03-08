@@ -29,8 +29,8 @@
 #define PIN_CURRENT       A0
 #define PRESSURE_PIN      A2
 #define PIN_PRESSURE      A3
-#define L1                A4
-#define L2                A5
+#define L1                4
+#define L2                5
 #define L3                A6
 #define L4                A7
 
@@ -43,12 +43,14 @@
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 #endif
 
+#if NANO_USE_TFT
 #define BLACK   ST77XX_BLACK
 #define WHITE   ST77XX_WHITE
 #define GREEN   ST77XX_GREEN
 #define RED     ST77XX_RED
 #define YELLOW  ST77XX_YELLOW
 #define GRAY    0x7BEF
+#endif
 
 #define Z1 40
 #define Z2 60
@@ -269,8 +271,13 @@ float readHousePressureBar() {
   return ns.housePressureCount ? (sum / ns.housePressureCount) : corrected;
 }
 
+bool readLevelPin(uint8_t pin) {
+  if (pin >= A0) return analogRead(pin) > LEVEL_THRESH;
+  return digitalRead(pin) == HIGH;
+}
+
 bool readLevelFiltered(uint8_t idx, uint8_t pin, unsigned long now) {
-  bool measuredState = analogRead(pin) > LEVEL_THRESH;
+  bool measuredState = readLevelPin(pin);
   LevelFilter &filter = ns.levelFilters[idx];
 
   if (measuredState != filter.stableState) {
@@ -408,6 +415,9 @@ void setup() {
 
   pinMode(PIN_RS485_DE_RE, OUTPUT);
   digitalWrite(PIN_RS485_DE_RE, LOW);
+
+  pinMode(L1, INPUT);
+  pinMode(L2, INPUT);
 
   long sum = 0;
   for (int i = 0; i < 600; i++) {
