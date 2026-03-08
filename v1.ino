@@ -409,6 +409,12 @@ void writeU16LE(uint8_t* dst, uint16_t value) {
   dst[1] = (uint8_t)((value >> 8) & 0xFF);
 }
 
+bool writeFrameBytes(uint8_t* frame, size_t frameLen, size_t offset, const void* src, size_t srcLen) {
+  if (offset > frameLen || srcLen > (frameLen - offset)) return false;
+  memcpy(frame + offset, src, srcLen);
+  return true;
+}
+
 uint16_t readU16LE(const uint8_t* src) {
   return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
 }
@@ -614,12 +620,33 @@ void updateTelemetryFrame(unsigned long now) {
   }
 
   uint8_t frame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
-  frame[0] = nanoProto::MAGIC;
-  frame[1] = nanoProto::VERSION;
-  frame[2] = nanoProto::MSG_TELEMETRY;
+  bool frameOk = true;
+  if (nanoProto::TELEMETRY_FRAME_LEN < 6) frameOk = false;
+
   static uint8_t txSeq = 0;
-  frame[3] = txSeq++;
-  memcpy(frame + 4, &payload, sizeof(payload));
+  const uint8_t seq = txSeq++;
+
+  if (frameOk) frame[0] = nanoProto::MAGIC;
+  if (frameOk) frame[1] = nanoProto::VERSION;
+  if (frameOk) frame[2] = nanoProto::MSG_TELEMETRY;
+  if (frameOk) frame[3] = seq;
+  if (frameOk && !writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, 4, &payload, sizeof(payload))) {
+    frameOk = false;
+  }
+
+  if (!frameOk) {
+    memset(frame, 0, sizeof(frame));
+    frame[0] = nanoProto::MAGIC;
+    frame[1] = nanoProto::VERSION;
+    frame[2] = nanoProto::MSG_TELEMETRY;
+    frame[3] = seq;
+
+    const uint8_t fallbackPayload[] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, nanoProto::STATUS_CMD_STALE
+    };
+    (void)writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, 4, fallbackPayload, sizeof(fallbackPayload));
+  }
+
   uint16_t crc = calcCrc16(frame, nanoProto::TELEMETRY_FRAME_LEN - 2);
   writeU16LE(frame + nanoProto::TELEMETRY_FRAME_LEN - 2, crc);
 
