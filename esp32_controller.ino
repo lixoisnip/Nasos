@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
 
 // -------- Controller enums --------
 enum class PumpIntention : uint8_t {
@@ -364,8 +365,14 @@ struct LinkHealth {
   unsigned long badHeaderCount = 0;
   unsigned long badCrcCount = 0;
   unsigned long parseRejectCount = 0;
+  unsigned long parseNoStarCount = 0;
+  unsigned long parseBadChecksumTextCount = 0;
+  unsigned long parseWrongFieldCount = 0;
+  unsigned long parseInvalidNumericRangeCount = 0;
+  unsigned long parseNonMonotonicTsCount = 0;
   unsigned long seqGapCount = 0;
   unsigned long txErrorCount = 0;
+  unsigned long lastTelemetryTimestampMs = 0;
   uint8_t lastTelemetrySeq = 0;
   uint8_t lastTxErrCode = 0;
   bool telemetrySeqValid = false;
@@ -378,6 +385,7 @@ struct LinkHealth {
 
 bool linkAlive = false;
 bool hasEverReceivedTelemetry = false;
+unsigned long lastTelemetryAgeMs = ULONG_MAX;
 unsigned long controllerBootMs = 0;
 
 struct Settings {
@@ -990,8 +998,104 @@ int16_t clampScaled(float value, float scale) {
   return (int16_t)scaled;
 }
 
+bool isTimestampMonotonicWrapAware(unsigned long prevTs, unsigned long nextTs) {
+  const unsigned long delta = nextTs - prevTs;
+  return delta < 0x80000000UL;
+}
+
+enum class ParseNanoError : uint8_t {
+  NONE,
+  NO_STAR,
+  BAD_CHECKSUM_TEXT,
+  WRONG_FIELD_COUNT,
+  INVALID_NUMERIC_RANGE
+};
+
+bool parseNanoLine(const String& line, unsigned long& timestampMs, ParseNanoError& err) {
+  err = ParseNanoError::NONE;
+  const int starPos = line.lastIndexOf('*');
+  if (starPos < 0) {
+    err = ParseNanoError::NO_STAR;
+    linkHealth.parseNoStarCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  const String checksumText = line.substring(starPos + 1);
+  if (checksumText.length() != 2 || !isxdigit((unsigned char)checksumText[0]) || !isxdigit((unsigned char)checksumText[1])) {
+    err = ParseNanoError::BAD_CHECKSUM_TEXT;
+    linkHealth.parseBadChecksumTextCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  uint8_t calcXor = 0;
+  for (int i = 0; i < starPos; i++) calcXor ^= (uint8_t)line[i];
+  char* end = nullptr;
+  const unsigned long rxChecksum = strtoul(checksumText.c_str(), &end, 16);
+  if (end == nullptr || *end != '\0' || rxChecksum > 0xFF || (uint8_t)rxChecksum != calcXor) {
+    err = ParseNanoError::BAD_CHECKSUM_TEXT;
+    linkHealth.parseBadChecksumTextCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  int commaCount = 0;
+  for (int i = 0; i < starPos; i++) {
+    if (line[i] == ',') commaCount++;
+  }
+  if (commaCount < 1) {
+    err = ParseNanoError::WRONG_FIELD_COUNT;
+    linkHealth.parseWrongFieldCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  const int firstComma = line.indexOf(',');
+  if (firstComma < 0 || firstComma >= starPos) {
+    err = ParseNanoError::WRONG_FIELD_COUNT;
+    linkHealth.parseWrongFieldCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  const String tsField = line.substring(firstComma + 1, starPos);
+  if (tsField.length() == 0) {
+    err = ParseNanoError::WRONG_FIELD_COUNT;
+    linkHealth.parseWrongFieldCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  for (size_t i = 0; i < tsField.length(); i++) {
+    if (!isdigit((unsigned char)tsField[i])) {
+      err = ParseNanoError::INVALID_NUMERIC_RANGE;
+      linkHealth.parseInvalidNumericRangeCount++;
+      linkHealth.parseRejectCount++;
+      return false;
+    }
+  }
+
+  const unsigned long parsedTs = strtoul(tsField.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0') {
+    err = ParseNanoError::INVALID_NUMERIC_RANGE;
+    linkHealth.parseInvalidNumericRangeCount++;
+    linkHealth.parseRejectCount++;
+    return false;
+  }
+
+  timestampMs = parsedTs;
+  return true;
+}
+
 bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long now) {
-  tm.ts = now;
+  const unsigned long timestampMs = now;
+  if (hasEverReceivedTelemetry && !isTimestampMonotonicWrapAware(linkHealth.lastTelemetryTimestampMs, timestampMs)) {
+    linkHealth.parseNonMonotonicTsCount++;
+    return false;
+  }
+
+  tm.ts = timestampMs;
   tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
   tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
   tm.houseCurrent = normalizeTelemetryCurrent(payload.houseCurrentCentiA / 100.0f, telemetryCurrent::HOUSE_GAIN);
@@ -1005,6 +1109,7 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   tm.linkOk = (payload.statusBits & nanoProto::STATUS_LINK_OK) != 0;
   tm.vfdFreqFeedback = st.vfdFreq;
   tm.valid = true;
+  linkHealth.lastTelemetryTimestampMs = timestampMs;
   linkHealth.lastValidPacketMs = now;
   linkHealth.lastGoodRxMs = now;
   hasEverReceivedTelemetry = true;
@@ -1082,6 +1187,20 @@ void readNanoI2c() {
 
   NanoTelemetryPayload payload;
   memcpy(&payload, frame + 4, sizeof(payload));
+
+  const bool rangesOk =
+      abs((int)payload.wellCurrentCentiA) <= 5000 &&
+      abs((int)payload.houseCurrentCentiA) <= 5000 &&
+      payload.wellPressureCentiBar >= -100 && payload.wellPressureCentiBar <= 1000 &&
+      payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
+  if (!rangesOk) {
+    linkHealth.invalidFrameCount++;
+    linkHealth.parseRejectCount++;
+    linkHealth.parseInvalidNumericRangeCount++;
+    appendLinkLogThrottled("Nano I2C invalid frame: telemetry out of range", linkHealth.lastInvalidFrameLogMs);
+    return;
+  }
+
   if (!decodeTelemetryPayload(payload, millis())) {
     linkHealth.invalidFrameCount++;
     linkHealth.parseRejectCount++;
@@ -1696,6 +1815,12 @@ String buildJsonState() {
   doc["link_bad_header"] = linkHealth.badHeaderCount;
   doc["link_bad_crc"] = linkHealth.badCrcCount;
   doc["link_parse_reject"] = linkHealth.parseRejectCount;
+  doc["link_parse_no_star"] = linkHealth.parseNoStarCount;
+  doc["link_parse_bad_checksum_text"] = linkHealth.parseBadChecksumTextCount;
+  doc["link_parse_wrong_field_count"] = linkHealth.parseWrongFieldCount;
+  doc["link_parse_invalid_numeric_range"] = linkHealth.parseInvalidNumericRangeCount;
+  doc["link_parse_non_monotonic_ts"] = linkHealth.parseNonMonotonicTsCount;
+  doc["lastTelemetryAgeMs"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
   doc["link_seq_gaps"] = linkHealth.seqGapCount;
   doc["telemetry_cmd_stale"] = tm.cmdStale;
 
@@ -2057,44 +2182,67 @@ void setup() {
 void loop() {
   feedTaskWatchdog();
   unsigned long now = millis();
-  static bool linkLossLogged = false;
   static bool startupGraceLogged = false;
+  enum class LinkState : uint8_t { HEALTHY, DEGRADED, LOST };
+  static LinkState prevLinkState = LinkState::HEALTHY;
 
   readNanoI2c();
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
-  const bool telemetryFresh = (now - linkHealth.lastValidPacketMs) < nanoLink::TELEMETRY_STALE_MS;
+  lastTelemetryAgeMs = hasEverReceivedTelemetry ? (now - linkHealth.lastValidPacketMs) : ULONG_MAX;
+  const bool telemetryFresh = hasEverReceivedTelemetry && lastTelemetryAgeMs < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
   linkAlive = (startupGraceActive || telemetryFresh) && txHealthy;
-  if (!linkAlive) {
+
+  if (!startupGraceActive && (!hasEverReceivedTelemetry || lastTelemetryAgeMs >= nanoLink::TELEMETRY_STALE_MS)) {
+    tm.valid = false;
+  }
+
+  LinkState linkState = LinkState::HEALTHY;
+  if (!txHealthy && (startupGraceActive || telemetryFresh)) {
+    linkState = LinkState::DEGRADED;
+  } else if (!linkAlive) {
+    linkState = LinkState::LOST;
+  }
+
+  if (linkState == LinkState::DEGRADED) {
     tm.valid = false;
     st.wellRelay = false;
     st.vfdRun = false;
     st.wellMode = WellMode::FAIL;
     st.houseMode = HouseMode::STOPPED;
+  } else if (linkState == LinkState::LOST) {
+    tm.valid = false;
+    st.wellRelay = false;
+    st.vfdRun = false;
+    st.wellMode = WellMode::FAIL;
+    st.houseMode = HouseMode::STOPPED;
+  }
 
-    if (!linkLossLogged) {
-      if (!txHealthy) {
-        appendLog(st.logsWell, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
-        appendLog(st.logsHouse, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
-      } else {
-        appendLog(st.logsWell, "Nano link timeout: потеря телеметрии, насосы остановлены");
-        appendLog(st.logsHouse, "Nano link timeout: потеря телеметрии, насосы остановлены");
-      }
-      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, millis() - linkHealth.lastValidPacketMs, 0);
-      linkLossLogged = true;
+  if (linkState != prevLinkState) {
+    if (linkState == LinkState::DEGRADED) {
+      appendLog(st.logsWell, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
+      appendLog(st.logsHouse, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
+      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 1);
+    } else if (linkState == LinkState::LOST) {
+      appendLog(st.logsWell, "Nano link lost: потеря телеметрии, насосы остановлены");
+      appendLog(st.logsHouse, "Nano link lost: потеря телеметрии, насосы остановлены");
+      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 2);
+    } else if (prevLinkState == LinkState::LOST || prevLinkState == LinkState::DEGRADED) {
+      appendLog(st.logsWell, "Nano link restored: телеметрия восстановлена");
+      appendLog(st.logsHouse, "Nano link restored: телеметрия восстановлена");
+      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, 0, 3);
     }
+    prevLinkState = linkState;
+  }
+
+  if (startupGraceActive && !hasEverReceivedTelemetry && !startupGraceLogged && (now - controllerBootMs) > 1500UL) {
+    appendLog(st.logsWell, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
+    appendLog(st.logsHouse, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
+    startupGraceLogged = true;
+  } else if (!startupGraceActive) {
     startupGraceLogged = false;
-  } else {
-    if (startupGraceActive && !hasEverReceivedTelemetry && !startupGraceLogged && (now - controllerBootMs) > 1500UL) {
-      appendLog(st.logsWell, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
-      appendLog(st.logsHouse, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
-      startupGraceLogged = true;
-    } else if (hasEverReceivedTelemetry) {
-      linkLossLogged = false;
-      startupGraceLogged = false;
-    }
   }
 
   static bool startupInitLogged = false;
