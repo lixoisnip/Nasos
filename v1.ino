@@ -66,6 +66,7 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
+constexpr uint8_t VERSION_LEGACY = 0;
 constexpr uint8_t VERSION = 1;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
@@ -146,6 +147,7 @@ struct NanoState {
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
   unsigned long linkRxErrorCount = 0;
+  uint8_t commandProtocolVersion = nanoProto::VERSION;
 
 } ns;
 
@@ -178,12 +180,27 @@ const char* wellModeText(int mode) {
 }
 
 const char* houseModeText(int mode) {
+  const bool legacyModeIds = ns.commandProtocolVersion == nanoProto::VERSION_LEGACY;
+
+  if (legacyModeIds) {
+    switch (mode) {
+      case 0: return "WAIT";
+      case 1: return "READY";
+      case 2: return "RUN";
+      case 3: return "STOP";
+      default: return ns.vfdRun ? "RUN" : "WAIT";
+    }
+  }
+
   switch (mode) {
-    case 0: return "WAIT";
-    case 1: return "READY";
-    case 2: return "RUN";
-    case 3: return "STOP";
-    default: return ns.vfdRun ? "RUN" : "WAIT";
+    case 0: return "WAIT_WATER";
+    case 1: return "STARTING";
+    case 2: return "READY";
+    case 3: return "RUNNING";
+    case 4: return "STOPPING";
+    case 5: return "STOPPED";
+    case 6: return "FAULT";
+    default: return "UNKNOWN";
   }
 }
 
@@ -433,7 +450,7 @@ void checkI2cLevelWiringSanity(unsigned long now) {
   Serial.println(F("[WIRING WARNING] Legacy A4/A5 level wiring conflicts with I2C SDA/SCL."));
 }
 
-bool applyCommandFrame(const uint8_t* frame, size_t len, unsigned long now) {
+bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion, unsigned long now) {
   if (len != nanoProto::COMMAND_FRAME_LEN) {
     nanoParseRejectCount++;
     return false;
@@ -453,6 +470,7 @@ bool applyCommandFrame(const uint8_t* frame, size_t len, unsigned long now) {
   ns.houseAlarm = (payload.flags & nanoProto::FLAG_HOUSE_ALARM) != 0;
   ns.houseBlocked = (payload.flags & nanoProto::FLAG_HOUSE_BLOCKED) != 0;
   ns.statusFromEsp = true;
+  ns.commandProtocolVersion = protocolVersion;
   ns.statusUpdatedAt = now;
   nanoLastCommandAt = now;
   return true;
@@ -471,7 +489,10 @@ void onI2cReceive(int count) {
     return;
   }
 
-  if (raw[0] != nanoProto::MAGIC || raw[1] != nanoProto::VERSION || raw[2] != nanoProto::MSG_COMMAND) {
+  const uint8_t protocolVersion = raw[1];
+  const bool supportedVersion = (protocolVersion == nanoProto::VERSION) ||
+                                (protocolVersion == nanoProto::VERSION_LEGACY);
+  if (raw[0] != nanoProto::MAGIC || !supportedVersion || raw[2] != nanoProto::MSG_COMMAND) {
     nanoBadHeaderCount++;
     return;
   }
@@ -507,7 +528,7 @@ void processEspI2c(unsigned long now) {
     i2cCommandReady = false;
     interrupts();
 
-    if (!applyCommandFrame(local, sizeof(local), now)) {
+    if (!applyCommandFrame(local, sizeof(local), local[1], now)) {
       nanoParseRejectCount++;
     }
   }
