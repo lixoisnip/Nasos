@@ -60,6 +60,14 @@ const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID = "Nasos-ESP32";
 const char* AP_PASS = "12345678";  // min 8 chars for WPA2
 
+// -------- Forward declarations for Arduino IDE auto-prototypes --------
+struct NanoTelemetryPayload;
+struct NanoCommandPacket;
+
+bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long now);
+NanoCommandPacket buildNanoCommandPacket();
+void sendNanoControlPacket(const NanoCommandPacket& packet);
+
 struct WellConfig {
   float dryCurrent;
   float overloadCurrent;
