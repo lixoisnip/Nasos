@@ -5,6 +5,7 @@
 // =====================================================
 
 #include <Wire.h>
+#include "i2c_link_config.h"
 #include <avr/wdt.h>
 #include <string.h>
 #include <stdlib.h>
@@ -63,7 +64,7 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 #define Y5 (Y4+Z4)
 
 // I2C link to ESP32 (Nano as slave)
-constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
+constexpr uint8_t NANO_I2C_ADDRESS = i2cLinkCfg::NANO_SLAVE_ADDRESS;
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
 constexpr uint8_t VERSION = 2;
@@ -159,6 +160,7 @@ const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
 const unsigned long I2C_SANITY_CHECK_INTERVAL_MS = 5000;
 const unsigned long L1_L2_STUCK_WINDOW_MS = 45000;
 const unsigned long WIRING_WARNING_RATE_LIMIT_MS = 15000;
+const unsigned long NANO_HEARTBEAT_INTERVAL_MS = 5000;
 
 const float WELL_CURRENT_DRY = 3.3f;
 const float WELL_CURRENT_OVERLOAD = 4.3f;
@@ -607,9 +609,20 @@ void sendTelemetry(unsigned long now) {
 
 void setup() {
   Serial.begin(9600);      // RS485 VFD
+  delay(50);
+  Serial.println();
+  Serial.println(F("[BOOT] Nano firmware startup"));
+  Serial.print(F("[BOOT] Firmware: "));
+  Serial.print(i2cLinkCfg::NANO_FW_NAME);
+  Serial.print(F(" v"));
+  Serial.println(i2cLinkCfg::NANO_FW_VERSION);
+  Serial.print(F("[BOOT] Configured I2C slave address: 0x"));
+  Serial.println(NANO_I2C_ADDRESS, HEX);
+
   Wire.begin(NANO_I2C_ADDRESS);
   Wire.onReceive(onI2cReceive);
   Wire.onRequest(onI2cRequest);
+  Serial.println(F("[BOOT] Wire.begin(slaveAddress) executed; Nano in I2C slave mode"));
 
   pinMode(RELAY_WELL, OUTPUT);
   digitalWrite(RELAY_WELL, HIGH);
@@ -625,6 +638,7 @@ void setup() {
   nanoLastL1 = readLevelPin(L1);
   nanoLastL2 = readLevelPin(L2);
 
+  Serial.println(F("[BOOT] Calibrating current zero offset (600 samples)..."));
   long sum = 0;
   for (int i = 0; i < 600; i++) {
     sum += analogRead(ACS_PIN);
@@ -633,16 +647,29 @@ void setup() {
   }
   ns.currentZeroOffset = sum / 600.0f;
   if (ns.currentZeroOffset < 400 || ns.currentZeroOffset > 600) ns.currentZeroOffset = 512.0f;
+  Serial.print(F("[BOOT] Current zero offset="));
+  Serial.println(ns.currentZeroOffset);
 
+  Serial.println(F("[BOOT] Initializing VFD over RS485..."));
   initVFD();
+  Serial.println(F("[BOOT] VFD init sequence complete"));
 
   wdt_enable(WDTO_4S);
   feedWatchdog();
+  Serial.println(F("[BOOT] Nano setup complete"));
 }
 
 void loop() {
   feedWatchdog();
   unsigned long now = millis();
+  static unsigned long lastHeartbeatMs = 0;
+  if (now - lastHeartbeatMs >= NANO_HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = now;
+    Serial.print(F("[HEARTBEAT] Nano alive; I2C=0x"));
+    Serial.print(NANO_I2C_ADDRESS, HEX);
+    Serial.print(F(", cmdAgeMs="));
+    Serial.println(nanoLastCommandAt ? (now - nanoLastCommandAt) : 0UL);
+  }
   processEspI2c(now);
   feedWatchdog();
   readInputs(now);
