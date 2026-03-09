@@ -1,6 +1,6 @@
 // =====================================================
 // ESP32 main controller: all pump logic/protections + web UI
-// Works with Arduino Nano I/O bridge over UART2.
+// Works with Arduino Nano I/O bridge over I2C binary frames.
 // =====================================================
 
 #include <WiFi.h>
@@ -11,7 +11,6 @@
 #include <Wire.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
-#include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -311,7 +310,6 @@ constexpr uint8_t STATUS_LINK_OK = 1 << 2;
 
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 80UL;
-constexpr unsigned long HEARTBEAT_PERIOD_MS = 1000UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
 constexpr uint8_t COMMAND_FRAME_LEN = 18;
@@ -364,15 +362,8 @@ struct LinkHealth {
   unsigned long invalidFrameCount = 0;
   unsigned long badHeaderCount = 0;
   unsigned long badCrcCount = 0;
-  unsigned long parseRejectCount = 0;
-  unsigned long parseNoStarCount = 0;
-  unsigned long parseBadChecksumTextCount = 0;
-  unsigned long parseWrongFieldCount = 0;
-  unsigned long parseInvalidNumericRangeCount = 0;
-  unsigned long parseNonMonotonicTsCount = 0;
   unsigned long seqGapCount = 0;
   unsigned long txErrorCount = 0;
-  unsigned long lastTelemetryTimestampMs = 0;
   uint8_t lastTelemetrySeq = 0;
   uint8_t lastTxErrCode = 0;
   bool telemetrySeqValid = false;
@@ -387,6 +378,7 @@ bool linkAlive = false;
 bool hasEverReceivedTelemetry = false;
 unsigned long lastTelemetryAgeMs = ULONG_MAX;
 unsigned long controllerBootMs = 0;
+bool linkHasTxErrors = false;
 
 struct Settings {
   WellConfig well;
@@ -998,104 +990,8 @@ int16_t clampScaled(float value, float scale) {
   return (int16_t)scaled;
 }
 
-bool isTimestampMonotonicWrapAware(unsigned long prevTs, unsigned long nextTs) {
-  const unsigned long delta = nextTs - prevTs;
-  return delta < 0x80000000UL;
-}
-
-enum class ParseNanoError : uint8_t {
-  NONE,
-  NO_STAR,
-  BAD_CHECKSUM_TEXT,
-  WRONG_FIELD_COUNT,
-  INVALID_NUMERIC_RANGE
-};
-
-bool parseNanoLine(const String& line, unsigned long& timestampMs, ParseNanoError& err) {
-  err = ParseNanoError::NONE;
-  const int starPos = line.lastIndexOf('*');
-  if (starPos < 0) {
-    err = ParseNanoError::NO_STAR;
-    linkHealth.parseNoStarCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  const String checksumText = line.substring(starPos + 1);
-  if (checksumText.length() != 2 || !isxdigit((unsigned char)checksumText[0]) || !isxdigit((unsigned char)checksumText[1])) {
-    err = ParseNanoError::BAD_CHECKSUM_TEXT;
-    linkHealth.parseBadChecksumTextCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  uint8_t calcXor = 0;
-  for (int i = 0; i < starPos; i++) calcXor ^= (uint8_t)line[i];
-  char* end = nullptr;
-  const unsigned long rxChecksum = strtoul(checksumText.c_str(), &end, 16);
-  if (end == nullptr || *end != '\0' || rxChecksum > 0xFF || (uint8_t)rxChecksum != calcXor) {
-    err = ParseNanoError::BAD_CHECKSUM_TEXT;
-    linkHealth.parseBadChecksumTextCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  int commaCount = 0;
-  for (int i = 0; i < starPos; i++) {
-    if (line[i] == ',') commaCount++;
-  }
-  if (commaCount < 1) {
-    err = ParseNanoError::WRONG_FIELD_COUNT;
-    linkHealth.parseWrongFieldCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  const int firstComma = line.indexOf(',');
-  if (firstComma < 0 || firstComma >= starPos) {
-    err = ParseNanoError::WRONG_FIELD_COUNT;
-    linkHealth.parseWrongFieldCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  const String tsField = line.substring(firstComma + 1, starPos);
-  if (tsField.length() == 0) {
-    err = ParseNanoError::WRONG_FIELD_COUNT;
-    linkHealth.parseWrongFieldCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  for (size_t i = 0; i < tsField.length(); i++) {
-    if (!isdigit((unsigned char)tsField[i])) {
-      err = ParseNanoError::INVALID_NUMERIC_RANGE;
-      linkHealth.parseInvalidNumericRangeCount++;
-      linkHealth.parseRejectCount++;
-      return false;
-    }
-  }
-
-  const unsigned long parsedTs = strtoul(tsField.c_str(), &end, 10);
-  if (end == nullptr || *end != '\0') {
-    err = ParseNanoError::INVALID_NUMERIC_RANGE;
-    linkHealth.parseInvalidNumericRangeCount++;
-    linkHealth.parseRejectCount++;
-    return false;
-  }
-
-  timestampMs = parsedTs;
-  return true;
-}
-
 bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long now) {
-  const unsigned long timestampMs = now;
-  if (hasEverReceivedTelemetry && !isTimestampMonotonicWrapAware(linkHealth.lastTelemetryTimestampMs, timestampMs)) {
-    linkHealth.parseNonMonotonicTsCount++;
-    return false;
-  }
-
-  tm.ts = timestampMs;
+  tm.ts = now;
   tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
   tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
   tm.houseCurrent = normalizeTelemetryCurrent(payload.houseCurrentCentiA / 100.0f, telemetryCurrent::HOUSE_GAIN);
@@ -1109,7 +1005,6 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   tm.linkOk = (payload.statusBits & nanoProto::STATUS_LINK_OK) != 0;
   tm.vfdFreqFeedback = st.vfdFreq;
   tm.valid = true;
-  linkHealth.lastTelemetryTimestampMs = timestampMs;
   linkHealth.lastValidPacketMs = now;
   linkHealth.lastGoodRxMs = now;
   hasEverReceivedTelemetry = true;
@@ -1195,15 +1090,12 @@ void readNanoI2c() {
       payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
   if (!rangesOk) {
     linkHealth.invalidFrameCount++;
-    linkHealth.parseRejectCount++;
-    linkHealth.parseInvalidNumericRangeCount++;
     appendLinkLogThrottled("Nano I2C invalid frame: telemetry out of range", linkHealth.lastInvalidFrameLogMs);
     return;
   }
 
   if (!decodeTelemetryPayload(payload, millis())) {
     linkHealth.invalidFrameCount++;
-    linkHealth.parseRejectCount++;
     appendLinkLogThrottled("Nano I2C invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
   }
 }
@@ -1257,25 +1149,13 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
   recordNanoTxResult(err, "command");
 }
 
-void sendNanoHeartbeat() {
-  Wire.beginTransmission(NANO_I2C_ADDRESS);
-  uint8_t err = Wire.endTransmission();
-  recordNanoTxResult(err, "heartbeat");
-}
-
 void serviceNanoTx(unsigned long now) {
   static unsigned long lastControlTxMs = 0;
-  static unsigned long lastHeartbeatTxMs = 0;
 
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
     sendNanoControlPacket(current);
     lastControlTxMs = now;
-  }
-
-  if (now - lastHeartbeatTxMs >= nanoLink::HEARTBEAT_PERIOD_MS) {
-    sendNanoHeartbeat();
-    lastHeartbeatTxMs = now;
   }
 }
 
@@ -1814,14 +1694,10 @@ String buildJsonState() {
   doc["link_short_frames"] = linkHealth.shortFrameCount;
   doc["link_bad_header"] = linkHealth.badHeaderCount;
   doc["link_bad_crc"] = linkHealth.badCrcCount;
-  doc["link_parse_reject"] = linkHealth.parseRejectCount;
-  doc["link_parse_no_star"] = linkHealth.parseNoStarCount;
-  doc["link_parse_bad_checksum_text"] = linkHealth.parseBadChecksumTextCount;
-  doc["link_parse_wrong_field_count"] = linkHealth.parseWrongFieldCount;
-  doc["link_parse_invalid_numeric_range"] = linkHealth.parseInvalidNumericRangeCount;
-  doc["link_parse_non_monotonic_ts"] = linkHealth.parseNonMonotonicTsCount;
   doc["lastTelemetryAgeMs"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
   doc["link_seq_gaps"] = linkHealth.seqGapCount;
+  doc["link_tx_error_burst"] = linkHealth.txErrorBurstActive;
+  doc["link_has_tx_errors"] = linkHasTxErrors;
   doc["telemetry_cmd_stale"] = tm.cmdStale;
 
   JsonArray lv = doc.createNestedArray("levels");
@@ -2193,26 +2069,22 @@ void loop() {
   lastTelemetryAgeMs = hasEverReceivedTelemetry ? (now - linkHealth.lastValidPacketMs) : ULONG_MAX;
   const bool telemetryFresh = hasEverReceivedTelemetry && lastTelemetryAgeMs < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
+  const bool telemetryStale = !startupGraceActive && (!hasEverReceivedTelemetry || !telemetryFresh);
   linkAlive = (startupGraceActive || telemetryFresh) && txHealthy;
+  linkHasTxErrors = hasEverReceivedTelemetry && telemetryFresh && !txHealthy;
 
-  if (!startupGraceActive && (!hasEverReceivedTelemetry || lastTelemetryAgeMs >= nanoLink::TELEMETRY_STALE_MS)) {
+  if (telemetryStale) {
     tm.valid = false;
   }
 
   LinkState linkState = LinkState::HEALTHY;
-  if (!txHealthy && (startupGraceActive || telemetryFresh)) {
+  if (linkHasTxErrors) {
     linkState = LinkState::DEGRADED;
-  } else if (!linkAlive) {
+  } else if (telemetryStale || !txHealthy) {
     linkState = LinkState::LOST;
   }
 
-  if (linkState == LinkState::DEGRADED) {
-    tm.valid = false;
-    st.wellRelay = false;
-    st.vfdRun = false;
-    st.wellMode = WellMode::FAIL;
-    st.houseMode = HouseMode::STOPPED;
-  } else if (linkState == LinkState::LOST) {
+  if (linkState != LinkState::HEALTHY) {
     tm.valid = false;
     st.wellRelay = false;
     st.vfdRun = false;
@@ -2222,12 +2094,12 @@ void loop() {
 
   if (linkState != prevLinkState) {
     if (linkState == LinkState::DEGRADED) {
-      appendLog(st.logsWell, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
-      appendLog(st.logsHouse, String("Nano link degraded: I2C TX errors (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped");
+      appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
+      appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 1);
     } else if (linkState == LinkState::LOST) {
-      appendLog(st.logsWell, "Nano link lost: потеря телеметрии, насосы остановлены");
-      appendLog(st.logsHouse, "Nano link lost: потеря телеметрии, насосы остановлены");
+      appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
+      appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 2);
     } else if (prevLinkState == LinkState::LOST || prevLinkState == LinkState::DEGRADED) {
       appendLog(st.logsWell, "Nano link restored: телеметрия восстановлена");

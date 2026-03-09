@@ -66,9 +66,7 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
-constexpr uint8_t VERSION_LEGACY = 0;
 constexpr uint8_t VERSION = 2;
-constexpr uint8_t VERSION_WITH_SETTINGS = 2;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
 constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
@@ -78,9 +76,7 @@ constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
 constexpr uint8_t STATUS_VFD_RUN = 1 << 0;
 constexpr uint8_t STATUS_CMD_STALE = 1 << 1;
 constexpr uint8_t STATUS_LINK_OK = 1 << 2;
-constexpr uint8_t COMMAND_FRAME_LEN_V1 = 14;   // 4-byte header + 8-byte payload + 2-byte CRC
-constexpr uint8_t COMMAND_FRAME_LEN_V2 = 18;   // 4-byte header + 12-byte payload + 2-byte CRC
-constexpr uint8_t COMMAND_FRAME_LEN = COMMAND_FRAME_LEN_V2;
+constexpr uint8_t COMMAND_FRAME_LEN = 18;   // 4-byte header + 12-byte payload + 2-byte CRC
 constexpr uint8_t TELEMETRY_FRAME_LEN = 16; // 4-byte header + 10-byte payload + 2-byte CRC
 constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
 }
@@ -88,16 +84,6 @@ constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
 volatile bool i2cCommandReady = false;
 volatile uint8_t i2cCommandFrame[nanoProto::COMMAND_FRAME_LEN] = {0};
 volatile uint8_t i2cTelemetryFrame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
-
-struct NanoCommandPayloadV1 {
-  uint8_t relay = 0;
-  uint8_t vfdRun = 0;
-  int16_t vfdFreqDeciHz = 0;
-  uint8_t wellMode = 0;
-  uint8_t wellIntention = 0;
-  uint8_t houseMode = 0;
-  uint8_t flags = 0;
-} __attribute__((packed));
 
 struct NanoCommandPayload {
   uint8_t relay = 0;
@@ -167,9 +153,6 @@ struct NanoState {
   bool houseBlocked = false;
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
-  unsigned long linkRxErrorCount = 0;
-  uint8_t commandProtocolVersion = nanoProto::VERSION;
-
 } ns;
 
 const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
@@ -196,23 +179,11 @@ const char* wellModeText(int mode) {
     case 1: return "START";
     case 2: return "RUN";
     case 3: return "FAIL";
-    default: return "WAIT";
+    default: return "UNKNOWN";
   }
 }
 
 const char* houseModeText(int mode) {
-  const bool legacyModeIds = ns.commandProtocolVersion == nanoProto::VERSION_LEGACY;
-
-  if (legacyModeIds) {
-    switch (mode) {
-      case 0: return "WAIT";
-      case 1: return "READY";
-      case 2: return "RUN";
-      case 3: return "STOP";
-      default: return ns.vfdRun ? "RUN" : "WAIT";
-    }
-  }
-
   switch (mode) {
     case 0: return "WAIT_WATER";
     case 1: return "STARTING";
@@ -478,29 +449,13 @@ void checkI2cLevelWiringSanity(unsigned long now) {
 }
 
 bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion, unsigned long now) {
-  const bool isV2 = protocolVersion >= nanoProto::VERSION_WITH_SETTINGS;
-  const size_t expectedLen = isV2 ? nanoProto::COMMAND_FRAME_LEN_V2 : nanoProto::COMMAND_FRAME_LEN_V1;
-  if (len != expectedLen) {
+  if (protocolVersion != nanoProto::VERSION || len != nanoProto::COMMAND_FRAME_LEN) {
     nanoParseRejectCount++;
     return false;
   }
 
   NanoCommandPayload payload;
-  if (isV2) {
-    memcpy(&payload, frame + 4, sizeof(payload));
-  } else {
-    NanoCommandPayloadV1 legacyPayload;
-    memcpy(&legacyPayload, frame + 4, sizeof(legacyPayload));
-    payload.relay = legacyPayload.relay;
-    payload.vfdRun = legacyPayload.vfdRun;
-    payload.vfdFreqDeciHz = legacyPayload.vfdFreqDeciHz;
-    payload.wellMode = legacyPayload.wellMode;
-    payload.wellIntention = legacyPayload.wellIntention;
-    payload.houseMode = legacyPayload.houseMode;
-    payload.flags = legacyPayload.flags;
-    payload.levelFilterMs = LEVEL_FILTER_MS_DEFAULT;
-    payload.levelThreshRaw = LEVEL_THRESH_DEFAULT;
-  }
+  memcpy(&payload, frame + 4, sizeof(payload));
 
   ns.relayWellOn = payload.relay != 0;
   ns.vfdRun = payload.vfdRun != 0;
@@ -515,7 +470,6 @@ bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion
   ns.levelFilterMs = constrain((unsigned long)payload.levelFilterMs, LEVEL_FILTER_MS_MIN, LEVEL_FILTER_MS_MAX);
   ns.levelThresh = constrain((int)payload.levelThreshRaw, LEVEL_THRESH_MIN, LEVEL_THRESH_MAX);
   ns.statusFromEsp = true;
-  ns.commandProtocolVersion = protocolVersion;
   ns.statusUpdatedAt = now;
   nanoLastCommandAt = now;
   return true;
@@ -529,23 +483,18 @@ void onI2cReceive(int count) {
   while (Wire.available() && idx < sizeof(raw)) raw[idx++] = (uint8_t)Wire.read();
   while (Wire.available()) { (void)Wire.read(); idx++; }
 
-  if (idx < nanoProto::COMMAND_FRAME_LEN_V1) {
+  if (idx < nanoProto::COMMAND_FRAME_LEN) {
     nanoShortFrameCount++;
     return;
   }
 
   const uint8_t protocolVersion = raw[1];
-  const bool supportedVersion = (protocolVersion == nanoProto::VERSION) ||
-                                (protocolVersion == nanoProto::VERSION_WITH_SETTINGS) ||
-                                (protocolVersion == nanoProto::VERSION_LEGACY);
-  if (raw[0] != nanoProto::MAGIC || !supportedVersion || raw[2] != nanoProto::MSG_COMMAND) {
+  if (raw[0] != nanoProto::MAGIC || protocolVersion != nanoProto::VERSION || raw[2] != nanoProto::MSG_COMMAND) {
     nanoBadHeaderCount++;
     return;
   }
 
-  const size_t expectedLen = (protocolVersion >= nanoProto::VERSION_WITH_SETTINGS)
-                           ? nanoProto::COMMAND_FRAME_LEN_V2
-                           : nanoProto::COMMAND_FRAME_LEN_V1;
+  const size_t expectedLen = nanoProto::COMMAND_FRAME_LEN;
   if (idx != expectedLen) {
     nanoShortFrameCount++;
     return;
@@ -583,10 +532,7 @@ void processEspI2c(unsigned long now) {
     i2cCommandReady = false;
     interrupts();
 
-    const size_t rxLen = (local[1] >= nanoProto::VERSION_WITH_SETTINGS)
-                       ? nanoProto::COMMAND_FRAME_LEN_V2
-                       : nanoProto::COMMAND_FRAME_LEN_V1;
-    if (!applyCommandFrame(local, rxLen, local[1], now)) {
+    if (!applyCommandFrame(local, nanoProto::COMMAND_FRAME_LEN, local[1], now)) {
       nanoParseRejectCount++;
     }
   }
