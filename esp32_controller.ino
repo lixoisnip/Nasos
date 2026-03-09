@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include "i2c_link_config.h"
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <string.h>
@@ -159,6 +160,33 @@ String resetReasonToString(esp_reset_reason_t reason) {
   }
 }
 
+
+const char* i2cTxErrorToText(uint8_t err) {
+  switch (err) {
+    case 0: return "OK";
+    case 1: return "data too long for TX buffer";
+    case 2: return "address NACK / slave not responding";
+    case 3: return "data NACK";
+    case 4: return "other I2C error";
+    case 5: return "timeout";
+    default: return "unknown";
+  }
+}
+
+bool probeNanoAtStartup(uint8_t attempts) {
+  bool ack = false;
+  Serial.println("[I2C] Startup probe begin");
+  for (uint8_t i = 0; i < attempts; i++) {
+    Wire.beginTransmission(i2cLinkCfg::NANO_SLAVE_ADDRESS);
+    uint8_t err = Wire.endTransmission();
+    Serial.println(String("[I2C] Probe #") + String(i + 1) + ": addr=0x" + String(i2cLinkCfg::NANO_SLAVE_ADDRESS, HEX) + ", code=" + String(err) + " (" + i2cTxErrorToText(err) + ")");
+    if (err == 0) ack = true;
+    delay(60);
+  }
+  Serial.println(String("[I2C] Startup probe result: ") + (ack ? "ACK detected" : "no ACK"));
+  return ack;
+}
+
 namespace defaults {
 /*
 Baseline table (Osnova.ino -> esp32_controller.ino)
@@ -286,9 +314,9 @@ constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
 }
 
 // -------- I2C to Nano --------
-constexpr uint8_t NANO_I2C_ADDRESS = 0x2A;
-constexpr int I2C_SDA_PIN = 21;
-constexpr int I2C_SCL_PIN = 22;
+constexpr uint8_t NANO_I2C_ADDRESS = i2cLinkCfg::NANO_SLAVE_ADDRESS;
+constexpr int I2C_SDA_PIN = i2cLinkCfg::ESP32_SDA_PIN;
+constexpr int I2C_SCL_PIN = i2cLinkCfg::ESP32_SCL_PIN;
 
 namespace telemetryCurrent {
 constexpr float WELL_GAIN = 1.0f;
@@ -1028,6 +1056,13 @@ void appendLinkLogThrottled(const String& message, unsigned long& lastLogMs) {
 }
 
 void recordNanoTxResult(uint8_t err, const char* context) {
+  static uint8_t startupTxLogs = 0;
+
+  if (startupTxLogs < 8) {
+    Serial.println(String("[I2C] TX ") + context + ": code=" + String(err) + " (" + i2cTxErrorToText(err) + ")");
+    startupTxLogs++;
+  }
+
   if (err == 0) {
     linkHealth.lastTxErrCode = 0;
     linkHealth.txErrorBurstActive = false;
@@ -1037,7 +1072,7 @@ void recordNanoTxResult(uint8_t err, const char* context) {
   linkHealth.txErrorCount++;
   linkHealth.lastTxErrCode = err;
   if (!linkHealth.txErrorBurstActive) {
-    const String msg = String("Nano I2C TX error (") + context + "): code=" + String(err);
+    const String msg = String("Nano I2C TX error (") + context + "): code=" + String(err) + " (" + i2cTxErrorToText(err) + ")";
     appendLinkLogThrottled(msg, linkHealth.lastTxErrorLogMs);
     linkHealth.txErrorBurstActive = true;
   }
@@ -2038,7 +2073,14 @@ void trackStateEvents() {
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000UL);
+  delay(80);
+  Serial.println();
+  Serial.println("[BOOT] ESP32 controller startup");
+  Serial.println(String("[BOOT] I2C pins: SDA=") + String(I2C_SDA_PIN) + ", SCL=" + String(I2C_SCL_PIN));
+  Serial.println(String("[BOOT] Expected Nano I2C address: 0x") + String(NANO_I2C_ADDRESS, HEX));
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
+  Serial.println(String("[BOOT] Wire.begin() done @ ") + String(i2cLinkCfg::BUS_FREQUENCY_HZ) + " Hz");
+  const bool probeAck = probeNanoAtStartup(6);
 
   initConfigFromNamespaces();
 
@@ -2059,6 +2101,8 @@ void setup() {
 
   appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
   appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
+  appendLog(st.logsWell, String("I2C startup probe: ") + (probeAck ? "Nano ACK detected" : "no ACK at Nano address"));
+  appendLog(st.logsHouse, String("I2C startup probe: ") + (probeAck ? "Nano ACK detected" : "no ACK at Nano address"));
 
   controllerBootMs = millis();
 }
