@@ -171,6 +171,17 @@ const float HOUSE_CURRENT_DRY = 0.4f;
 const float HOUSE_CURRENT_OVERLOAD = 1.3f;
 const float HOUSE_CURRENT_EMERGENCY = 1.5f;
 
+// House pump current input calibration (VFD analog output -> resistor divider -> MCU ADC).
+// New recommended divider for 0-10V VFD output is 20k(top)/10k(bottom):
+// 10.0V at VFD output -> ~3.33V at ADC node.
+const float ADC_REFERENCE_V = 5.0f;
+const float ADC_MAX_COUNTS = 1023.0f;
+const float VFD_DIVIDER_R_TOP_OHM = 20000.0f;
+const float VFD_DIVIDER_R_BOTTOM_OHM = 10000.0f;
+const float VFD_DIVIDER_GAIN = (VFD_DIVIDER_R_TOP_OHM + VFD_DIVIDER_R_BOTTOM_OHM) / VFD_DIVIDER_R_BOTTOM_OHM;
+// Engineering scaling assumption for protections/UI: 0-10V VFD analog output corresponds to 0-9A.
+const float VFD_ANALOG_V_TO_CURRENT_A = 0.9f;
+
 bool useEspDisplayStatus(unsigned long now) {
   return ns.statusFromEsp && (now - ns.statusUpdatedAt <= ESP_STATUS_TIMEOUT_MS);
 }
@@ -284,8 +295,9 @@ float readWellCurrent() {
 
 float readHouseCurrent() {
   int raw = analogRead(PIN_CURRENT);
-  float voltage = raw * 5.0f / 1023.0f;
-  float amps = voltage * 2.0f;
+  float adcVoltage = (raw * ADC_REFERENCE_V) / ADC_MAX_COUNTS;
+  float vfdOutputVoltage = adcVoltage * VFD_DIVIDER_GAIN;
+  float amps = vfdOutputVoltage * VFD_ANALOG_V_TO_CURRENT_A;
   return amps < 0.10f ? 0.0f : amps;
 }
 
@@ -649,6 +661,20 @@ void setup() {
   if (ns.currentZeroOffset < 400 || ns.currentZeroOffset > 600) ns.currentZeroOffset = 512.0f;
   Serial.print(F("[BOOT] Current zero offset="));
   Serial.println(ns.currentZeroOffset);
+
+  Serial.print(F("[BOOT] House current calibration: ADC="));
+  Serial.print(ADC_REFERENCE_V, 2);
+  Serial.print(F("V/"));
+  Serial.print((int)ADC_MAX_COUNTS);
+  Serial.print(F(", divider="));
+  Serial.print((int)VFD_DIVIDER_R_TOP_OHM);
+  Serial.print(F("/"));
+  Serial.print((int)VFD_DIVIDER_R_BOTTOM_OHM);
+  Serial.print(F(" (gain="));
+  Serial.print(VFD_DIVIDER_GAIN, 2);
+  Serial.print(F("), VFD 0-10V => 0-"));
+  Serial.print(10.0f * VFD_ANALOG_V_TO_CURRENT_A, 1);
+  Serial.println(F("A"));
 
   Serial.println(F("[BOOT] Initializing VFD over RS485..."));
   initVFD();
