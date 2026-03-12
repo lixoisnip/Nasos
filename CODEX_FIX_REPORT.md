@@ -19,12 +19,15 @@
   2. ADC node voltage
   3. divider gain restoration (from ADC node to original VFD output voltage)
   4. VFD voltage-to-current engineering conversion
+- Added explicit clamp of reconstructed VFD voltage to `0..10V` before conversion to keep out-of-range ADC spikes from inflating engineering current.
 - Added explicit constants in `v1.ino`:
   - `ADC_REFERENCE_V`
   - `ADC_MAX_COUNTS`
   - `VFD_DIVIDER_R_TOP_OHM`
   - `VFD_DIVIDER_R_BOTTOM_OHM`
   - `VFD_DIVIDER_GAIN`
+  - `VFD_OUTPUT_MAX_V`
+  - `VFD_OUTPUT_MAX_CURRENT_A`
   - `VFD_ANALOG_V_TO_CURRENT_A`
 - Calibration assumes new divider `20k/10k` and engineering mapping `0–10V = 0–9A`.
 
