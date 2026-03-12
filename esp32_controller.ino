@@ -1,6 +1,6 @@
 // =====================================================
 // ESP32 main controller: all pump logic/protections + web UI
-// Works with Arduino Nano I/O bridge over I2C binary frames.
+// Works with Arduino Nano I/O bridge over UART binary frames.
 // =====================================================
 
 #include <WiFi.h>
@@ -8,8 +8,6 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <Wire.h>
-#include "i2c_link_config.h"
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <string.h>
@@ -159,32 +157,6 @@ String resetReasonToString(esp_reset_reason_t reason) {
 }
 
 
-const char* i2cTxErrorToText(uint8_t err) {
-  switch (err) {
-    case 0: return "OK";
-    case 1: return "data too long for TX buffer";
-    case 2: return "address NACK / slave not responding";
-    case 3: return "data NACK";
-    case 4: return "other I2C error";
-    case 5: return "timeout";
-    default: return "unknown";
-  }
-}
-
-bool probeNanoAtStartup(uint8_t attempts) {
-  bool ack = false;
-  Serial.println("[I2C] Startup probe begin");
-  for (uint8_t i = 0; i < attempts; i++) {
-    Wire.beginTransmission(i2cLinkCfg::NANO_SLAVE_ADDRESS);
-    uint8_t err = Wire.endTransmission();
-    Serial.println(String("[I2C] Probe #") + String(i + 1) + ": addr=0x" + String(i2cLinkCfg::NANO_SLAVE_ADDRESS, HEX) + ", code=" + String(err) + " (" + i2cTxErrorToText(err) + ")");
-    if (err == 0) ack = true;
-    delay(60);
-  }
-  Serial.println(String("[I2C] Startup probe result: ") + (ack ? "ACK detected" : "no ACK"));
-  return ack;
-}
-
 namespace defaults {
 /*
 Baseline table (Osnova.ino -> esp32_controller.ino)
@@ -311,10 +283,11 @@ constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL; // Intentional deviation
 constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
 }
 
-// -------- I2C to Nano --------
-constexpr uint8_t NANO_I2C_ADDRESS = i2cLinkCfg::NANO_SLAVE_ADDRESS;
-constexpr int I2C_SDA_PIN = i2cLinkCfg::ESP32_SDA_PIN;
-constexpr int I2C_SCL_PIN = i2cLinkCfg::ESP32_SCL_PIN;
+// -------- UART to Nano --------
+HardwareSerial& nanoSerial = Serial2;
+constexpr int NANO_UART_RX_PIN = 16;
+constexpr int NANO_UART_TX_PIN = 17;
+constexpr int NANO_UART_BAUD = 38400;
 
 namespace telemetryCurrent {
 constexpr float WELL_GAIN = 1.0f;
@@ -329,7 +302,8 @@ float normalizeTelemetryCurrent(float amps, float gain) {
 }
 
 namespace nanoProto {
-constexpr uint8_t MAGIC = 0xA5;
+constexpr uint8_t MAGIC_0 = 0xA5;
+constexpr uint8_t MAGIC_1 = 0x5A;
 constexpr uint8_t VERSION = 3;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
@@ -343,17 +317,18 @@ constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
 }
 
 namespace nanoLink {
-constexpr unsigned long CMD_PERIOD_MS = 140UL;
-constexpr unsigned long TELEMETRY_POLL_MS = 140UL;
-constexpr unsigned long TX_RX_GAP_MS = 12UL;
+constexpr unsigned long CMD_PERIOD_MS = 100UL;
+constexpr unsigned long RESPONSE_TIMEOUT_MS = 70UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
-constexpr uint8_t COMMAND_FRAME_LEN = 18;
-constexpr uint8_t TELEMETRY_FRAME_LEN = 16;
+constexpr uint8_t COMMAND_PAYLOAD_LEN = 12;
+constexpr uint8_t TELEMETRY_PAYLOAD_LEN = 10;
+constexpr uint8_t HEADER_LEN = 6;
+constexpr uint8_t CRC_LEN = 2;
+constexpr uint8_t COMMAND_FRAME_LEN = HEADER_LEN + COMMAND_PAYLOAD_LEN + CRC_LEN;
+constexpr uint8_t TELEMETRY_FRAME_LEN = HEADER_LEN + TELEMETRY_PAYLOAD_LEN + CRC_LEN;
 constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
 constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
-constexpr uint8_t RECOVERY_TIMEOUT_THRESHOLD = 4;
-constexpr unsigned long RECOVERY_COOLDOWN_MS = 1200UL;
 }
 
 struct NanoCommandPayload {
@@ -377,11 +352,11 @@ struct NanoTelemetryPayload {
 } __attribute__((packed));
 
 namespace vfdBus {
-constexpr int UART_PORT = 2;
+constexpr int UART_PORT = 1;
 constexpr int UART_BAUD = 9600;
 constexpr uint32_t UART_CONFIG = SERIAL_8N1;
-constexpr int RS485_TX_PIN = 17;
-constexpr int RS485_RX_PIN = 16;
+constexpr int RS485_TX_PIN = 25;
+constexpr int RS485_RX_PIN = 26;
 constexpr int RS485_DE_PIN = 27;
 constexpr uint8_t MODBUS_SLAVE_ID = 0x08;
 constexpr unsigned long DIR_SETTLE_US = 120;
@@ -430,8 +405,6 @@ struct LinkHealth {
   unsigned long lastTxErrorLogMs = 0;
   unsigned long lastShortReadLogMs = 0;
   unsigned long lastInvalidFrameLogMs = 0;
-  uint8_t txTimeoutStreak = 0;
-  unsigned long lastWireRecoveryMs = 0;
 } linkHealth;
 
 bool linkAlive = false;
@@ -677,14 +650,22 @@ void clear() {
 }
 }
 
+
+float sanitizeEventValue(float value) {
+  if (!isfinite(value)) return 0.0f;
+  if (value > 1000000.0f) return 1000000.0f;
+  if (value < -1000000.0f) return -1000000.0f;
+  return value;
+}
+
 void appendEventLog(uint8_t src, const char* code, float v1 = 0.0f, float v2 = 0.0f) {
   EventLogRecord& rec = eventLog::records[eventLog::head];
   rec.ts = millis();
   rec.src = src;
   strncpy(rec.code, code ? code : "", sizeof(rec.code) - 1);
   rec.code[sizeof(rec.code) - 1] = '\0';
-  rec.v1 = v1;
-  rec.v2 = v2;
+  rec.v1 = sanitizeEventValue(v1);
+  rec.v2 = sanitizeEventValue(v2);
 
   eventLog::head = (eventLog::head + 1) % eventLog::CAPACITY;
   if (eventLog::count < eventLog::CAPACITY) eventLog::count++;
@@ -1051,7 +1032,7 @@ int16_t clampScaled(float value, float scale) {
   return (int16_t)scaled;
 }
 
-HardwareSerial& vfdSerial = Serial2;
+HardwareSerial vfdSerial(vfdBus::UART_PORT);
 
 void vfdSetRxMode() {
   digitalWrite(vfdBus::RS485_DE_PIN, LOW);
@@ -1190,85 +1171,42 @@ void appendLinkLogThrottled(const String& message, unsigned long& lastLogMs) {
   lastLogMs = now;
 }
 
-void recoverI2cBusIfNeeded(unsigned long now) {
-  if (linkHealth.txTimeoutStreak < nanoLink::RECOVERY_TIMEOUT_THRESHOLD) return;
-  if (linkHealth.lastWireRecoveryMs != 0 && (now - linkHealth.lastWireRecoveryMs) < nanoLink::RECOVERY_COOLDOWN_MS) return;
-
-  appendLinkLogThrottled("Nano I2C recovery: reinitializing Wire after repeated timeouts", linkHealth.lastTxErrorLogMs);
-  Wire.end();
-  delay(2);
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
-  linkHealth.lastWireRecoveryMs = now;
-  linkHealth.txTimeoutStreak = 0;
-}
-
-void recordNanoTxResult(uint8_t err, const char* context) {
+void recordNanoTxResult(bool ok, const char* context) {
   static uint8_t startupTxLogs = 0;
 
   if (startupTxLogs < 8) {
-    Serial.println(String("[I2C] TX ") + context + ": code=" + String(err) + " (" + i2cTxErrorToText(err) + ")");
+    Serial.println(String("[UART] TX ") + context + ": " + (ok ? "OK" : "FAIL"));
     startupTxLogs++;
   }
 
-  if (err == 0) {
+  if (ok) {
     linkHealth.lastTxErrCode = 0;
     linkHealth.txErrorBurstActive = false;
-    linkHealth.txTimeoutStreak = 0;
     return;
   }
 
   linkHealth.txErrorCount++;
-  linkHealth.lastTxErrCode = err;
-  if (err == 5) {
-    if (linkHealth.txTimeoutStreak < 255) linkHealth.txTimeoutStreak++;
-  } else {
-    linkHealth.txTimeoutStreak = 0;
-  }
+  linkHealth.lastTxErrCode = 1;
   if (!linkHealth.txErrorBurstActive) {
-    const String msg = String("Nano I2C TX error (") + context + "): code=" + String(err) + " (" + i2cTxErrorToText(err) + ")";
+    const String msg = String("Nano UART TX error (") + context + ")";
     appendLinkLogThrottled(msg, linkHealth.lastTxErrorLogMs);
     linkHealth.txErrorBurstActive = true;
   }
 }
 
-void readNanoI2c() {
-  const unsigned long now = millis();
-  static unsigned long lastTelemetryPollMs = 0;
-  if (now - lastTelemetryPollMs < nanoLink::TELEMETRY_POLL_MS) return;
-  lastTelemetryPollMs = now;
-
-  uint8_t frame[nanoLink::TELEMETRY_FRAME_LEN] = {0};
-  const int expected = (int)nanoLink::TELEMETRY_FRAME_LEN;
-  int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, expected);
-  if (received <= 0) {
-    recordNanoTxResult(5, "telemetry");
-    return;
-  }
-
-  recordNanoTxResult(0, "telemetry");
-
-  if (received != expected) {
-    linkHealth.shortReadCount++;
-    appendLinkLogThrottled(String("Nano I2C short read: requested=") + String(expected) + ", received=" + String(received), linkHealth.lastShortReadLogMs);
-  }
-
-  uint8_t idx = 0;
-  while (Wire.available() && idx < sizeof(frame)) frame[idx++] = (uint8_t)Wire.read();
-  while (Wire.available()) { (void)Wire.read(); idx++; }
-
-  linkHealth.totalPackets++;
-  if (idx != nanoLink::TELEMETRY_FRAME_LEN) {
+bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now) {
+  if (len != nanoLink::TELEMETRY_FRAME_LEN) {
     linkHealth.shortReadCount++;
     linkHealth.shortFrameCount++;
-    appendLinkLogThrottled(String("Nano I2C short frame: expected=") + String(nanoLink::TELEMETRY_FRAME_LEN) + ", actual=" + String(idx), linkHealth.lastShortReadLogMs);
-    return;
+    appendLinkLogThrottled(String("Nano UART short frame: expected=") + String(nanoLink::TELEMETRY_FRAME_LEN) + ", actual=" + String(len), linkHealth.lastShortReadLogMs);
+    return false;
   }
 
-  if (frame[0] != nanoProto::MAGIC || frame[1] != nanoProto::VERSION || frame[2] != nanoProto::MSG_TELEMETRY) {
+  if (frame[0] != nanoProto::MAGIC_0 || frame[1] != nanoProto::MAGIC_1 || frame[2] != nanoProto::VERSION || frame[3] != nanoProto::MSG_TELEMETRY || frame[5] != nanoLink::TELEMETRY_PAYLOAD_LEN) {
     linkHealth.invalidFrameCount++;
     linkHealth.badHeaderCount++;
-    appendLinkLogThrottled("Nano I2C invalid frame: bad header", linkHealth.lastInvalidFrameLogMs);
-    return;
+    appendLinkLogThrottled("Nano UART invalid frame: bad header", linkHealth.lastInvalidFrameLogMs);
+    return false;
   }
 
   uint16_t rxCrc = readU16LE(frame + nanoLink::TELEMETRY_FRAME_LEN - 2);
@@ -1276,11 +1214,11 @@ void readNanoI2c() {
   if (rxCrc != calc) {
     linkHealth.invalidFrameCount++;
     linkHealth.badCrcCount++;
-    appendLinkLogThrottled("Nano I2C invalid frame: CRC mismatch", linkHealth.lastInvalidFrameLogMs);
-    return;
+    appendLinkLogThrottled("Nano UART invalid frame: CRC mismatch", linkHealth.lastInvalidFrameLogMs);
+    return false;
   }
 
-  const uint8_t seq = frame[3];
+  const uint8_t seq = frame[4];
   if (linkHealth.telemetrySeqValid && (uint8_t)(linkHealth.lastTelemetrySeq + 1) != seq) {
     linkHealth.seqGapCount++;
   }
@@ -1288,7 +1226,7 @@ void readNanoI2c() {
   linkHealth.telemetrySeqValid = true;
 
   NanoTelemetryPayload payload;
-  memcpy(&payload, frame + 4, sizeof(payload));
+  memcpy(&payload, frame + nanoLink::HEADER_LEN, sizeof(payload));
 
   const bool rangesOk =
       abs((int)payload.wellCurrentCentiA) <= 5000 &&
@@ -1296,15 +1234,48 @@ void readNanoI2c() {
       payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
   if (!rangesOk) {
     linkHealth.invalidFrameCount++;
-    appendLinkLogThrottled("Nano I2C invalid frame: telemetry out of range", linkHealth.lastInvalidFrameLogMs);
-    return;
+    appendLinkLogThrottled("Nano UART invalid frame: telemetry out of range", linkHealth.lastInvalidFrameLogMs);
+    return false;
   }
 
   if (!decodeTelemetryPayload(payload, now)) {
     linkHealth.invalidFrameCount++;
-    appendLinkLogThrottled("Nano I2C invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
+    appendLinkLogThrottled("Nano UART invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
+    return false;
   }
+
+  return true;
 }
+
+void readNanoUartResponse(unsigned long now, uint8_t expectedSeq) {
+  uint8_t frame[nanoLink::TELEMETRY_FRAME_LEN] = {0};
+  uint8_t idx = 0;
+  const unsigned long deadline = millis() + nanoLink::RESPONSE_TIMEOUT_MS;
+
+  while ((long)(deadline - millis()) > 0) {
+    while (nanoSerial.available()) {
+      const uint8_t b = (uint8_t)nanoSerial.read();
+      if (idx == 0 && b != nanoProto::MAGIC_0) continue;
+      if (idx == 1 && b != nanoProto::MAGIC_1) {
+        idx = 0;
+        if (b == nanoProto::MAGIC_0) frame[idx++] = b;
+        continue;
+      }
+      if (idx < sizeof(frame)) frame[idx++] = b;
+      if (idx == nanoLink::TELEMETRY_FRAME_LEN) {
+        linkHealth.totalPackets++;
+        const bool ok = parseNanoTelemetryFrame(frame, idx, now);
+        if (ok && frame[4] != expectedSeq) linkHealth.seqGapCount++;
+        return;
+      }
+    }
+    delay(1);
+  }
+
+  linkHealth.shortReadCount++;
+  appendLinkLogThrottled("Nano UART response timeout", linkHealth.lastShortReadLogMs);
+}
+
 
 NanoCommandPacket buildNanoCommandPacket() {
   NanoCommandPacket packet;
@@ -1337,31 +1308,30 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
   if (packet.houseBlocked) payload.flags |= nanoProto::FLAG_HOUSE_BLOCKED;
 
   uint8_t frame[nanoLink::COMMAND_FRAME_LEN] = {0};
-  frame[0] = nanoProto::MAGIC;
-  frame[1] = nanoProto::VERSION;
-  frame[2] = nanoProto::MSG_COMMAND;
-  frame[3] = linkHealth.txSeq++;
-  memcpy(frame + 4, &payload, sizeof(payload));
+  frame[0] = nanoProto::MAGIC_0;
+  frame[1] = nanoProto::MAGIC_1;
+  frame[2] = nanoProto::VERSION;
+  frame[3] = nanoProto::MSG_COMMAND;
+  frame[4] = linkHealth.txSeq++;
+  frame[5] = nanoLink::COMMAND_PAYLOAD_LEN;
+  memcpy(frame + nanoLink::HEADER_LEN, &payload, sizeof(payload));
   uint16_t crc = calcCrc16(frame, nanoLink::COMMAND_FRAME_LEN - 2);
   writeU16LE(frame + nanoLink::COMMAND_FRAME_LEN - 2, crc);
 
-  Wire.beginTransmission(NANO_I2C_ADDRESS);
-  Wire.write(frame, nanoLink::COMMAND_FRAME_LEN);
-  uint8_t err = Wire.endTransmission();
-  recordNanoTxResult(err, "command");
+  while (nanoSerial.available()) (void)nanoSerial.read();
+  const size_t sent = nanoSerial.write(frame, nanoLink::COMMAND_FRAME_LEN);
+  recordNanoTxResult(sent == nanoLink::COMMAND_FRAME_LEN, "command");
+  if (sent == nanoLink::COMMAND_FRAME_LEN) {
+    readNanoUartResponse(millis(), frame[4]);
+  }
 }
 
 void serviceNanoTx(unsigned long now) {
   static unsigned long lastControlTxMs = 0;
-  static unsigned long lastBusActivityMs = 0;
-
-  if (now - lastBusActivityMs < nanoLink::TX_RX_GAP_MS) return;
-
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
     sendNanoControlPacket(current);
     lastControlTxMs = now;
-    lastBusActivityMs = now;
   }
 }
 
@@ -2239,10 +2209,9 @@ void setup() {
   delay(80);
   Serial.println();
   Serial.println("[BOOT] ESP32 controller startup");
-  Serial.println(String("[BOOT] I2C pins: SDA=") + String(I2C_SDA_PIN) + ", SCL=" + String(I2C_SCL_PIN));
-  Serial.println(String("[BOOT] Expected Nano I2C address: 0x") + String(NANO_I2C_ADDRESS, HEX));
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
-  Serial.println(String("[BOOT] Wire.begin() done @ ") + String(i2cLinkCfg::BUS_FREQUENCY_HZ) + " Hz");
+  Serial.println(String("[BOOT] Nano UART link: RX=") + String(NANO_UART_RX_PIN) + ", TX=" + String(NANO_UART_TX_PIN) + ", baud=" + String(NANO_UART_BAUD));
+  nanoSerial.begin(NANO_UART_BAUD, SERIAL_8N1, NANO_UART_RX_PIN, NANO_UART_TX_PIN);
+  nanoSerial.setTimeout(nanoLink::RESPONSE_TIMEOUT_MS);
   pinMode(vfdBus::RS485_DE_PIN, OUTPUT);
   rs485Receive();
   vfdSerial.begin(vfdBus::UART_BAUD, vfdBus::UART_CONFIG, vfdBus::RS485_RX_PIN, vfdBus::RS485_TX_PIN);
@@ -2255,7 +2224,7 @@ void setup() {
   (void)vfdWriteRegister(vfdBus::REG_FREQ_SETPOINT, 0x0000);
   delay(150);
   vfdStop();
-  const bool probeAck = probeNanoAtStartup(6);
+  const bool probeAck = true;
 
   initConfigFromNamespaces();
 
@@ -2276,8 +2245,8 @@ void setup() {
 
   appendLog(st.logsWell, "Система запущена: контроллер ESP32 онлайн");
   appendLog(st.logsHouse, "Система запущена: контроллер ESP32 онлайн");
-  appendLog(st.logsWell, String("I2C startup probe: ") + (probeAck ? "Nano ACK detected" : "no ACK at Nano address"));
-  appendLog(st.logsHouse, String("I2C startup probe: ") + (probeAck ? "Nano ACK detected" : "no ACK at Nano address"));
+  appendLog(st.logsWell, String("UART startup: ") + (probeAck ? "Nano UART initialized" : "Nano UART init failed"));
+  appendLog(st.logsHouse, String("UART startup: ") + (probeAck ? "Nano UART initialized" : "Nano UART init failed"));
 
   controllerBootMs = millis();
 }
@@ -2288,9 +2257,6 @@ void loop() {
   static bool startupGraceLogged = false;
   enum class LinkState : uint8_t { HEALTHY, DEGRADED, LOST };
   static LinkState prevLinkState = LinkState::HEALTHY;
-
-  readNanoI2c();
-  recoverI2cBusIfNeeded(now);
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
@@ -2326,12 +2292,12 @@ void loop() {
 
   if (linkState != prevLinkState) {
     if (linkState == LinkState::DEGRADED) {
-      appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
-      appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
+      appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
+      appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 1);
     } else if (linkState == LinkState::LOST) {
-      appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
-      appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
+      appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent UART TX failure, pumps stopped");
+      appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent UART TX failure, pumps stopped");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 2);
     } else if (prevLinkState == LinkState::LOST || prevLinkState == LinkState::DEGRADED) {
       appendLog(st.logsWell, "Nano link restored: телеметрия восстановлена");

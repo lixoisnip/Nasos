@@ -4,8 +4,7 @@
 // while all control logic + VFD RS485 is moved to ESP32.
 // =====================================================
 
-#include <Wire.h>
-#include "i2c_link_config.h"
+#include <SoftwareSerial.h>
 #include <avr/wdt.h>
 #include <string.h>
 #include <stdlib.h>
@@ -62,10 +61,15 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 #define Y4 (Y3+Z3)
 #define Y5 (Y4+Z4)
 
-// I2C link to ESP32 (Nano as slave)
-constexpr uint8_t NANO_I2C_ADDRESS = i2cLinkCfg::NANO_SLAVE_ADDRESS;
+// UART link to ESP32 (Nano side uses SoftwareSerial to keep USB Serial debug)
+constexpr uint8_t NANO_UART_RX_PIN = 11;
+constexpr uint8_t NANO_UART_TX_PIN = 10;
+constexpr unsigned long NANO_UART_BAUD = 38400UL;
+SoftwareSerial controllerSerial(NANO_UART_RX_PIN, NANO_UART_TX_PIN);
+
 namespace nanoProto {
-constexpr uint8_t MAGIC = 0xA5;
+constexpr uint8_t MAGIC_0 = 0xA5;
+constexpr uint8_t MAGIC_1 = 0x5A;
 constexpr uint8_t VERSION = 3;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
@@ -76,15 +80,14 @@ constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
 constexpr uint8_t STATUS_CMD_STALE = 1 << 0;
 constexpr uint8_t STATUS_LINK_OK = 1 << 1;
 constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
-constexpr uint8_t COMMAND_FRAME_LEN = 18;   // 4-byte header + 12-byte payload + 2-byte CRC
-constexpr uint8_t TELEMETRY_FRAME_LEN = 16; // 4-byte header + 10-byte payload + 2-byte CRC
+constexpr uint8_t COMMAND_PAYLOAD_LEN = 12;
+constexpr uint8_t TELEMETRY_PAYLOAD_LEN = 10;
+constexpr uint8_t HEADER_LEN = 6; // magic0, magic1, version, type, seq, payloadLen
+constexpr uint8_t CRC_LEN = 2;
+constexpr uint8_t COMMAND_FRAME_LEN = HEADER_LEN + COMMAND_PAYLOAD_LEN + CRC_LEN;
+constexpr uint8_t TELEMETRY_FRAME_LEN = HEADER_LEN + TELEMETRY_PAYLOAD_LEN + CRC_LEN;
 constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
 }
-
-volatile bool i2cCommandReady = false;
-volatile uint8_t i2cCommandFrame[nanoProto::COMMAND_FRAME_LEN] = {0};
-volatile uint8_t i2cTelemetryFrame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
-volatile uint8_t i2cCommandLen = 0;
 
 struct NanoCommandPayload {
   uint8_t relay = 0;
@@ -154,7 +157,7 @@ struct NanoState {
 } ns;
 
 const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
-const unsigned long I2C_SANITY_CHECK_INTERVAL_MS = 5000;
+const unsigned long UART_SANITY_CHECK_INTERVAL_MS = 5000;
 const unsigned long L1_L2_STUCK_WINDOW_MS = 45000;
 const unsigned long WIRING_WARNING_RATE_LIMIT_MS = 15000;
 const unsigned long NANO_HEARTBEAT_INTERVAL_MS = 5000;
@@ -337,14 +340,14 @@ bool nanoLastL2 = false;
 void printBootPinWarningBanner() {
   Serial.println();
   Serial.println(F("=============================================="));
-  Serial.println(F("WARNING: I2C mode active (A4/A5 reserved)"));
+  Serial.println(F("WARNING: UART mode active (A4/A5 free)"));
   Serial.println(F("Level pin mapping: L1=D4, L2=D5, L3=A6, L4=A7"));
-  Serial.println(F("Legacy A4/A5 level wiring is NOT compatible."));
+  Serial.println(F("Nano link: SoftwareSerial RX=D11 TX=D10 @38400"));
   Serial.println(F("=============================================="));
 }
 
-void checkI2cLevelWiringSanity(unsigned long now) {
-  if (now - nanoLastSanityCheckAt < I2C_SANITY_CHECK_INTERVAL_MS) return;
+void checkUartLevelWiringSanity(unsigned long now) {
+  if (now - nanoLastSanityCheckAt < UART_SANITY_CHECK_INTERVAL_MS) return;
   nanoLastSanityCheckAt = now;
 
   const unsigned long errorTotal = nanoCommandSeqGapCount + nanoShortFrameCount + nanoBadHeaderCount +
@@ -358,16 +361,16 @@ void checkI2cLevelWiringSanity(unsigned long now) {
     nanoLastL2 = ns.levels[1];
   }
 
-  const bool i2cUnstable = errorDelta >= 2;
+  const bool uartUnstable = errorDelta >= 2;
   const bool l1l2Stuck = (now - nanoLastLevelTransitionAt) >= L1_L2_STUCK_WINDOW_MS;
-  if (!i2cUnstable || !l1l2Stuck) return;
+  if (!uartUnstable || !l1l2Stuck) return;
 
   if (now - nanoLastWiringWarningAt < WIRING_WARNING_RATE_LIMIT_MS) return;
   nanoLastWiringWarningAt = now;
 
-  Serial.println(F("[WIRING WARNING] I2C traffic unstable and L1/L2 look stuck/invalid."));
+  Serial.println(F("[WIRING WARNING] UART traffic unstable and L1/L2 look stuck/invalid."));
   Serial.println(F("[WIRING WARNING] Verify level sensor wiring: L1=D4, L2=D5 (NOT A4/A5)."));
-  Serial.println(F("[WIRING WARNING] Legacy A4/A5 level wiring conflicts with I2C SDA/SCL."));
+  Serial.println(F("[WIRING WARNING] Legacy A4/A5 level wiring from old I2C layout may be stale."));
 }
 
 bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion, unsigned long now) {
@@ -377,7 +380,7 @@ bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion
   }
 
   NanoCommandPayload payload;
-  memcpy(&payload, frame + 4, sizeof(payload));
+  memcpy(&payload, frame + nanoProto::HEADER_LEN, sizeof(payload));
 
   ns.relayWellOn = payload.relay != 0;
   ns.wellMode = payload.wellMode;
@@ -395,64 +398,62 @@ bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion
   return true;
 }
 
-void onI2cReceive(int count) {
-  if (count <= 0) return;
-
-  uint8_t raw[nanoProto::COMMAND_FRAME_LEN] = {0};
-  uint8_t idx = 0;
-  while (Wire.available() && idx < sizeof(raw)) raw[idx++] = (uint8_t)Wire.read();
-  while (Wire.available()) { (void)Wire.read(); idx++; }
-
-  if (idx > nanoProto::COMMAND_FRAME_LEN) idx = nanoProto::COMMAND_FRAME_LEN;
-  memcpy((void*)i2cCommandFrame, raw, idx);
-  i2cCommandLen = idx;
-  i2cCommandReady = true;
-}
-
-void onI2cRequest() {
-  Wire.write((const uint8_t*)i2cTelemetryFrame, nanoProto::TELEMETRY_FRAME_LEN);
-}
-
-void processEspI2c(unsigned long now) {
-  if (i2cCommandReady) {
-    uint8_t local[nanoProto::COMMAND_FRAME_LEN] = {0};
-    uint8_t localLen = 0;
-    noInterrupts();
-    memcpy(local, (const void*)i2cCommandFrame, nanoProto::COMMAND_FRAME_LEN);
-    localLen = i2cCommandLen;
-    i2cCommandReady = false;
-    interrupts();
-
-    if (localLen < nanoProto::COMMAND_FRAME_LEN) {
-      nanoShortFrameCount++;
-      return;
+bool parseCommandFrameFromUart(unsigned long now, uint8_t* rxFrame, uint8_t& idx) {
+  while (controllerSerial.available()) {
+    const uint8_t b = (uint8_t)controllerSerial.read();
+    if (idx == 0 && b != nanoProto::MAGIC_0) continue;
+    if (idx == 1 && b != nanoProto::MAGIC_1) {
+      idx = 0;
+      if (b == nanoProto::MAGIC_0) rxFrame[idx++] = b;
+      continue;
     }
 
-    const uint8_t protocolVersion = local[1];
-    if (local[0] != nanoProto::MAGIC || protocolVersion != nanoProto::VERSION || local[2] != nanoProto::MSG_COMMAND) {
-      nanoBadHeaderCount++;
-      return;
+    rxFrame[idx++] = b;
+    if (idx == nanoProto::HEADER_LEN) {
+      if (rxFrame[2] != nanoProto::VERSION || rxFrame[3] != nanoProto::MSG_COMMAND || rxFrame[5] != nanoProto::COMMAND_PAYLOAD_LEN) {
+        nanoBadHeaderCount++;
+        idx = 0;
+      }
     }
 
-    const size_t expectedLen = nanoProto::COMMAND_FRAME_LEN;
-    const uint16_t rxCrc = readU16LE(local + expectedLen - 2);
-    const uint16_t calc = calcCrc16(local, expectedLen - 2);
-    if (rxCrc != calc) {
-      nanoBadCrcCount++;
-      return;
+    if (idx >= nanoProto::COMMAND_FRAME_LEN) {
+      const uint16_t rxCrc = readU16LE(rxFrame + nanoProto::COMMAND_FRAME_LEN - 2);
+      const uint16_t calc = calcCrc16(rxFrame, nanoProto::COMMAND_FRAME_LEN - 2);
+      if (rxCrc != calc) {
+        nanoBadCrcCount++;
+        idx = 0;
+        return false;
+      }
+
+      const uint8_t seq = rxFrame[4];
+      if (nanoCommandSeqValid && (uint8_t)(nanoLastCommandSeq + 1) != seq) nanoCommandSeqGapCount++;
+      nanoLastCommandSeq = seq;
+      nanoCommandSeqValid = true;
+
+      if (!applyCommandFrame(rxFrame, nanoProto::COMMAND_FRAME_LEN, rxFrame[2], now)) {
+        nanoParseRejectCount++;
+        idx = 0;
+        return false;
+      }
+      idx = 0;
+      return true;
     }
 
-    if (nanoCommandSeqValid && (uint8_t)(nanoLastCommandSeq + 1) != local[3]) nanoCommandSeqGapCount++;
-    nanoLastCommandSeq = local[3];
-    nanoCommandSeqValid = true;
-
-    if (!applyCommandFrame(local, expectedLen, protocolVersion, now)) {
-      nanoParseRejectCount++;
-    }
   }
+  return false;
+}
+
+void processEspUart(unsigned long now) {
+  static uint8_t rxFrame[nanoProto::COMMAND_FRAME_LEN] = {0};
+  static uint8_t rxIdx = 0;
+  const bool commandAccepted = parseCommandFrameFromUart(now, rxFrame, rxIdx);
 
   if (nanoLastCommandAt != 0 && (now - nanoLastCommandAt) > nanoProto::COMMAND_TIMEOUT_MS) {
     ns.relayWellOn = false;
+  }
+
+  if (commandAccepted) {
+    sendTelemetry(now);
   }
 }
 
@@ -484,33 +485,35 @@ void updateTelemetryFrame(unsigned long now) {
   static uint8_t txSeq = 0;
   const uint8_t seq = txSeq++;
 
-  if (frameOk) frame[0] = nanoProto::MAGIC;
-  if (frameOk) frame[1] = nanoProto::VERSION;
-  if (frameOk) frame[2] = nanoProto::MSG_TELEMETRY;
-  if (frameOk) frame[3] = seq;
-  if (frameOk && !writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, 4, &payload, sizeof(payload))) {
+  if (frameOk) frame[0] = nanoProto::MAGIC_0;
+  if (frameOk) frame[1] = nanoProto::MAGIC_1;
+  if (frameOk) frame[2] = nanoProto::VERSION;
+  if (frameOk) frame[3] = nanoProto::MSG_TELEMETRY;
+  if (frameOk) frame[4] = seq;
+  if (frameOk) frame[5] = nanoProto::TELEMETRY_PAYLOAD_LEN;
+  if (frameOk && !writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, nanoProto::HEADER_LEN, &payload, sizeof(payload))) {
     frameOk = false;
   }
 
   if (!frameOk) {
     memset(frame, 0, sizeof(frame));
-    frame[0] = nanoProto::MAGIC;
-    frame[1] = nanoProto::VERSION;
-    frame[2] = nanoProto::MSG_TELEMETRY;
-    frame[3] = seq;
+    frame[0] = nanoProto::MAGIC_0;
+    frame[1] = nanoProto::MAGIC_1;
+    frame[2] = nanoProto::VERSION;
+    frame[3] = nanoProto::MSG_TELEMETRY;
+    frame[4] = seq;
+    frame[5] = nanoProto::TELEMETRY_PAYLOAD_LEN;
 
     const uint8_t fallbackPayload[] = {
       0, 0, 0, 0, 0, 0, 0, 0, 0, nanoProto::STATUS_CMD_STALE
     };
-    (void)writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, 4, fallbackPayload, sizeof(fallbackPayload));
+    (void)writeFrameBytes(frame, nanoProto::TELEMETRY_FRAME_LEN, nanoProto::HEADER_LEN, fallbackPayload, sizeof(fallbackPayload));
   }
 
   uint16_t crc = calcCrc16(frame, nanoProto::TELEMETRY_FRAME_LEN - 2);
   writeU16LE(frame + nanoProto::TELEMETRY_FRAME_LEN - 2, crc);
 
-  noInterrupts();
-  memcpy((void*)i2cTelemetryFrame, frame, nanoProto::TELEMETRY_FRAME_LEN);
-  interrupts();
+  controllerSerial.write(frame, nanoProto::TELEMETRY_FRAME_LEN);
 }
 
 void sendTelemetry(unsigned long now) {
@@ -522,17 +525,14 @@ void setup() {
   delay(50);
   Serial.println();
   Serial.println(F("[BOOT] Nano firmware startup"));
-  Serial.print(F("[BOOT] Firmware: "));
-  Serial.print(i2cLinkCfg::NANO_FW_NAME);
-  Serial.print(F(" v"));
-  Serial.println(i2cLinkCfg::NANO_FW_VERSION);
-  Serial.print(F("[BOOT] Configured I2C slave address: 0x"));
-  Serial.println(NANO_I2C_ADDRESS, HEX);
-
-  Wire.begin(NANO_I2C_ADDRESS);
-  Wire.onReceive(onI2cReceive);
-  Wire.onRequest(onI2cRequest);
-  Serial.println(F("[BOOT] Wire.begin(slaveAddress) executed; Nano in I2C slave mode"));
+  Serial.println(F("[BOOT] Firmware: nasos-nano-bridge-uart v2.0.0"));
+  controllerSerial.begin(NANO_UART_BAUD);
+  Serial.print(F("[BOOT] Controller UART ready RX="));
+  Serial.print(NANO_UART_RX_PIN);
+  Serial.print(F(" TX="));
+  Serial.print(NANO_UART_TX_PIN);
+  Serial.print(F(" baud="));
+  Serial.println(NANO_UART_BAUD);
 
   pinMode(RELAY_WELL, OUTPUT);
   digitalWrite(RELAY_WELL, HIGH);
@@ -568,18 +568,17 @@ void loop() {
   static unsigned long lastHeartbeatMs = 0;
   if (now - lastHeartbeatMs >= NANO_HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = now;
-    Serial.print(F("[HEARTBEAT] Nano alive; I2C=0x"));
-    Serial.print(NANO_I2C_ADDRESS, HEX);
+    Serial.print(F("[HEARTBEAT] Nano alive; UART seqValid="));
+    Serial.print(nanoCommandSeqValid ? 1 : 0);
     Serial.print(F(", cmdAgeMs="));
     Serial.println(nanoLastCommandAt ? (now - nanoLastCommandAt) : 0UL);
   }
-  processEspI2c(now);
+  processEspUart(now);
   feedWatchdog();
   readInputs(now);
   applyOutputs();
   feedWatchdog();
-  sendTelemetry(now);
-  checkI2cLevelWiringSanity(now);
+  checkUartLevelWiringSanity(now);
 
   feedWatchdog();
 }
