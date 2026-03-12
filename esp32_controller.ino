@@ -109,8 +109,6 @@ struct NetworkConfig {
 
 struct NanoCommandPacket {
   bool relay = false;
-  bool vfdRun = false;
-  float vfdFreq = 0;
   uint8_t wellMode = 0;
   bool wellAlarm = false;
   bool wellBlocked = false;
@@ -332,16 +330,16 @@ float normalizeTelemetryCurrent(float amps, float gain) {
 
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
-constexpr uint8_t VERSION = 2;
+constexpr uint8_t VERSION = 3;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
 constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
 constexpr uint8_t FLAG_WELL_BLOCKED = 1 << 1;
 constexpr uint8_t FLAG_HOUSE_ALARM = 1 << 2;
 constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
-constexpr uint8_t STATUS_VFD_RUN = 1 << 0;
-constexpr uint8_t STATUS_CMD_STALE = 1 << 1;
-constexpr uint8_t STATUS_LINK_OK = 1 << 2;
+constexpr uint8_t STATUS_CMD_STALE = 1 << 0;
+constexpr uint8_t STATUS_LINK_OK = 1 << 1;
+constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
 }
 
 namespace nanoLink {
@@ -356,24 +354,44 @@ constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
 
 struct NanoCommandPayload {
   uint8_t relay = 0;
-  uint8_t vfdRun = 0;
-  int16_t vfdFreqDeciHz = 0;
   uint8_t wellMode = 0;
   uint8_t wellIntention = 0;
   uint8_t houseMode = 0;
   uint8_t flags = 0;
   uint16_t levelFilterMs = 0;
   uint16_t levelThreshRaw = 0;
+  uint8_t reserved[4] = {0, 0, 0, 0};
 } __attribute__((packed));
 
 struct NanoTelemetryPayload {
   int16_t wellCurrentCentiA = 0;
   int16_t wellPressureCentiBar = 0;
-  int16_t houseCurrentCentiA = 0;
+  int16_t analogAuxRaw = 0;
   int16_t housePressureCentiBar = 0;
   uint8_t levelsMask = 0;
   uint8_t statusBits = 0;
 } __attribute__((packed));
+
+namespace vfdBus {
+constexpr int UART_PORT = 2;
+constexpr int UART_BAUD = 9600;
+constexpr uint32_t UART_CONFIG = SERIAL_8N1;
+constexpr int UART_TX_PIN = 17;
+constexpr int UART_RX_PIN = 16;
+constexpr int RS485_DIR_PIN = 4;
+constexpr uint8_t MODBUS_SLAVE_ID = 0x08;
+constexpr unsigned long DIR_SETTLE_US = 120;
+constexpr unsigned long RESPONSE_TIMEOUT_MS = 120;
+constexpr unsigned long POLL_PERIOD_MS = 200;
+constexpr uint16_t REG_COMMAND = 0x9CA7;
+constexpr uint16_t REG_FREQ_SETPOINT = 0x9CA6;
+constexpr uint16_t REG_INIT_MODE = 0x9C41;
+constexpr uint16_t REG_INIT_SOURCE = 0x9C40;
+constexpr uint16_t REG_CURRENT_FEEDBACK = 0x3004;
+constexpr uint16_t REG_RUN_STATUS = 0x3003;
+constexpr float CURRENT_SCALE_A_PER_LSB = 0.01f;
+constexpr float FREQ_SCALE_HZ_PER_LSB = 0.01f;
+}
 
 struct Telemetry {
   unsigned long ts = 0;
@@ -428,6 +446,7 @@ struct Controller {
   bool wellRelay = false;
   bool vfdRun = false;
   float vfdFreq = 28.0f;
+  float vfdCurrent = 0.0f;
 
   bool wellBlocked = false;
   bool wellAlarm = false;
@@ -1026,17 +1045,119 @@ int16_t clampScaled(float value, float scale) {
   return (int16_t)scaled;
 }
 
+HardwareSerial& vfdSerial = Serial2;
+
+void vfdSetRxMode() {
+  digitalWrite(vfdBus::RS485_DIR_PIN, LOW);
+}
+
+void vfdSetTxMode() {
+  digitalWrite(vfdBus::RS485_DIR_PIN, HIGH);
+  delayMicroseconds(vfdBus::DIR_SETTLE_US);
+}
+
+bool vfdWriteRegister(uint16_t reg, uint16_t value) {
+  uint8_t frame[8];
+  frame[0] = vfdBus::MODBUS_SLAVE_ID;
+  frame[1] = 0x06;
+  frame[2] = highByte(reg);
+  frame[3] = lowByte(reg);
+  frame[4] = highByte(value);
+  frame[5] = lowByte(value);
+  uint16_t crc = calcCrc16(frame, 6);
+  frame[6] = lowByte(crc);
+  frame[7] = highByte(crc);
+
+  while (vfdSerial.available()) (void)vfdSerial.read();
+  vfdSetTxMode();
+  vfdSerial.write(frame, sizeof(frame));
+  vfdSerial.flush();
+  vfdSetRxMode();
+
+  uint8_t ack[8] = {0};
+  size_t got = vfdSerial.readBytes(ack, sizeof(ack));
+  if (got != sizeof(ack)) return false;
+  uint16_t ackCrc = readU16LE(ack + 6);
+  return ack[0] == vfdBus::MODBUS_SLAVE_ID && ack[1] == 0x06 && ackCrc == calcCrc16(ack, 6);
+}
+
+bool vfdReadHoldingRegister(uint16_t reg, uint16_t& value) {
+  uint8_t req[8];
+  req[0] = vfdBus::MODBUS_SLAVE_ID;
+  req[1] = 0x03;
+  req[2] = highByte(reg);
+  req[3] = lowByte(reg);
+  req[4] = 0x00;
+  req[5] = 0x01;
+  uint16_t crc = calcCrc16(req, 6);
+  req[6] = lowByte(crc);
+  req[7] = highByte(crc);
+
+  while (vfdSerial.available()) (void)vfdSerial.read();
+  vfdSetTxMode();
+  vfdSerial.write(req, sizeof(req));
+  vfdSerial.flush();
+  vfdSetRxMode();
+
+  uint8_t rsp[7] = {0};
+  size_t got = vfdSerial.readBytes(rsp, sizeof(rsp));
+  if (got != sizeof(rsp)) return false;
+  uint16_t rspCrc = readU16LE(rsp + 5);
+  if (rsp[0] != vfdBus::MODBUS_SLAVE_ID || rsp[1] != 0x03 || rsp[2] != 0x02 || rspCrc != calcCrc16(rsp, 5)) return false;
+
+  value = ((uint16_t)rsp[3] << 8) | rsp[4];
+  return true;
+}
+
+void vfdStart() { (void)vfdWriteRegister(vfdBus::REG_COMMAND, 0x0001); }
+void vfdStop() { (void)vfdWriteRegister(vfdBus::REG_COMMAND, 0x0000); }
+void vfdSetFrequency(float hz) {
+  uint16_t raw = (uint16_t)lroundf(max(0.0f, hz) / vfdBus::FREQ_SCALE_HZ_PER_LSB);
+  (void)vfdWriteRegister(vfdBus::REG_FREQ_SETPOINT, raw);
+}
+
+void serviceVfd(unsigned long now) {
+  static bool prevRun = false;
+  static float prevFreq = -1000.0f;
+  static unsigned long lastPollMs = 0;
+
+  if (st.vfdRun != prevRun) {
+    st.vfdRun ? vfdStart() : vfdStop();
+    prevRun = st.vfdRun;
+  }
+
+  if (fabsf(st.vfdFreq - prevFreq) >= 0.1f) {
+    vfdSetFrequency(st.vfdFreq);
+    prevFreq = st.vfdFreq;
+  }
+
+  if (now - lastPollMs < vfdBus::POLL_PERIOD_MS) return;
+  lastPollMs = now;
+
+  uint16_t currentRaw = 0;
+  if (vfdReadHoldingRegister(vfdBus::REG_CURRENT_FEEDBACK, currentRaw)) {
+    st.vfdCurrent = currentRaw * vfdBus::CURRENT_SCALE_A_PER_LSB;
+  }
+
+  uint16_t runRaw = 0;
+  if (vfdReadHoldingRegister(vfdBus::REG_RUN_STATUS, runRaw)) {
+    tm.vfdRunFeedback = runRaw != 0;
+  } else {
+    tm.vfdRunFeedback = st.vfdRun;
+  }
+}
+
 bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long now) {
   tm.ts = now;
   tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
   tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
-  tm.houseCurrent = normalizeTelemetryCurrent(payload.houseCurrentCentiA / 100.0f, telemetryCurrent::HOUSE_GAIN);
+  tm.houseCurrent = normalizeTelemetryCurrent(st.vfdCurrent, telemetryCurrent::HOUSE_GAIN);
   tm.housePressure = payload.housePressureCentiBar / 100.0f;
   tm.levels[0] = (payload.levelsMask & 0x01) != 0;
   tm.levels[1] = (payload.levelsMask & 0x02) != 0;
   tm.levels[2] = (payload.levelsMask & 0x04) != 0;
   tm.levels[3] = (payload.levelsMask & 0x08) != 0;
-  tm.vfdRunFeedback = (payload.statusBits & nanoProto::STATUS_VFD_RUN) != 0;
+  tm.vfdRunFeedback = st.vfdRun;
   tm.cmdStale = (payload.statusBits & nanoProto::STATUS_CMD_STALE) != 0;
   tm.linkOk = (payload.statusBits & nanoProto::STATUS_LINK_OK) != 0;
   tm.vfdFreqFeedback = st.vfdFreq;
@@ -1128,7 +1249,6 @@ void readNanoI2c() {
 
   const bool rangesOk =
       abs((int)payload.wellCurrentCentiA) <= 5000 &&
-      abs((int)payload.houseCurrentCentiA) <= 5000 &&
       payload.wellPressureCentiBar >= -100 && payload.wellPressureCentiBar <= 1000 &&
       payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
   if (!rangesOk) {
@@ -1146,8 +1266,6 @@ void readNanoI2c() {
 NanoCommandPacket buildNanoCommandPacket() {
   NanoCommandPacket packet;
   packet.relay = st.wellRelay;
-  packet.vfdRun = st.vfdRun;
-  packet.vfdFreq = st.vfdFreq;
   packet.wellMode = (uint8_t)st.wellMode;
   packet.wellAlarm = st.wellAlarm;
   packet.wellBlocked = st.wellBlocked;
@@ -1163,8 +1281,6 @@ NanoCommandPacket buildNanoCommandPacket() {
 void sendNanoControlPacket(const NanoCommandPacket& packet) {
   NanoCommandPayload payload;
   payload.relay = packet.relay ? 1 : 0;
-  payload.vfdRun = packet.vfdRun ? 1 : 0;
-  payload.vfdFreqDeciHz = clampScaled(packet.vfdFreq, 10.0f);
   payload.wellMode = packet.wellMode;
   payload.wellIntention = packet.wellIntention;
   payload.houseMode = packet.houseMode;
@@ -2080,6 +2196,18 @@ void setup() {
   Serial.println(String("[BOOT] Expected Nano I2C address: 0x") + String(NANO_I2C_ADDRESS, HEX));
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
   Serial.println(String("[BOOT] Wire.begin() done @ ") + String(i2cLinkCfg::BUS_FREQUENCY_HZ) + " Hz");
+  pinMode(vfdBus::RS485_DIR_PIN, OUTPUT);
+  vfdSetRxMode();
+  vfdSerial.begin(vfdBus::UART_BAUD, vfdBus::UART_CONFIG, vfdBus::UART_RX_PIN, vfdBus::UART_TX_PIN);
+  vfdSerial.setTimeout(vfdBus::RESPONSE_TIMEOUT_MS);
+  Serial.println(String("[BOOT] VFD RS485 UART ready: RX=") + String(vfdBus::UART_RX_PIN) + ", TX=" + String(vfdBus::UART_TX_PIN) + ", DIR=" + String(vfdBus::RS485_DIR_PIN));
+  (void)vfdWriteRegister(vfdBus::REG_INIT_MODE, 0x0002);
+  delay(150);
+  (void)vfdWriteRegister(vfdBus::REG_INIT_SOURCE, 0x0005);
+  delay(150);
+  (void)vfdWriteRegister(vfdBus::REG_FREQ_SETPOINT, 0x0000);
+  delay(150);
+  vfdStop();
   const bool probeAck = probeNanoAtStartup(6);
 
   initConfigFromNamespaces();
@@ -2183,6 +2311,7 @@ void loop() {
     feedTaskWatchdog();
     runWellLogic(now);
     runHouseLogic();
+    serviceVfd(now);
   }
 
   feedTaskWatchdog();

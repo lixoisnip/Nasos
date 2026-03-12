@@ -1,7 +1,7 @@
 // =====================================================
 // Arduino Nano I/O bridge for dual-pump project
-// Nano keeps original wiring (sensors/relay/RS485 VFD),
-// while all control logic is moved to ESP32.
+// Nano keeps original wiring for sensors and relay only,
+// while all control logic + VFD RS485 is moved to ESP32.
 // =====================================================
 
 #include <Wire.h>
@@ -24,7 +24,6 @@
 
 // Original project pins (unchanged wiring)
 #define RELAY_WELL        3
-#define PIN_RS485_DE_RE   7
 #define ACS_PIN           A1
 #define PIN_CURRENT       A0
 #define PRESSURE_PIN      A2
@@ -67,16 +66,16 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 constexpr uint8_t NANO_I2C_ADDRESS = i2cLinkCfg::NANO_SLAVE_ADDRESS;
 namespace nanoProto {
 constexpr uint8_t MAGIC = 0xA5;
-constexpr uint8_t VERSION = 2;
+constexpr uint8_t VERSION = 3;
 constexpr uint8_t MSG_COMMAND = 1;
 constexpr uint8_t MSG_TELEMETRY = 2;
 constexpr uint8_t FLAG_WELL_ALARM = 1 << 0;
 constexpr uint8_t FLAG_WELL_BLOCKED = 1 << 1;
 constexpr uint8_t FLAG_HOUSE_ALARM = 1 << 2;
 constexpr uint8_t FLAG_HOUSE_BLOCKED = 1 << 3;
-constexpr uint8_t STATUS_VFD_RUN = 1 << 0;
-constexpr uint8_t STATUS_CMD_STALE = 1 << 1;
-constexpr uint8_t STATUS_LINK_OK = 1 << 2;
+constexpr uint8_t STATUS_CMD_STALE = 1 << 0;
+constexpr uint8_t STATUS_LINK_OK = 1 << 1;
+constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
 constexpr uint8_t COMMAND_FRAME_LEN = 18;   // 4-byte header + 12-byte payload + 2-byte CRC
 constexpr uint8_t TELEMETRY_FRAME_LEN = 16; // 4-byte header + 10-byte payload + 2-byte CRC
 constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
@@ -88,20 +87,19 @@ volatile uint8_t i2cTelemetryFrame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
 
 struct NanoCommandPayload {
   uint8_t relay = 0;
-  uint8_t vfdRun = 0;
-  int16_t vfdFreqDeciHz = 0;
   uint8_t wellMode = 0;
   uint8_t wellIntention = 0;
   uint8_t houseMode = 0;
   uint8_t flags = 0;
   uint16_t levelFilterMs = 2000;
   uint16_t levelThreshRaw = 700;
+  uint8_t reserved[4] = {0, 0, 0, 0};
 } __attribute__((packed));
 
 struct NanoTelemetryPayload {
   int16_t wellCurrentCentiA = 0;
   int16_t wellPressureCentiBar = 0;
-  int16_t houseCurrentCentiA = 0;
+  int16_t analogAuxRaw = 0;
   int16_t housePressureCentiBar = 0;
   uint8_t levelsMask = 0;
   uint8_t statusBits = 0;
@@ -131,8 +129,6 @@ struct NanoState {
 
   // Actuator targets from ESP32
   bool relayWellOn = false;
-  bool vfdRun = false;
-  float vfdFreqHz = 0.0f;
 
   // Runtime
   float currentZeroOffset = 512.0f;
@@ -166,23 +162,6 @@ const float WELL_CURRENT_DRY = 3.3f;
 const float WELL_CURRENT_OVERLOAD = 4.3f;
 const float WELL_PRESSURE_WARNING = 1.2f;
 const float WELL_PRESSURE_BLOCK = 1.5f;
-
-const float HOUSE_CURRENT_DRY = 0.4f;
-const float HOUSE_CURRENT_OVERLOAD = 1.3f;
-const float HOUSE_CURRENT_EMERGENCY = 1.5f;
-
-// House pump current input calibration (VFD analog output -> resistor divider -> MCU ADC).
-// New recommended divider for 0-10V VFD output is 20k(top)/10k(bottom):
-// 10.0V at VFD output -> ~3.33V at ADC node.
-const float ADC_REFERENCE_V = 5.0f;
-const float ADC_MAX_COUNTS = 1023.0f;
-const float VFD_DIVIDER_R_TOP_OHM = 20000.0f;
-const float VFD_DIVIDER_R_BOTTOM_OHM = 10000.0f;
-const float VFD_DIVIDER_GAIN = (VFD_DIVIDER_R_TOP_OHM + VFD_DIVIDER_R_BOTTOM_OHM) / VFD_DIVIDER_R_BOTTOM_OHM;
-// Engineering scaling assumption for protections/UI: 0-10V VFD analog output corresponds to 0-9A.
-const float VFD_OUTPUT_MAX_V = 10.0f;
-const float VFD_OUTPUT_MAX_CURRENT_A = 9.0f;
-const float VFD_ANALOG_V_TO_CURRENT_A = VFD_OUTPUT_MAX_CURRENT_A / VFD_OUTPUT_MAX_V;
 
 bool useEspDisplayStatus(unsigned long now) {
   return ns.statusFromEsp && (now - ns.statusUpdatedAt <= ESP_STATUS_TIMEOUT_MS);
@@ -224,65 +203,6 @@ void feedWatchdog() {
 }
 
 
-void txMode() {
-  digitalWrite(PIN_RS485_DE_RE, HIGH);
-  delayMicroseconds(100);
-}
-
-void rxMode() {
-  delayMicroseconds(100);
-  digitalWrite(PIN_RS485_DE_RE, LOW);
-}
-
-uint16_t calculateCRC(uint8_t *data, uint8_t length) {
-  uint16_t crc = 0xFFFF;
-  for (uint8_t i = 0; i < length; i++) {
-    crc ^= (uint16_t)data[i];
-    for (uint8_t j = 0; j < 8; j++) {
-      crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-    }
-  }
-  return crc;
-}
-
-void writeReg(uint16_t addr, uint16_t val) {
-  feedWatchdog();
-  uint8_t frame[8];
-  frame[0] = 0x08;
-  frame[1] = 0x06;
-  frame[2] = highByte(addr);
-  frame[3] = lowByte(addr);
-  frame[4] = highByte(val);
-  frame[5] = lowByte(val);
-
-  uint16_t crc = calculateCRC(frame, 6);
-  frame[6] = lowByte(crc);
-  frame[7] = highByte(crc);
-
-  txMode();
-  Serial.write(frame, 8);
-  Serial.flush();
-  rxMode();
-  delay(20);
-  feedWatchdog();
-}
-
-void vfdStart() { writeReg(0x9CA7, 0x0001); }
-void vfdStop()  { writeReg(0x9CA7, 0x0000); }
-
-void setFrequency(float hz) {
-  uint16_t freq = (uint16_t)round(max(0.0f, hz) * 100.0f);
-  writeReg(0x9CA6, freq);
-}
-
-void initVFD() {
-  feedWatchdog();
-  writeReg(0x9C41, 0x0002); delay(150); feedWatchdog();
-  writeReg(0x9C40, 0x0005); delay(150); feedWatchdog();
-  writeReg(0x9CA6, 0x0000); delay(150); feedWatchdog();
-  vfdStop();
-}
-
 float readWellCurrent() {
   float sqSum = 0.0f;
   for (uint8_t i = 0; i < WELL_CURRENT_SAMPLES; i++) {
@@ -295,15 +215,8 @@ float readWellCurrent() {
   return amps < 0.10f ? 0.0f : amps;
 }
 
-float readHouseCurrent() {
-  int raw = analogRead(PIN_CURRENT);
-  // Explicit conversion chain for easier maintenance/calibration:
-  // raw ADC counts -> ADC node voltage -> original VFD output voltage -> engineering current.
-  float adcVoltage = (raw * ADC_REFERENCE_V) / ADC_MAX_COUNTS;
-  float vfdOutputVoltage = adcVoltage * VFD_DIVIDER_GAIN;
-  vfdOutputVoltage = constrain(vfdOutputVoltage, 0.0f, VFD_OUTPUT_MAX_V);
-  float amps = vfdOutputVoltage * VFD_ANALOG_V_TO_CURRENT_A;
-  return amps < 0.10f ? 0.0f : amps;
+float readAuxAnalog() {
+  return (float)analogRead(PIN_CURRENT);
 }
 
 float readWellPressureBar() {
@@ -356,7 +269,7 @@ bool readLevelFiltered(uint8_t idx, uint8_t pin, unsigned long now) {
 
 void readInputs(unsigned long now) {
   ns.wellCurrent = readWellCurrent();
-  ns.houseCurrent = readHouseCurrent();
+  ns.houseCurrent = readAuxAnalog();
   ns.wellPressureBar = readWellPressureBar();
   ns.housePressureBar = readHousePressureBar();
 
@@ -370,17 +283,6 @@ void applyOutputs() {
   // relay active LOW in original project
   digitalWrite(RELAY_WELL, ns.relayWellOn ? LOW : HIGH);
 
-  static bool prevRun = false;
-  static float prevFreq = -1;
-  if (ns.vfdRun != prevRun) {
-    ns.vfdRun ? vfdStart() : vfdStop();
-    prevRun = ns.vfdRun;
-  }
-
-  if (abs(ns.vfdFreqHz - prevFreq) >= 0.1f) {
-    setFrequency(ns.vfdFreqHz);
-    prevFreq = ns.vfdFreqHz;
-  }
 }
 
 uint16_t calcCrc16(const uint8_t* data, size_t length) {
@@ -477,8 +379,6 @@ bool applyCommandFrame(const uint8_t* frame, size_t len, uint8_t protocolVersion
   memcpy(&payload, frame + 4, sizeof(payload));
 
   ns.relayWellOn = payload.relay != 0;
-  ns.vfdRun = payload.vfdRun != 0;
-  ns.vfdFreqHz = payload.vfdFreqDeciHz / 10.0f;
   ns.wellMode = payload.wellMode;
   ns.wellIntention = payload.wellIntention;
   ns.houseMode = payload.houseMode;
@@ -558,8 +458,6 @@ void processEspI2c(unsigned long now) {
 
   if (nanoLastCommandAt != 0 && (now - nanoLastCommandAt) > nanoProto::COMMAND_TIMEOUT_MS) {
     ns.relayWellOn = false;
-    ns.vfdRun = false;
-    ns.vfdFreqHz = 0.0f;
   }
 }
 
@@ -570,14 +468,14 @@ void updateTelemetryFrame(unsigned long now) {
   NanoTelemetryPayload payload;
   payload.wellCurrentCentiA = clampScaled(ns.wellCurrent, 100.0f);
   payload.wellPressureCentiBar = clampScaled(ns.wellPressureBar, 100.0f);
-  payload.houseCurrentCentiA = clampScaled(ns.houseCurrent, 100.0f);
+  payload.analogAuxRaw = (int16_t)constrain((int)lroundf(ns.houseCurrent), -32768, 32767);
   payload.housePressureCentiBar = clampScaled(ns.housePressureBar, 100.0f);
   payload.levelsMask = (ns.levels[0] ? 1 : 0) |
                        (ns.levels[1] ? 2 : 0) |
                        (ns.levels[2] ? 4 : 0) |
                        (ns.levels[3] ? 8 : 0);
   payload.statusBits = 0;
-  if (ns.vfdRun) payload.statusBits |= nanoProto::STATUS_VFD_RUN;
+  if (ns.relayWellOn) payload.statusBits |= nanoProto::STATUS_RELAY_WELL_ACTIVE;
   if (nanoLastCommandAt != 0 && (now - nanoLastCommandAt) <= nanoProto::COMMAND_TIMEOUT_MS) {
     payload.statusBits |= nanoProto::STATUS_LINK_OK;
   } else {
@@ -625,7 +523,7 @@ void sendTelemetry(unsigned long now) {
 }
 
 void setup() {
-  Serial.begin(9600);      // RS485 VFD
+  Serial.begin(115200);
   delay(50);
   Serial.println();
   Serial.println(F("[BOOT] Nano firmware startup"));
@@ -643,9 +541,6 @@ void setup() {
 
   pinMode(RELAY_WELL, OUTPUT);
   digitalWrite(RELAY_WELL, HIGH);
-
-  pinMode(PIN_RS485_DE_RE, OUTPUT);
-  digitalWrite(PIN_RS485_DE_RE, LOW);
 
   pinMode(L1, INPUT);
   pinMode(L2, INPUT);
@@ -666,26 +561,6 @@ void setup() {
   if (ns.currentZeroOffset < 400 || ns.currentZeroOffset > 600) ns.currentZeroOffset = 512.0f;
   Serial.print(F("[BOOT] Current zero offset="));
   Serial.println(ns.currentZeroOffset);
-
-  Serial.print(F("[BOOT] House current calibration: ADC="));
-  Serial.print(ADC_REFERENCE_V, 2);
-  Serial.print(F("V/"));
-  Serial.print((int)ADC_MAX_COUNTS);
-  Serial.print(F(", divider="));
-  Serial.print((int)VFD_DIVIDER_R_TOP_OHM);
-  Serial.print(F("/"));
-  Serial.print((int)VFD_DIVIDER_R_BOTTOM_OHM);
-  Serial.print(F(" (gain="));
-  Serial.print(VFD_DIVIDER_GAIN, 2);
-  Serial.print(F("), VFD 0-"));
-  Serial.print(VFD_OUTPUT_MAX_V, 1);
-  Serial.print(F("V => 0-"));
-  Serial.print(VFD_OUTPUT_MAX_CURRENT_A, 1);
-  Serial.println(F("A"));
-
-  Serial.println(F("[BOOT] Initializing VFD over RS485..."));
-  initVFD();
-  Serial.println(F("[BOOT] VFD init sequence complete"));
 
   wdt_enable(WDTO_4S);
   feedWatchdog();

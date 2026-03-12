@@ -13,5 +13,5 @@ constexpr int ESP32_SDA_PIN = 21;
 constexpr int ESP32_SCL_PIN = 22;
 
 constexpr const char* NANO_FW_NAME = "nasos-nano-bridge";
-constexpr const char* NANO_FW_VERSION = "1.2.0";
+constexpr const char* NANO_FW_VERSION = "1.3.0";
 }  // namespace i2cLinkCfg
