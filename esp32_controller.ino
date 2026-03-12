@@ -343,13 +343,17 @@ constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
 }
 
 namespace nanoLink {
-constexpr unsigned long CMD_PERIOD_MS = 80UL;
+constexpr unsigned long CMD_PERIOD_MS = 140UL;
+constexpr unsigned long TELEMETRY_POLL_MS = 140UL;
+constexpr unsigned long TX_RX_GAP_MS = 12UL;
 constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
 constexpr float FREQ_EPS = 0.05f;
 constexpr uint8_t COMMAND_FRAME_LEN = 18;
 constexpr uint8_t TELEMETRY_FRAME_LEN = 16;
 constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
 constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
+constexpr uint8_t RECOVERY_TIMEOUT_THRESHOLD = 4;
+constexpr unsigned long RECOVERY_COOLDOWN_MS = 1200UL;
 }
 
 struct NanoCommandPayload {
@@ -426,6 +430,8 @@ struct LinkHealth {
   unsigned long lastTxErrorLogMs = 0;
   unsigned long lastShortReadLogMs = 0;
   unsigned long lastInvalidFrameLogMs = 0;
+  uint8_t txTimeoutStreak = 0;
+  unsigned long lastWireRecoveryMs = 0;
 } linkHealth;
 
 bool linkAlive = false;
@@ -1184,6 +1190,18 @@ void appendLinkLogThrottled(const String& message, unsigned long& lastLogMs) {
   lastLogMs = now;
 }
 
+void recoverI2cBusIfNeeded(unsigned long now) {
+  if (linkHealth.txTimeoutStreak < nanoLink::RECOVERY_TIMEOUT_THRESHOLD) return;
+  if (linkHealth.lastWireRecoveryMs != 0 && (now - linkHealth.lastWireRecoveryMs) < nanoLink::RECOVERY_COOLDOWN_MS) return;
+
+  appendLinkLogThrottled("Nano I2C recovery: reinitializing Wire after repeated timeouts", linkHealth.lastTxErrorLogMs);
+  Wire.end();
+  delay(2);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
+  linkHealth.lastWireRecoveryMs = now;
+  linkHealth.txTimeoutStreak = 0;
+}
+
 void recordNanoTxResult(uint8_t err, const char* context) {
   static uint8_t startupTxLogs = 0;
 
@@ -1195,11 +1213,17 @@ void recordNanoTxResult(uint8_t err, const char* context) {
   if (err == 0) {
     linkHealth.lastTxErrCode = 0;
     linkHealth.txErrorBurstActive = false;
+    linkHealth.txTimeoutStreak = 0;
     return;
   }
 
   linkHealth.txErrorCount++;
   linkHealth.lastTxErrCode = err;
+  if (err == 5) {
+    if (linkHealth.txTimeoutStreak < 255) linkHealth.txTimeoutStreak++;
+  } else {
+    linkHealth.txTimeoutStreak = 0;
+  }
   if (!linkHealth.txErrorBurstActive) {
     const String msg = String("Nano I2C TX error (") + context + "): code=" + String(err) + " (" + i2cTxErrorToText(err) + ")";
     appendLinkLogThrottled(msg, linkHealth.lastTxErrorLogMs);
@@ -1208,10 +1232,21 @@ void recordNanoTxResult(uint8_t err, const char* context) {
 }
 
 void readNanoI2c() {
+  const unsigned long now = millis();
+  static unsigned long lastTelemetryPollMs = 0;
+  if (now - lastTelemetryPollMs < nanoLink::TELEMETRY_POLL_MS) return;
+  lastTelemetryPollMs = now;
+
   uint8_t frame[nanoLink::TELEMETRY_FRAME_LEN] = {0};
   const int expected = (int)nanoLink::TELEMETRY_FRAME_LEN;
   int received = Wire.requestFrom((int)NANO_I2C_ADDRESS, expected);
-  if (received <= 0) return;
+  if (received <= 0) {
+    recordNanoTxResult(5, "telemetry");
+    return;
+  }
+
+  recordNanoTxResult(0, "telemetry");
+
   if (received != expected) {
     linkHealth.shortReadCount++;
     appendLinkLogThrottled(String("Nano I2C short read: requested=") + String(expected) + ", received=" + String(received), linkHealth.lastShortReadLogMs);
@@ -1265,7 +1300,7 @@ void readNanoI2c() {
     return;
   }
 
-  if (!decodeTelemetryPayload(payload, millis())) {
+  if (!decodeTelemetryPayload(payload, now)) {
     linkHealth.invalidFrameCount++;
     appendLinkLogThrottled("Nano I2C invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
   }
@@ -1318,11 +1353,15 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
 
 void serviceNanoTx(unsigned long now) {
   static unsigned long lastControlTxMs = 0;
+  static unsigned long lastBusActivityMs = 0;
+
+  if (now - lastBusActivityMs < nanoLink::TX_RX_GAP_MS) return;
 
   if (now - lastControlTxMs >= nanoLink::CMD_PERIOD_MS) {
     NanoCommandPacket current = buildNanoCommandPacket();
     sendNanoControlPacket(current);
     lastControlTxMs = now;
+    lastBusActivityMs = now;
   }
 }
 
@@ -2251,10 +2290,15 @@ void loop() {
   static LinkState prevLinkState = LinkState::HEALTHY;
 
   readNanoI2c();
+  recoverI2cBusIfNeeded(now);
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
-  lastTelemetryAgeMs = hasEverReceivedTelemetry ? (now - linkHealth.lastValidPacketMs) : ULONG_MAX;
+  const unsigned long telemetryAgeMs =
+      hasEverReceivedTelemetry
+          ? ((now >= linkHealth.lastValidPacketMs) ? (now - linkHealth.lastValidPacketMs) : 0UL)
+          : 0UL;
+  lastTelemetryAgeMs = hasEverReceivedTelemetry ? telemetryAgeMs : ULONG_MAX;
   const bool telemetryFresh = hasEverReceivedTelemetry && lastTelemetryAgeMs < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
   const bool telemetryStale = !startupGraceActive && (!hasEverReceivedTelemetry || !telemetryFresh);
@@ -2284,11 +2328,11 @@ void loop() {
     if (linkState == LinkState::DEGRADED) {
       appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
       appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but I2C TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
-      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 1);
+      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 1);
     } else if (linkState == LinkState::LOST) {
       appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
       appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent I2C TX failure, pumps stopped");
-      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, lastTelemetryAgeMs, 2);
+      appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 2);
     } else if (prevLinkState == LinkState::LOST || prevLinkState == LinkState::DEGRADED) {
       appendLog(st.logsWell, "Nano link restored: телеметрия восстановлена");
       appendLog(st.logsHouse, "Nano link restored: телеметрия восстановлена");
