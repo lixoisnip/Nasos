@@ -1,26 +1,42 @@
 // =====================================================
 // ESP32 main controller: all pump logic/protections + web UI
-// Works with Arduino Nano I/O bridge over UART2.
+// Nano is now only an I/O expander over I2C.
+// VFD RS-485 / Modbus RTU is handled directly by ESP32.
 // =====================================================
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
 
 // -------- Wi-Fi settings --------
-// 1) STA mode: ESP32 connects to your router.
-// 2) AP mode: ESP32 always raises its own Wi-Fi for direct connection.
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID = "Nasos-ESP32";
-const char* AP_PASS = "12345678";  // min 8 chars for WPA2
+const char* AP_PASS = "12345678";
 
-// -------- UART to Nano --------
-HardwareSerial NanoSerial(2);
-constexpr int NANO_RX_PIN = 16;
-constexpr int NANO_TX_PIN = 17;
-constexpr uint32_t NANO_BAUD = 38400;
+// -------- Nano I2C --------
+constexpr uint8_t NANO_I2C_ADDR = 0x10;
+constexpr uint8_t I2C_SDA_PIN = 21;
+constexpr uint8_t I2C_SCL_PIN = 22;
+constexpr uint32_t I2C_CLOCK = 100000;
+constexpr unsigned long NANO_POLL_MS = 120;
+
+// -------- RS-485 / Modbus (VFD) --------
+constexpr int RS485_TX_PIN = 17;   // UART2 TX -> MAX485 DI
+constexpr int RS485_RX_PIN = 16;   // UART2 RX <- MAX485 RO (with divider)
+constexpr int RS485_DIR_PIN = 4;   // RE+DE tied together
+constexpr uint32_t VFD_BAUD = 9600;
+constexpr uint8_t VFD_SLAVE_ID = 0x08;
+constexpr uint16_t VFD_REG_RUN_CMD = 0x9CA7;
+constexpr uint16_t VFD_REG_FREQ_CMD = 0x9CA6;
+constexpr uint16_t VFD_REG_OUT_FREQ_FB = 0x9CAA;
+constexpr uint16_t VFD_REG_OUT_CURRENT_FB = 0x9CAB;
+constexpr float VFD_FREQ_SCALE = 0.01f;
+constexpr float VFD_CURRENT_SCALE = 0.01f;
+constexpr unsigned long MODBUS_INTERFRAME_MS = 4;
+constexpr unsigned long VFD_POLL_MS = 150;
 
 struct Telemetry {
   unsigned long ts = 0;
@@ -29,13 +45,13 @@ struct Telemetry {
   float houseCurrent = 0;
   float housePressure = 0;
   bool levels[4] = {false, false, false, false};
+  bool wellRelayFeedback = false;
   bool vfdRunFeedback = false;
   float vfdFreqFeedback = 0;
   bool valid = false;
 } tm;
 
 struct Settings {
-  // Well pump
   float wellDryCurrent = 3.3f;
   float wellOverloadCurrent = 4.3f;
   float wellEmergencyCurrent = 6.0f;
@@ -44,7 +60,6 @@ struct Settings {
   float targetMinutes = 5.0f;
   float litersPerMin = 30.0f;
 
-  // House pump
   float setpointBar = 1.0f;
   float houseHystOn = 0.50f;
   float houseHystOff = 1.18f;
@@ -55,22 +70,6 @@ struct Settings {
   float houseEmergencyCurrent = 1.5f;
   unsigned long houseDryDelayMs = 8000UL;
   unsigned long houseOverloadDelayMs = 5000UL;
-
-  // Sensor ranges (for calibration/display settings)
-  float wellPressureMinBar = 0.0f;
-  float wellPressureMaxBar = 12.0f;
-  float housePressureMinBar = 0.0f;
-  float housePressureMaxBar = 12.0f;
-  float wellCurrentMinA = 0.0f;
-  float wellCurrentMaxA = 10.0f;
-  float houseCurrentMinA = 0.0f;
-  float houseCurrentMaxA = 10.0f;
-
-  // Wi-Fi
-  String wifiSsid = WIFI_SSID_DEFAULT;
-  String wifiPass = WIFI_PASS_DEFAULT;
-  String apSsid = AP_SSID_DEFAULT;
-  String apPass = AP_PASS_DEFAULT;
 } cfg;
 
 struct Controller {
@@ -105,6 +104,26 @@ struct Controller {
 } st;
 
 WebServer server(80);
+HardwareSerial VfdSerial(2);
+
+#pragma pack(push, 1)
+struct NanoFrame {
+  uint8_t magic;
+  uint32_t ms;
+  int16_t wellCurrent_cA;
+  int16_t wellPressure_cBar;
+  int16_t housePressure_cBar;
+  uint8_t levelsMask;
+  uint8_t relayState;
+  uint8_t crc;
+};
+#pragma pack(pop)
+
+uint8_t crc8(const uint8_t* data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; ++i) crc ^= data[i];
+  return crc;
+}
 
 void appendLog(String& dst, const String& msg) {
   dst += msg + "\n";
@@ -116,49 +135,120 @@ void pushHistory(float* arr, float value) {
   arr[19] = value;
 }
 
-void parseNanoLine(const String& line) {
-  if (!line.startsWith("TEL,")) return;
-
-  float vals[11] = {0};
-  int idx = 0;
-  int start = 4;
-  while (idx < 11 && start < (int)line.length()) {
-    int comma = line.indexOf(',', start);
-    if (comma < 0) comma = line.length();
-    vals[idx++] = line.substring(start, comma).toFloat();
-    start = comma + 1;
+uint16_t modbusCRC(const uint8_t* data, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; j++) crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : crc >> 1;
   }
-  if (idx < 11) return;
+  return crc;
+}
 
-  tm.ts = (unsigned long)vals[0];
-  tm.wellCurrent = vals[1];
-  tm.wellPressure = vals[2];
-  tm.houseCurrent = vals[3];
-  tm.housePressure = vals[4];
-  tm.levels[0] = vals[5] > 0.5f;
-  tm.levels[1] = vals[6] > 0.5f;
-  tm.levels[2] = vals[7] > 0.5f;
-  tm.levels[3] = vals[8] > 0.5f;
-  tm.vfdRunFeedback = vals[9] > 0.5f;
-  tm.vfdFreqFeedback = vals[10];
+void rs485Tx(bool tx) {
+  digitalWrite(RS485_DIR_PIN, tx ? HIGH : LOW);
+  delayMicroseconds(120);
+}
+
+bool vfdWriteReg(uint16_t reg, uint16_t value) {
+  uint8_t req[8] = {VFD_SLAVE_ID, 0x06, (uint8_t)(reg >> 8), (uint8_t)reg, (uint8_t)(value >> 8), (uint8_t)value, 0, 0};
+  uint16_t crc = modbusCRC(req, 6);
+  req[6] = (uint8_t)crc;
+  req[7] = (uint8_t)(crc >> 8);
+
+  while (VfdSerial.available()) VfdSerial.read();
+  rs485Tx(true);
+  VfdSerial.write(req, sizeof(req));
+  VfdSerial.flush();
+  rs485Tx(false);
+
+  uint8_t resp[8] = {0};
+  size_t got = VfdSerial.readBytes(resp, sizeof(resp));
+  if (got != sizeof(resp)) return false;
+  uint16_t rcrc = (uint16_t)resp[7] << 8 | resp[6];
+  return rcrc == modbusCRC(resp, 6);
+}
+
+bool vfdReadReg(uint16_t reg, uint16_t& out) {
+  uint8_t req[8] = {VFD_SLAVE_ID, 0x03, (uint8_t)(reg >> 8), (uint8_t)reg, 0x00, 0x01, 0, 0};
+  uint16_t crc = modbusCRC(req, 6);
+  req[6] = (uint8_t)crc;
+  req[7] = (uint8_t)(crc >> 8);
+
+  while (VfdSerial.available()) VfdSerial.read();
+  rs485Tx(true);
+  VfdSerial.write(req, sizeof(req));
+  VfdSerial.flush();
+  rs485Tx(false);
+
+  uint8_t resp[7] = {0};
+  size_t got = VfdSerial.readBytes(resp, sizeof(resp));
+  if (got != sizeof(resp) || resp[0] != VFD_SLAVE_ID || resp[1] != 0x03 || resp[2] != 0x02) return false;
+  uint16_t rcrc = (uint16_t)resp[6] << 8 | resp[5];
+  if (rcrc != modbusCRC(resp, 5)) return false;
+  out = (uint16_t)resp[3] << 8 | resp[4];
+  return true;
+}
+
+void pollNano(unsigned long now) {
+  static unsigned long last = 0;
+  if (now - last < NANO_POLL_MS) return;
+  last = now;
+
+  Wire.requestFrom((int)NANO_I2C_ADDR, (int)sizeof(NanoFrame));
+  if (Wire.available() != (int)sizeof(NanoFrame)) return;
+
+  NanoFrame f{};
+  uint8_t* p = reinterpret_cast<uint8_t*>(&f);
+  for (size_t i = 0; i < sizeof(NanoFrame); ++i) p[i] = Wire.read();
+  if (f.magic != 0xA5 || crc8(p, sizeof(NanoFrame) - 1) != f.crc) return;
+
+  tm.ts = f.ms;
+  tm.wellCurrent = f.wellCurrent_cA / 100.0f;
+  tm.wellPressure = f.wellPressure_cBar / 100.0f;
+  tm.housePressure = f.housePressure_cBar / 100.0f;
+  tm.levels[0] = f.levelsMask & 0x01;
+  tm.levels[1] = f.levelsMask & 0x02;
+  tm.levels[2] = f.levelsMask & 0x04;
+  tm.levels[3] = f.levelsMask & 0x08;
+  tm.wellRelayFeedback = f.relayState;
   tm.valid = true;
 }
 
-void readNanoUart() {
-  static String line;
-  while (NanoSerial.available()) {
-    char c = (char)NanoSerial.read();
-    if (c == '\n') {
-      parseNanoLine(line);
-      line = "";
-    } else if (c != '\r') {
-      line += c;
-    }
-  }
+void sendNanoCommand() {
+  Wire.beginTransmission(NANO_I2C_ADDR);
+  Wire.write('C');
+  Wire.write(st.wellRelay ? 1 : 0);
+  Wire.endTransmission();
 }
 
-void sendNanoCommand() {
-  NanoSerial.printf("RELAY=%d;VFD_RUN=%d;VFD_FREQ=%.1f\n", st.wellRelay ? 1 : 0, st.vfdRun ? 1 : 0, st.vfdFreq);
+void pollVfd(unsigned long now) {
+  static unsigned long last = 0;
+  if (now - last < VFD_POLL_MS) return;
+  last = now;
+
+  uint16_t raw = 0;
+  if (vfdReadReg(VFD_REG_OUT_CURRENT_FB, raw)) tm.houseCurrent = raw * VFD_CURRENT_SCALE;
+  delay(MODBUS_INTERFRAME_MS);
+  if (vfdReadReg(VFD_REG_OUT_FREQ_FB, raw)) tm.vfdFreqFeedback = raw * VFD_FREQ_SCALE;
+  tm.vfdRunFeedback = tm.vfdFreqFeedback > 0.5f;
+}
+
+void applyVfdControl() {
+  static bool prevRun = false;
+  static float prevFreq = -999.0f;
+
+  if (st.vfdRun != prevRun) {
+    vfdWriteReg(VFD_REG_RUN_CMD, st.vfdRun ? 1 : 0);
+    delay(MODBUS_INTERFRAME_MS);
+    prevRun = st.vfdRun;
+  }
+
+  if (fabsf(st.vfdFreq - prevFreq) >= 0.1f) {
+    uint16_t cmd = (uint16_t)(constrain(st.vfdFreq, 0.0f, cfg.houseMaxFreq) * 100.0f);
+    vfdWriteReg(VFD_REG_FREQ_CMD, cmd);
+    delay(MODBUS_INTERFRAME_MS);
+    prevFreq = st.vfdFreq;
+  }
 }
 
 void runWellLogic(unsigned long now) {
@@ -170,7 +260,6 @@ void runWellLogic(unsigned long now) {
   bool needByLevels = !tm.levels[3] && (!tm.levels[1] || !tm.levels[2]);
   bool needPump = st.wellForceMode || needByLevels;
 
-  // Force mode bypasses level logic, but pause timer and protections still have priority.
   if (needPump && !st.wellRelay && (now - st.wellPauseStart > (unsigned long)st.pauseMs)) {
     st.wellRelay = true;
     st.wellRunStart = now;
@@ -232,7 +321,6 @@ void runProtections(unsigned long now) {
       st.wellForceMode = false;
       appendLog(st.logsWell, "WELL: emergency overcurrent");
     }
-
     if (tm.wellCurrent >= cfg.wellOverloadCurrent) {
       if (!st.wellOverloadStart) st.wellOverloadStart = now;
       if (now - st.wellOverloadStart > cfg.wellOverloadDelayMs) {
@@ -261,7 +349,6 @@ void runProtections(unsigned long now) {
       st.houseForceMode = false;
       appendLog(st.logsHouse, "HOUSE: emergency overcurrent");
     }
-
     if (tm.houseCurrent >= cfg.houseOverloadCurrent) {
       if (!st.houseOverloadStart) st.houseOverloadStart = now;
       if (now - st.houseOverloadStart > cfg.houseOverloadDelayMs) {
@@ -290,18 +377,13 @@ String buildJsonState() {
   doc["well_pressure"] = tm.wellPressure;
   doc["house_current"] = tm.houseCurrent;
   doc["house_pressure"] = tm.housePressure;
+  doc["vfd_run_feedback"] = tm.vfdRunFeedback;
+  doc["vfd_freq_feedback"] = tm.vfdFreqFeedback;
   doc["last_work_sec"] = st.lastWorkSec;
   doc["pause_ms"] = st.pauseMs;
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
   doc["house_alarm"] = st.houseAlarm;
-  doc["well_force"] = st.wellForceMode;
-  doc["house_force"] = st.houseForceMode;
-  doc["well_blocked"] = st.wellBlocked;
-  doc["house_blocked"] = st.houseBlocked;
-  doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
-  doc["wifi_sta_ip"] = WiFi.localIP().toString();
-  doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
 
   JsonArray lv = doc.createNestedArray("levels");
   for (int i = 0; i < 4; i++) lv.add(tm.levels[i]);
@@ -318,10 +400,6 @@ String buildJsonState() {
   return out;
 }
 
-void notifyClients() {
-  // kept for timing compatibility with old loop flow
-}
-
 void initWeb() {
   if (!LittleFS.begin(true)) return;
 
@@ -335,65 +413,19 @@ void initWeb() {
     file.close();
   });
 
-  server.on("/state", HTTP_GET, []() {
-    server.send(200, "application/json", buildJsonState());
-  });
-
-  server.on("/logs_well", HTTP_GET, []() {
-    server.send(200, "text/plain; charset=utf-8", st.logsWell);
-  });
-
-  server.on("/logs_house", HTTP_GET, []() {
-    server.send(200, "text/plain; charset=utf-8", st.logsHouse);
-  });
+  server.on("/state", HTTP_GET, []() { server.send(200, "application/json", buildJsonState()); });
+  server.on("/logs_well", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsWell); });
+  server.on("/logs_house", HTTP_GET, []() { server.send(200, "text/plain; charset=utf-8", st.logsHouse); });
 
   server.on("/set", HTTP_POST, []() {
     if (server.hasArg("param") && server.hasArg("value")) {
       String p = server.arg("param");
       float v = server.arg("value").toFloat();
-      if (p == "SETPOINT_BAR") st.setpointBar = constrain(v, 0.0f, 2.0f);
-      // CURRENT_DRY kept for compatibility with UI; can be persisted later.
+      if (p == "SETPOINT_BAR") cfg.setpointBar = constrain(v, 0.0f, 2.0f);
       server.send(200, "text/plain", "OK");
       return;
     }
     server.send(400, "text/plain", "Missing param/value");
-  });
-
-  server.on("/clear_logs_well", HTTP_POST, []() {
-    st.logsWell = "";
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/clear_logs_house", HTTP_POST, []() {
-    st.logsHouse = "";
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/export_well", HTTP_GET, []() {
-    String csv = "idx,volume_l,work_s\n";
-    for (int i = 0; i < 20; i++) csv += String(i) + "," + String(st.volumeHistory[i], 2) + "," + String(st.workHistory[i], 0) + "\n";
-    server.send(200, "text/csv", csv);
-  });
-
-  server.on("/export_house", HTTP_GET, []() {
-    String csv = "house_current,house_pressure\n" + String(tm.houseCurrent, 2) + "," + String(tm.housePressure, 2) + "\n";
-    server.send(200, "text/csv", csv);
-  });
-
-  server.onNotFound([]() {
-    String path = server.uri();
-    if (LittleFS.exists(path)) {
-      File file = LittleFS.open(path, "r");
-      String contentType = "text/plain";
-      if (path.endsWith(".css")) contentType = "text/css";
-      else if (path.endsWith(".js")) contentType = "application/javascript";
-      else if (path.endsWith(".html")) contentType = "text/html; charset=utf-8";
-      else if (path.endsWith(".png")) contentType = "image/png";
-      server.streamFile(file, contentType);
-      file.close();
-      return;
-    }
-    server.send(404, "text/plain", "Not found");
   });
 
   server.begin();
@@ -402,28 +434,18 @@ void initWeb() {
 void initWiFi() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
-
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) delay(300);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    appendLog(st.logsWell, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-    appendLog(st.logsHouse, "Wi-Fi STA connected: " + WiFi.localIP().toString());
-  } else {
-    appendLog(st.logsWell, "Wi-Fi STA not connected, AP mode still available");
-    appendLog(st.logsHouse, "Wi-Fi STA not connected, AP mode still available");
-  }
-  appendLog(st.logsWell, "Wi-Fi AP: " + WiFi.softAPIP().toString());
-  appendLog(st.logsHouse, "Wi-Fi AP: " + WiFi.softAPIP().toString());
 }
 
 void setup() {
   Serial.begin(115200);
-  NanoSerial.begin(NANO_BAUD, SERIAL_8N1, NANO_RX_PIN, NANO_TX_PIN);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK);
+
+  pinMode(RS485_DIR_PIN, OUTPUT);
+  digitalWrite(RS485_DIR_PIN, LOW);
+  VfdSerial.begin(VFD_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   initWiFi();
-
   initWeb();
 
   appendLog(st.logsWell, "System start: ESP32 controller online");
@@ -433,17 +455,14 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  readNanoUart();
+  pollNano(now);
+  pollVfd(now);
   runWellLogic(now);
   runHouseLogic();
   runProtections(now);
-  sendNanoCommand();
 
-  static unsigned long lastWs = 0;
-  if (now - lastWs > 1000) {
-    lastWs = now;
-    notifyClients();
-  }
+  sendNanoCommand();
+  applyVfdControl();
 
   server.handleClient();
   delay(20);
