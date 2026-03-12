@@ -376,9 +376,9 @@ namespace vfdBus {
 constexpr int UART_PORT = 2;
 constexpr int UART_BAUD = 9600;
 constexpr uint32_t UART_CONFIG = SERIAL_8N1;
-constexpr int UART_TX_PIN = 17;
-constexpr int UART_RX_PIN = 16;
-constexpr int RS485_DIR_PIN = 4;
+constexpr int RS485_TX_PIN = 17;
+constexpr int RS485_RX_PIN = 16;
+constexpr int RS485_DE_PIN = 27;
 constexpr uint8_t MODBUS_SLAVE_ID = 0x08;
 constexpr unsigned long DIR_SETTLE_US = 120;
 constexpr unsigned long RESPONSE_TIMEOUT_MS = 120;
@@ -1048,12 +1048,20 @@ int16_t clampScaled(float value, float scale) {
 HardwareSerial& vfdSerial = Serial2;
 
 void vfdSetRxMode() {
-  digitalWrite(vfdBus::RS485_DIR_PIN, LOW);
+  digitalWrite(vfdBus::RS485_DE_PIN, LOW);
 }
 
 void vfdSetTxMode() {
-  digitalWrite(vfdBus::RS485_DIR_PIN, HIGH);
+  digitalWrite(vfdBus::RS485_DE_PIN, HIGH);
   delayMicroseconds(vfdBus::DIR_SETTLE_US);
+}
+
+void rs485Receive() {
+  vfdSetRxMode();
+}
+
+void rs485Transmit() {
+  vfdSetTxMode();
 }
 
 bool vfdWriteRegister(uint16_t reg, uint16_t value) {
@@ -1069,10 +1077,10 @@ bool vfdWriteRegister(uint16_t reg, uint16_t value) {
   frame[7] = highByte(crc);
 
   while (vfdSerial.available()) (void)vfdSerial.read();
-  vfdSetTxMode();
+  rs485Transmit();
   vfdSerial.write(frame, sizeof(frame));
   vfdSerial.flush();
-  vfdSetRxMode();
+  rs485Receive();
 
   uint8_t ack[8] = {0};
   size_t got = vfdSerial.readBytes(ack, sizeof(ack));
@@ -1094,10 +1102,10 @@ bool vfdReadHoldingRegister(uint16_t reg, uint16_t& value) {
   req[7] = highByte(crc);
 
   while (vfdSerial.available()) (void)vfdSerial.read();
-  vfdSetTxMode();
+  rs485Transmit();
   vfdSerial.write(req, sizeof(req));
   vfdSerial.flush();
-  vfdSetRxMode();
+  rs485Receive();
 
   uint8_t rsp[7] = {0};
   size_t got = vfdSerial.readBytes(rsp, sizeof(rsp));
@@ -2196,11 +2204,11 @@ void setup() {
   Serial.println(String("[BOOT] Expected Nano I2C address: 0x") + String(NANO_I2C_ADDRESS, HEX));
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, i2cLinkCfg::BUS_FREQUENCY_HZ);
   Serial.println(String("[BOOT] Wire.begin() done @ ") + String(i2cLinkCfg::BUS_FREQUENCY_HZ) + " Hz");
-  pinMode(vfdBus::RS485_DIR_PIN, OUTPUT);
-  vfdSetRxMode();
-  vfdSerial.begin(vfdBus::UART_BAUD, vfdBus::UART_CONFIG, vfdBus::UART_RX_PIN, vfdBus::UART_TX_PIN);
+  pinMode(vfdBus::RS485_DE_PIN, OUTPUT);
+  rs485Receive();
+  vfdSerial.begin(vfdBus::UART_BAUD, vfdBus::UART_CONFIG, vfdBus::RS485_RX_PIN, vfdBus::RS485_TX_PIN);
   vfdSerial.setTimeout(vfdBus::RESPONSE_TIMEOUT_MS);
-  Serial.println(String("[BOOT] VFD RS485 UART ready: RX=") + String(vfdBus::UART_RX_PIN) + ", TX=" + String(vfdBus::UART_TX_PIN) + ", DIR=" + String(vfdBus::RS485_DIR_PIN));
+  Serial.println(String("[BOOT] VFD RS485 UART ready: RX=") + String(vfdBus::RS485_RX_PIN) + ", TX=" + String(vfdBus::RS485_TX_PIN) + ", DE/RE=" + String(vfdBus::RS485_DE_PIN));
   (void)vfdWriteRegister(vfdBus::REG_INIT_MODE, 0x0002);
   delay(150);
   (void)vfdWriteRegister(vfdBus::REG_INIT_SOURCE, 0x0005);

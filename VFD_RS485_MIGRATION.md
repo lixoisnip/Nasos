@@ -21,7 +21,7 @@
 - RX2 `GPIO16` <- `RO` (MAX485) через делитель:
   - `RO -> 10k -> RX`
   - `RX -> 20k -> GND`
-- `RE` + `DE` (вместе) -> `GPIO4`
+- `RE` + `DE` (вместе) -> `GPIO27`
   - `LOW` = receive
   - `HIGH` = transmit
 - Питание MAX485: `5V`
