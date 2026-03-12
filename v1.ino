@@ -180,7 +180,9 @@ const float VFD_DIVIDER_R_TOP_OHM = 20000.0f;
 const float VFD_DIVIDER_R_BOTTOM_OHM = 10000.0f;
 const float VFD_DIVIDER_GAIN = (VFD_DIVIDER_R_TOP_OHM + VFD_DIVIDER_R_BOTTOM_OHM) / VFD_DIVIDER_R_BOTTOM_OHM;
 // Engineering scaling assumption for protections/UI: 0-10V VFD analog output corresponds to 0-9A.
-const float VFD_ANALOG_V_TO_CURRENT_A = 0.9f;
+const float VFD_OUTPUT_MAX_V = 10.0f;
+const float VFD_OUTPUT_MAX_CURRENT_A = 9.0f;
+const float VFD_ANALOG_V_TO_CURRENT_A = VFD_OUTPUT_MAX_CURRENT_A / VFD_OUTPUT_MAX_V;
 
 bool useEspDisplayStatus(unsigned long now) {
   return ns.statusFromEsp && (now - ns.statusUpdatedAt <= ESP_STATUS_TIMEOUT_MS);
@@ -295,8 +297,11 @@ float readWellCurrent() {
 
 float readHouseCurrent() {
   int raw = analogRead(PIN_CURRENT);
+  // Explicit conversion chain for easier maintenance/calibration:
+  // raw ADC counts -> ADC node voltage -> original VFD output voltage -> engineering current.
   float adcVoltage = (raw * ADC_REFERENCE_V) / ADC_MAX_COUNTS;
   float vfdOutputVoltage = adcVoltage * VFD_DIVIDER_GAIN;
+  vfdOutputVoltage = constrain(vfdOutputVoltage, 0.0f, VFD_OUTPUT_MAX_V);
   float amps = vfdOutputVoltage * VFD_ANALOG_V_TO_CURRENT_A;
   return amps < 0.10f ? 0.0f : amps;
 }
@@ -672,8 +677,10 @@ void setup() {
   Serial.print((int)VFD_DIVIDER_R_BOTTOM_OHM);
   Serial.print(F(" (gain="));
   Serial.print(VFD_DIVIDER_GAIN, 2);
-  Serial.print(F("), VFD 0-10V => 0-"));
-  Serial.print(10.0f * VFD_ANALOG_V_TO_CURRENT_A, 1);
+  Serial.print(F("), VFD 0-"));
+  Serial.print(VFD_OUTPUT_MAX_V, 1);
+  Serial.print(F("V => 0-"));
+  Serial.print(VFD_OUTPUT_MAX_CURRENT_A, 1);
   Serial.println(F("A"));
 
   Serial.println(F("[BOOT] Initializing VFD over RS485..."));
