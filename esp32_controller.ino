@@ -26,7 +26,7 @@ constexpr unsigned long NANO_POLL_MS = 120;
 // -------- RS-485 / Modbus (VFD) --------
 constexpr int RS485_TX_PIN = 17;   // UART2 TX -> MAX485 DI
 constexpr int RS485_RX_PIN = 16;   // UART2 RX <- MAX485 RO (with divider)
-constexpr int RS485_DIR_PIN = 4;   // RE+DE tied together
+constexpr int RS485_DE_PIN = 27;   // RE+DE tied together
 constexpr uint32_t VFD_BAUD = 9600;
 constexpr uint8_t VFD_SLAVE_ID = 0x08;
 constexpr uint16_t VFD_REG_RUN_CMD = 0x9CA7;
@@ -37,6 +37,8 @@ constexpr float VFD_FREQ_SCALE = 0.01f;
 constexpr float VFD_CURRENT_SCALE = 0.01f;
 constexpr unsigned long MODBUS_INTERFRAME_MS = 4;
 constexpr unsigned long VFD_POLL_MS = 150;
+constexpr unsigned long STARTUP_NO_CURRENT_DELAY_MS = 2500;
+constexpr float HOUSE_MAX_PRESSURE_TRIP_BAR = 2.2f;
 
 struct Telemetry {
   unsigned long ts = 0;
@@ -84,6 +86,7 @@ struct Controller {
 
   bool wellForceMode = false;
   bool houseForceMode = false;
+  bool emergencyStop = false;
 
   unsigned long wellRunStart = 0;
   unsigned long wellPauseStart = 0;
@@ -91,6 +94,7 @@ struct Controller {
   unsigned long wellOverloadStart = 0;
   unsigned long houseDryStart = 0;
   unsigned long houseOverloadStart = 0;
+  unsigned long houseRunStart = 0;
 
   unsigned long lastWorkSec = 0;
   float pauseMs = 0;
@@ -144,8 +148,13 @@ uint16_t modbusCRC(const uint8_t* data, uint8_t len) {
   return crc;
 }
 
-void rs485Tx(bool tx) {
-  digitalWrite(RS485_DIR_PIN, tx ? HIGH : LOW);
+void rs485Transmit() {
+  digitalWrite(RS485_DE_PIN, HIGH);
+  delayMicroseconds(120);
+}
+
+void rs485Receive() {
+  digitalWrite(RS485_DE_PIN, LOW);
   delayMicroseconds(120);
 }
 
@@ -156,10 +165,10 @@ bool vfdWriteReg(uint16_t reg, uint16_t value) {
   req[7] = (uint8_t)(crc >> 8);
 
   while (VfdSerial.available()) VfdSerial.read();
-  rs485Tx(true);
+  rs485Transmit();
   VfdSerial.write(req, sizeof(req));
   VfdSerial.flush();
-  rs485Tx(false);
+  rs485Receive();
 
   uint8_t resp[8] = {0};
   size_t got = VfdSerial.readBytes(resp, sizeof(resp));
@@ -175,10 +184,10 @@ bool vfdReadReg(uint16_t reg, uint16_t& out) {
   req[7] = (uint8_t)(crc >> 8);
 
   while (VfdSerial.available()) VfdSerial.read();
-  rs485Tx(true);
+  rs485Transmit();
   VfdSerial.write(req, sizeof(req));
   VfdSerial.flush();
-  rs485Tx(false);
+  rs485Receive();
 
   uint8_t resp[7] = {0};
   size_t got = VfdSerial.readBytes(resp, sizeof(resp));
@@ -279,8 +288,10 @@ void runWellLogic(unsigned long now) {
   }
 }
 
-void runHouseLogic() {
-  if (!tm.valid || st.houseBlocked) {
+void runHouseLogic(unsigned long now) {
+  bool prevRun = st.vfdRun;
+
+  if (st.emergencyStop || !tm.valid || st.houseBlocked) {
     st.vfdRun = false;
     st.vfdFreq = cfg.houseMinFreq;
     return;
@@ -307,6 +318,8 @@ void runHouseLogic() {
     }
   }
 
+  if (st.vfdRun && !prevRun) st.houseRunStart = now;
+
   if (st.vfdRun) {
     float error = cfg.setpointBar - tm.housePressure;
     st.vfdFreq = constrain(cfg.houseMinFreq + error * 20.0f, cfg.houseMinFreq, cfg.houseMaxFreq);
@@ -314,6 +327,12 @@ void runHouseLogic() {
 }
 
 void runProtections(unsigned long now) {
+  if (st.emergencyStop) {
+    st.wellRelay = false;
+    st.vfdRun = false;
+    return;
+  }
+
   if (st.wellRelay) {
     if (tm.wellCurrent >= cfg.wellEmergencyCurrent) {
       st.wellBlocked = st.wellAlarm = true;
@@ -368,6 +387,20 @@ void runProtections(unsigned long now) {
         appendLog(st.logsHouse, "HOUSE: dry run");
       }
     } else st.houseDryStart = 0;
+
+    if (now - st.houseRunStart > STARTUP_NO_CURRENT_DELAY_MS && tm.houseCurrent <= 0.05f) {
+      st.houseBlocked = st.houseAlarm = true;
+      st.vfdRun = false;
+      st.houseForceMode = false;
+      appendLog(st.logsHouse, "HOUSE: no current after start");
+    }
+
+    if (tm.housePressure >= HOUSE_MAX_PRESSURE_TRIP_BAR) {
+      st.houseBlocked = st.houseAlarm = true;
+      st.vfdRun = false;
+      st.houseForceMode = false;
+      appendLog(st.logsHouse, "HOUSE: pressure protection trip");
+    }
   }
 }
 
@@ -384,6 +417,7 @@ String buildJsonState() {
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
   doc["house_alarm"] = st.houseAlarm;
+  doc["emergency_stop"] = st.emergencyStop;
 
   JsonArray lv = doc.createNestedArray("levels");
   for (int i = 0; i < 4; i++) lv.add(tm.levels[i]);
@@ -428,6 +462,21 @@ void initWeb() {
     server.send(400, "text/plain", "Missing param/value");
   });
 
+  server.on("/emergency", HTTP_POST, []() {
+    if (!server.hasArg("value")) {
+      server.send(400, "text/plain", "Missing value");
+      return;
+    }
+    st.emergencyStop = server.arg("value").toInt() == 1;
+    if (st.emergencyStop) {
+      st.wellRelay = false;
+      st.vfdRun = false;
+      appendLog(st.logsWell, "WELL: emergency stop");
+      appendLog(st.logsHouse, "HOUSE: emergency stop");
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
   server.begin();
 }
 
@@ -441,8 +490,8 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK);
 
-  pinMode(RS485_DIR_PIN, OUTPUT);
-  digitalWrite(RS485_DIR_PIN, LOW);
+  pinMode(RS485_DE_PIN, OUTPUT);
+  rs485Receive();
   VfdSerial.begin(VFD_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   initWiFi();
@@ -458,7 +507,7 @@ void loop() {
   pollNano(now);
   pollVfd(now);
   runWellLogic(now);
-  runHouseLogic();
+  runHouseLogic(now);
   runProtections(now);
 
   sendNanoCommand();
