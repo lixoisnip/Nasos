@@ -84,6 +84,7 @@ constexpr unsigned long COMMAND_TIMEOUT_MS = 2000UL;
 volatile bool i2cCommandReady = false;
 volatile uint8_t i2cCommandFrame[nanoProto::COMMAND_FRAME_LEN] = {0};
 volatile uint8_t i2cTelemetryFrame[nanoProto::TELEMETRY_FRAME_LEN] = {0};
+volatile uint8_t i2cCommandLen = 0;
 
 struct NanoCommandPayload {
   uint8_t relay = 0;
@@ -402,56 +403,50 @@ void onI2cReceive(int count) {
   while (Wire.available() && idx < sizeof(raw)) raw[idx++] = (uint8_t)Wire.read();
   while (Wire.available()) { (void)Wire.read(); idx++; }
 
-  if (idx < nanoProto::COMMAND_FRAME_LEN) {
-    nanoShortFrameCount++;
-    return;
-  }
-
-  const uint8_t protocolVersion = raw[1];
-  if (raw[0] != nanoProto::MAGIC || protocolVersion != nanoProto::VERSION || raw[2] != nanoProto::MSG_COMMAND) {
-    nanoBadHeaderCount++;
-    return;
-  }
-
-  const size_t expectedLen = nanoProto::COMMAND_FRAME_LEN;
-  if (idx != expectedLen) {
-    nanoShortFrameCount++;
-    return;
-  }
-
-  uint16_t rxCrc = readU16LE(raw + expectedLen - 2);
-  uint16_t calc = calcCrc16(raw, expectedLen - 2);
-  if (rxCrc != calc) {
-    nanoBadCrcCount++;
-    return;
-  }
-
-  if (nanoCommandSeqValid && (uint8_t)(nanoLastCommandSeq + 1) != raw[3]) nanoCommandSeqGapCount++;
-  nanoLastCommandSeq = raw[3];
-  nanoCommandSeqValid = true;
-
-  noInterrupts();
-  memset((void*)i2cCommandFrame, 0, nanoProto::COMMAND_FRAME_LEN);
-  memcpy((void*)i2cCommandFrame, raw, expectedLen);
+  if (idx > nanoProto::COMMAND_FRAME_LEN) idx = nanoProto::COMMAND_FRAME_LEN;
+  memcpy((void*)i2cCommandFrame, raw, idx);
+  i2cCommandLen = idx;
   i2cCommandReady = true;
-  interrupts();
 }
 
 void onI2cRequest() {
-  noInterrupts();
   Wire.write((const uint8_t*)i2cTelemetryFrame, nanoProto::TELEMETRY_FRAME_LEN);
-  interrupts();
 }
 
 void processEspI2c(unsigned long now) {
   if (i2cCommandReady) {
     uint8_t local[nanoProto::COMMAND_FRAME_LEN] = {0};
+    uint8_t localLen = 0;
     noInterrupts();
     memcpy(local, (const void*)i2cCommandFrame, nanoProto::COMMAND_FRAME_LEN);
+    localLen = i2cCommandLen;
     i2cCommandReady = false;
     interrupts();
 
-    if (!applyCommandFrame(local, nanoProto::COMMAND_FRAME_LEN, local[1], now)) {
+    if (localLen < nanoProto::COMMAND_FRAME_LEN) {
+      nanoShortFrameCount++;
+      return;
+    }
+
+    const uint8_t protocolVersion = local[1];
+    if (local[0] != nanoProto::MAGIC || protocolVersion != nanoProto::VERSION || local[2] != nanoProto::MSG_COMMAND) {
+      nanoBadHeaderCount++;
+      return;
+    }
+
+    const size_t expectedLen = nanoProto::COMMAND_FRAME_LEN;
+    const uint16_t rxCrc = readU16LE(local + expectedLen - 2);
+    const uint16_t calc = calcCrc16(local, expectedLen - 2);
+    if (rxCrc != calc) {
+      nanoBadCrcCount++;
+      return;
+    }
+
+    if (nanoCommandSeqValid && (uint8_t)(nanoLastCommandSeq + 1) != local[3]) nanoCommandSeqGapCount++;
+    nanoLastCommandSeq = local[3];
+    nanoCommandSeqValid = true;
+
+    if (!applyCommandFrame(local, expectedLen, protocolVersion, now)) {
       nanoParseRejectCount++;
     }
   }
