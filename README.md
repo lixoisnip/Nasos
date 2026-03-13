@@ -1,104 +1,92 @@
-# Nasos: Arduino Nano + ESP32
+# Nasos: ESP32 main controller + Arduino Nano I/O board
 
-## Важно: какая прошивка для какой архитектуры
+## Firmware layout
 
-- **`Osnova.ino`** — историческая монолитная версия (референс).
-- Для split-архитектуры использовать:
-  - **Arduino Nano: `v1.ino`**
-  - **ESP32: `esp32_controller.ino`**
+- **ESP32 main firmware:** `esp32_controller.ino`
+- **Arduino Nano I/O firmware:** `v1.ino`
+- `Osnova.ino` remains historical reference only.
 
-## Роли контроллеров
+## Final architecture
 
-1. **`v1.ino` (Arduino Nano, I/O bridge)**
-   - уровни L1-L4;
-   - аналоговые входы (токи/давления);
-   - релейный выход скважинного насоса;
-   - локальная фильтрация датчиков;
-   - ответ телеметрией на команды ESP32 по UART.
+- **ESP32** is the main controller:
+  - full pump logic/protections,
+  - web UI/API/settings/logging,
+  - display handling,
+  - RS-485/Modbus with VFD,
+  - command/telemetry master for Nano.
+- **Arduino Nano** is only a low-level I/O executor:
+  - reads levels and analog channels,
+  - controls relay outputs,
+  - applies simple filtering,
+  - executes commands from ESP32,
+  - replies with telemetry frames over UART.
 
-2. **`esp32_controller.ino` (ESP32, master-логика + VFD Modbus RTU)**
-   - основная логика и защиты;
-   - web UI / API / настройки / логи;
-   - связь с Nano по UART (Serial2);
-   - RS-485 / Modbus RTU с VFD.
+## Final pinout and wiring
 
-3. **`data/index.html`**
-   - веб-панель мониторинга и настройки.
+### ESP32
 
-## Подключение Nano ↔ ESP32 (UART, вместо I2C)
+- Nano UART RX: **GPIO16**
+- Nano UART TX: **GPIO17**
+- MAX485 TX/DI: **GPIO25**
+- MAX485 RX/RO: **GPIO26**
+- MAX485 DE/RE: **GPIO27**
+- TFT_CS: **GPIO5**
+- TFT_DC: **GPIO2**
+- TFT_RST: **GPIO4**
 
-Контроллерная связь Nano↔ESP32 переведена с I2C на UART.
+### Nano
 
-### ESP32 (Serial2)
-- `ESP32 GPIO16` = `RX2` (прием от Nano)
-- `ESP32 GPIO17` = `TX2` (передача в Nano)
+- UART TX to ESP32: **D10**
+- UART RX from ESP32: **D11**
 
-### Arduino Nano (SoftwareSerial)
-- `Nano D10` = `TX` (в сторону ESP32 RX2)
-- `Nano D11` = `RX` (от ESP32 TX2)
-- USB `Serial` можно оставить для отладки.
+### Electrical requirements
 
-### Согласование уровней (обязательно)
+- **Nano TX (5V) -> ESP32 RX (3.3V) requires resistor divider:**
+  - Nano TX -> `10k` -> ESP32 RX node
+  - ESP32 RX node -> `20k` -> GND
+- **MAX485 RO -> ESP32 RX also requires divider `10k/20k` if RO is 5V logic:**
+  - MAX485 RO -> `10k` -> ESP32 RX node
+  - ESP32 RX node -> `20k` -> GND
+- ESP32 TX -> Nano RX can be direct.
+- ESP32 TX -> MAX485 DI can be direct.
+- MAX485 `DE` and `RE` are tied together and controlled by ESP32 GPIO27.
+- **Common GND between ESP32, Nano, and MAX485 is mandatory.**
 
-`Nano TX (5V) -> ESP32 RX (3.3V)` через делитель:
+## Controller communication (Nano <-> ESP32)
 
-- `Nano TX --10k--+-- ESP32 RX`
-- `               |`
-- `              20k`
-- `               |`
-- `              GND`
+- I2C controller-to-controller link is removed.
+- UART binary framing is used (conservative baud: **38400**).
+- Request-response flow:
+  - ESP32 sends command frame,
+  - Nano validates/applies it,
+  - Nano replies with telemetry frame.
 
-`ESP32 TX -> Nano RX` можно подключать напрямую.
+Frame structure:
+1. magic bytes,
+2. protocol version,
+3. message type,
+4. sequence number,
+5. payload length,
+6. payload,
+7. CRC16.
 
-### Общая земля
-- `GND Nano` ↔ `GND ESP32` (**обязательно**)
+## Scope split
 
-## Параметры UART link
+- Nano no longer handles display logic.
+- Nano no longer handles RS-485/Modbus logic.
+- RS-485/Modbus is handled only by ESP32.
 
-- Скорость: **38400 baud**
-- Кадры: бинарные, с заголовком и CRC16
-- Модель обмена: request-response
-  - ESP32 отправляет командный кадр;
-  - Nano валидирует команду и применяет выходы;
-  - Nano отправляет кадр телеметрии в ответ.
+## Fail-safe behavior
 
-## Протокол Nano↔ESP32
+- ESP32 enforces safe-stop if Nano telemetry is stale/lost.
+- Nano forces safe output state when valid ESP32 commands time out.
 
-Используется короткий бинарный протокол с полями:
-- magic bytes,
-- protocol version,
-- message type,
-- sequence,
-- payload length,
-- payload,
-- CRC16.
+## ESP32 API
 
-Смысл инженерных значений и защит сохранен как в предыдущей версии.
-
-## Fail-safe
-
-- На ESP32: при отсутствии свежей валидной телеметрии link считается потерянным, насосы переводятся в безопасный стоп.
-- На Nano: при просрочке валидных команд от ESP32 релейный выход снимается (safe output).
-
-## RS-485 / Modbus
-
-RS-485/Modbus для VFD остается на стороне ESP32.
-Nano не содержит RS-485/Modbus логики VFD.
-
-## API ESP32
-
-- `GET /` — веб-интерфейс
-- `GET /state` — текущее состояние
-- `GET /settings` — текущие настройки
-- `POST /set?param=...&value=...` — изменить параметр
-- `POST /action?pump=well|house&cmd=...` — команды (`reset_alarm`, `force_on`, `force_off`)
+- `GET /` — web UI
+- `GET /state` — current state
+- `GET /settings` — active settings
+- `POST /set?param=...&value=...` — change setting
+- `POST /action?pump=well|house&cmd=...` — control actions
 - `GET /logs_well`, `GET /logs_house`
 - `POST /clear_logs_well`, `POST /clear_logs_house`
-
-## Wi‑Fi
-
-ESP32 работает в режиме **AP + STA**:
-- AP: `Nasos-ESP32` / `12345678`
-- STA: `wifi_ssid` / `wifi_pass` в настройках
-
-Если роутер недоступен, интерфейс доступен через AP ESP32 `192.168.4.1`.
