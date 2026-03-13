@@ -9,18 +9,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Set to 1 to enable TFT diagnostics on Nano.
-// Default is 0 to keep firmware size below ATmega328P limit.
-#ifndef NANO_USE_TFT
-#define NANO_USE_TFT 0
-#endif
-
-#if NANO_USE_TFT
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
-#include <SPI.h>
-#endif
-
 // Original project pins (unchanged wiring)
 #define RELAY_WELL        3
 #define ACS_PIN           A1
@@ -32,23 +20,8 @@
 #define L3                A6
 #define L4                A7
 
-// TFT pins (same as Osnova.ino)
-#define TFT_CS           10
-#define TFT_DC            9
-#define TFT_RST           8
-
-#if NANO_USE_TFT
-Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
-#endif
-
-#if NANO_USE_TFT
-#define BLACK   ST77XX_BLACK
-#define WHITE   ST77XX_WHITE
-#define GREEN   ST77XX_GREEN
-#define RED     ST77XX_RED
-#define YELLOW  ST77XX_YELLOW
-#define GRAY    0x7BEF
-#endif
+// Nano display logic is intentionally removed.
+// Display belongs to ESP32 only.
 
 #define Z1 40
 #define Z2 60
