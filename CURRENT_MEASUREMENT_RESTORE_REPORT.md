@@ -12,23 +12,20 @@ House pump current input is restored to Nano analog telemetry:
 ## Conversion formula on ESP32
 ESP32 now performs explicit conversion in `convertNanoAnalogToCurrent(uint16_t raw)`:
 1. `adc_voltage = raw * NANO_ADC_VREF / NANO_ADC_MAX`
-2. `source_voltage = adc_voltage * CURRENT_SENSOR_DIVIDER_RATIO`
-3. `current = source_voltage * CURRENT_SENSOR_MAX_CURRENT / CURRENT_SENSOR_MAX_VOLTAGE`
-4. `current = current * CURRENT_CALIBRATION_GAIN + CURRENT_CALIBRATION_OFFSET`
-5. Clamp to sane range and apply near-zero suppression.
+2. `current = adc_voltage * CURRENT_PER_ADC_VOLT`
+3. `current = current * CURRENT_CALIBRATION_GAIN + CURRENT_CALIBRATION_OFFSET`
+4. Clamp to sane range and apply near-zero suppression.
 
-## Divider assumptions and calibration constants
+## Conversion constants and calibration
 Configurable constants are centralized in `houseCurrentSense` namespace:
 - `NANO_ADC_MAX`
 - `NANO_ADC_VREF`
-- `CURRENT_SENSOR_DIVIDER_RATIO`
-- `CURRENT_SENSOR_MAX_VOLTAGE`
-- `CURRENT_SENSOR_MAX_CURRENT`
+- `CURRENT_PER_ADC_VOLT` (set to `2.0`, matching legacy `Osnova.ino`: `current = voltage * 2.0`)
 - `CURRENT_CALIBRATION_GAIN`
 - `CURRENT_CALIBRATION_OFFSET`
 - `NEAR_ZERO_CLAMP_A`
 
-This keeps divider tuning explicit and avoids hidden scaling assumptions.
+This keeps scaling explicit and avoids hidden conversion assumptions.
 
 ## Filtering strategy
 Filtering is applied in two stages:

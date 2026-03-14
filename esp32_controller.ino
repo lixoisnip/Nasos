@@ -297,9 +297,7 @@ constexpr float ZERO_CUTOFF_A = 0.10f;
 namespace houseCurrentSense {
 constexpr float NANO_ADC_MAX = 1023.0f;
 constexpr float NANO_ADC_VREF = 5.0f;
-constexpr float CURRENT_SENSOR_DIVIDER_RATIO = 2.0f;      // 0..10V source scaled to 0..5V on Nano ADC
-constexpr float CURRENT_SENSOR_MAX_VOLTAGE = 10.0f;       // VFD analog output full-scale voltage
-constexpr float CURRENT_SENSOR_MAX_CURRENT = 2.0f;        // configured VFD current at full-scale output voltage
+constexpr float CURRENT_PER_ADC_VOLT = 2.0f;           // legacy Osnova mapping: current(A) = adcVoltage(V) * 2.0
 constexpr float CURRENT_CALIBRATION_GAIN = 1.0f;
 constexpr float CURRENT_CALIBRATION_OFFSET = 0.0f;
 constexpr float NEAR_ZERO_CLAMP_A = 0.08f;
@@ -317,8 +315,7 @@ float normalizeTelemetryCurrent(float amps, float gain) {
 float convertNanoAnalogToCurrent(uint16_t raw) {
   const float boundedRaw = constrain((float)raw, 0.0f, houseCurrentSense::NANO_ADC_MAX);
   const float adcVoltage = boundedRaw * houseCurrentSense::NANO_ADC_VREF / houseCurrentSense::NANO_ADC_MAX;
-  const float sourceVoltage = adcVoltage * houseCurrentSense::CURRENT_SENSOR_DIVIDER_RATIO;
-  float current = sourceVoltage * houseCurrentSense::CURRENT_SENSOR_MAX_CURRENT / houseCurrentSense::CURRENT_SENSOR_MAX_VOLTAGE;
+  float current = adcVoltage * houseCurrentSense::CURRENT_PER_ADC_VOLT;
   current = current * houseCurrentSense::CURRENT_CALIBRATION_GAIN + houseCurrentSense::CURRENT_CALIBRATION_OFFSET;
   if (current < houseCurrentSense::NEAR_ZERO_CLAMP_A) current = 0.0f;
   return constrain(current, 0.0f, houseCurrentSense::MAX_SANE_CURRENT_A);
