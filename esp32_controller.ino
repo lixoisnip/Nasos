@@ -291,14 +291,37 @@ constexpr int NANO_UART_BAUD = 38400;
 
 namespace telemetryCurrent {
 constexpr float WELL_GAIN = 1.0f;
-constexpr float HOUSE_GAIN = 1.0f;
 constexpr float ZERO_CUTOFF_A = 0.10f;
+}
+
+namespace houseCurrentSense {
+constexpr float NANO_ADC_MAX = 1023.0f;
+constexpr float NANO_ADC_VREF = 5.0f;
+constexpr float CURRENT_SENSOR_DIVIDER_RATIO = 2.0f;      // 0..10V source scaled to 0..5V on Nano ADC
+constexpr float CURRENT_SENSOR_MAX_VOLTAGE = 10.0f;       // VFD analog output full-scale voltage
+constexpr float CURRENT_SENSOR_MAX_CURRENT = 2.0f;        // configured VFD current at full-scale output voltage
+constexpr float CURRENT_CALIBRATION_GAIN = 1.0f;
+constexpr float CURRENT_CALIBRATION_OFFSET = 0.0f;
+constexpr float NEAR_ZERO_CLAMP_A = 0.08f;
+constexpr float PROTECTION_FILTER_ALPHA = 0.45f;
+constexpr float DISPLAY_FILTER_ALPHA = 0.20f;
+constexpr float MAX_SANE_CURRENT_A = 20.0f;
 }
 
 float normalizeTelemetryCurrent(float amps, float gain) {
   float normalized = amps * gain;
   if (normalized < telemetryCurrent::ZERO_CUTOFF_A) return 0.0f;
   return normalized;
+}
+
+float convertNanoAnalogToCurrent(uint16_t raw) {
+  const float boundedRaw = constrain((float)raw, 0.0f, houseCurrentSense::NANO_ADC_MAX);
+  const float adcVoltage = boundedRaw * houseCurrentSense::NANO_ADC_VREF / houseCurrentSense::NANO_ADC_MAX;
+  const float sourceVoltage = adcVoltage * houseCurrentSense::CURRENT_SENSOR_DIVIDER_RATIO;
+  float current = sourceVoltage * houseCurrentSense::CURRENT_SENSOR_MAX_CURRENT / houseCurrentSense::CURRENT_SENSOR_MAX_VOLTAGE;
+  current = current * houseCurrentSense::CURRENT_CALIBRATION_GAIN + houseCurrentSense::CURRENT_CALIBRATION_OFFSET;
+  if (current < houseCurrentSense::NEAR_ZERO_CLAMP_A) current = 0.0f;
+  return constrain(current, 0.0f, houseCurrentSense::MAX_SANE_CURRENT_A);
 }
 
 namespace nanoProto {
@@ -366,9 +389,7 @@ constexpr uint16_t REG_COMMAND = 0x9CA7;
 constexpr uint16_t REG_FREQ_SETPOINT = 0x9CA6;
 constexpr uint16_t REG_INIT_MODE = 0x9C41;
 constexpr uint16_t REG_INIT_SOURCE = 0x9C40;
-constexpr uint16_t REG_CURRENT_FEEDBACK = 0x3004;
 constexpr uint16_t REG_RUN_STATUS = 0x3003;
-constexpr float CURRENT_SCALE_A_PER_LSB = 0.01f;
 constexpr float FREQ_SCALE_HZ_PER_LSB = 0.01f;
 }
 
@@ -377,6 +398,8 @@ struct Telemetry {
   float wellCurrent = 0;
   float wellPressure = 0;
   float houseCurrent = 0;
+  float houseCurrentDisplay = 0;
+  float houseCurrentProtection = 0;
   float housePressure = 0;
   bool levels[4] = {false, false, false, false};
   bool vfdRunFeedback = false;
@@ -425,7 +448,6 @@ struct Controller {
   bool wellRelay = false;
   bool vfdRun = false;
   float vfdFreq = 28.0f;
-  float vfdCurrent = 0.0f;
 
   bool wellBlocked = false;
   bool wellAlarm = false;
@@ -565,7 +587,7 @@ void updateEspDisplay() {
   drawDisplayLine(90, String("P1: ") + String(tm.wellPressure, 2) + "b", ST77XX_WHITE);
 
   drawDisplayLine(125, String("House: ") + houseModeLabel(st.houseMode) + " " + manualModeLabel(st.houseManualMode), ST77XX_WHITE);
-  drawDisplayLine(150, String("I2: ") + String(tm.houseCurrent, 1) + "A", ST77XX_WHITE);
+  drawDisplayLine(150, String("I2: ") + String(tm.houseCurrentDisplay, 1) + "A", ST77XX_WHITE);
   drawDisplayLine(175, String("P2: ") + String(tm.housePressure, 2) + "b", ST77XX_WHITE);
   drawDisplayLine(200, String("VFD: ") + (st.vfdRun ? "ON " : "OFF ") + String(st.vfdFreq, 1) + "Hz", ST77XX_WHITE);
 
@@ -1129,11 +1151,6 @@ void serviceVfd(unsigned long now) {
   if (now - lastPollMs < vfdBus::POLL_PERIOD_MS) return;
   lastPollMs = now;
 
-  uint16_t currentRaw = 0;
-  if (vfdReadHoldingRegister(vfdBus::REG_CURRENT_FEEDBACK, currentRaw)) {
-    st.vfdCurrent = currentRaw * vfdBus::CURRENT_SCALE_A_PER_LSB;
-  }
-
   uint16_t runRaw = 0;
   if (vfdReadHoldingRegister(vfdBus::REG_RUN_STATUS, runRaw)) {
     tm.vfdRunFeedback = runRaw != 0;
@@ -1146,7 +1163,12 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   tm.ts = now;
   tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
   tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
-  tm.houseCurrent = normalizeTelemetryCurrent(st.vfdCurrent, telemetryCurrent::HOUSE_GAIN);
+  const float houseCurrentRaw = convertNanoAnalogToCurrent((uint16_t)max(0, (int)payload.analogAuxRaw));
+  tm.houseCurrentProtection += houseCurrentSense::PROTECTION_FILTER_ALPHA * (houseCurrentRaw - tm.houseCurrentProtection);
+  tm.houseCurrentDisplay += houseCurrentSense::DISPLAY_FILTER_ALPHA * (houseCurrentRaw - tm.houseCurrentDisplay);
+  if (tm.houseCurrentProtection < houseCurrentSense::NEAR_ZERO_CLAMP_A) tm.houseCurrentProtection = 0.0f;
+  if (tm.houseCurrentDisplay < houseCurrentSense::NEAR_ZERO_CLAMP_A) tm.houseCurrentDisplay = 0.0f;
+  tm.houseCurrent = tm.houseCurrentProtection;
   tm.housePressure = payload.housePressureCentiBar / 100.0f;
   tm.levels[0] = (payload.levelsMask & 0x01) != 0;
   tm.levels[1] = (payload.levelsMask & 0x02) != 0;
@@ -1230,6 +1252,7 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
 
   const bool rangesOk =
       abs((int)payload.wellCurrentCentiA) <= 5000 &&
+      payload.analogAuxRaw >= 0 && payload.analogAuxRaw <= 1023 &&
       payload.wellPressureCentiBar >= -100 && payload.wellPressureCentiBar <= 1000 &&
       payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
   if (!rangesOk) {
@@ -1831,7 +1854,9 @@ String buildJsonState() {
   StaticJsonDocument<3328> doc;
   doc["well_current"] = tm.wellCurrent;
   doc["well_pressure"] = tm.wellPressure;
-  doc["house_current"] = tm.houseCurrent;
+  doc["house_current"] = tm.houseCurrentDisplay;
+  doc["house_current_display"] = tm.houseCurrentDisplay;
+  doc["house_current_protection"] = tm.houseCurrentProtection;
   doc["house_pressure"] = tm.housePressure;
   doc["last_work_sec"] = st.lastWorkSec;
   doc["pause_ms"] = st.pauseMs;
@@ -2117,7 +2142,7 @@ void initWeb() {
   });
 
   server.on("/export_house", HTTP_GET, []() {
-    String csv = "house_current,house_pressure\n" + String(tm.houseCurrent, 2) + "," + String(tm.housePressure, 2) + "\n";
+    String csv = "house_current,house_pressure\n" + String(tm.houseCurrentDisplay, 2) + "," + String(tm.housePressure, 2) + "\n";
     server.send(200, "text/csv", csv);
   });
 
