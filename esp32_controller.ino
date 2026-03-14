@@ -1711,9 +1711,10 @@ void runProtections(unsigned long now) {
     if (tm.wellCurrent < cfg.well.dryCurrent) {
       if (!st.wellDryStart) st.wellDryStart = now;
       if (now - st.wellDryStart > cfg.well.dryDelayMs) {
-        st.wellBlocked = st.wellAlarm = true;
+        // Основа: сухой ход после успешного RUN — нормальная остановка с паузой, без аварийной блокировки.
         st.wellManualMode = ManualMode::AUTO;
-        stopWellPump(now, "Скважина: сухой ход — ток ниже порога", PumpIntention::PUMPING_TO_L4, true);
+        st.wellAlarm = false;
+        stopWellPump(now, "Скважина: сухой ход в RUN — переход в WAIT и повтор позже", PumpIntention::PUMPING_TO_L4, true);
       }
     } else st.wellDryStart = 0;
   }
@@ -2306,20 +2307,25 @@ void loop() {
 
   if (linkState != LinkState::HEALTHY) {
     tm.valid = false;
-    st.wellRelay = false;
     st.vfdRun = false;
-    st.wellMode = WellMode::FAIL;
     st.houseMode = HouseMode::STOPPED;
+
+    if (st.wellRelay) {
+      stopWellPump(now, "Скважина: остановка — потеря связи с Nano (fail-safe)", st.intention, false);
+    } else if (!st.wellBlocked && !st.pressureBlock && st.wellMode != WellMode::STARTING) {
+      st.wellMode = WellMode::WAIT;
+      resetWellRuntimeTimers();
+    }
   }
 
   if (linkState != prevLinkState) {
     if (linkState == LinkState::DEGRADED) {
-      appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
-      appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), pumps stopped as fail-safe");
+      appendLog(st.logsWell, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), outputs stopped as fail-safe");
+      appendLog(st.logsHouse, String("Nano link degraded: telemetry is fresh, but UART TX errors detected (last=") + String(linkHealth.lastTxErrCode) + "), outputs stopped as fail-safe");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 1);
     } else if (linkState == LinkState::LOST) {
-      appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent UART TX failure, pumps stopped");
-      appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, pumps stopped" : "Nano link lost: persistent UART TX failure, pumps stopped");
+      appendLog(st.logsWell, telemetryStale ? "Nano link lost: telemetry stale/missing, outputs stopped" : "Nano link lost: persistent UART TX failure, outputs stopped");
+      appendLog(st.logsHouse, telemetryStale ? "Nano link lost: telemetry stale/missing, outputs stopped" : "Nano link lost: persistent UART TX failure, outputs stopped");
       appendEventLog(eventLog::SRC_LINK, eventCode::LINK_LOST, telemetryAgeMs, 2);
     } else if (prevLinkState == LinkState::LOST || prevLinkState == LinkState::DEGRADED) {
       appendLog(st.logsWell, "Nano link restored: телеметрия восстановлена");
