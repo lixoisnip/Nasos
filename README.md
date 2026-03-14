@@ -83,12 +83,11 @@ House pump current is measured through the **Nano analog path** (restored archit
 
 1. VFD analog output (0–10V, proportional to motor current) is wired to Nano `PIN_CURRENT` (`A0`) through a divider.
 2. Nano samples `A0` and sends averaged raw ADC value in telemetry field `analogAuxRaw`.
-3. ESP32 converts `analogAuxRaw` to amperes with explicit constants in `houseCurrentSense` and `convertNanoAnalogToCurrent(...)`.
+3. ESP32 converts `analogAuxRaw` to amperes using the legacy `Osnova.ino` mapping in `houseCurrentSense` and `convertNanoAnalogToCurrent(...)`.
 
 Conversion chain:
 - `adc_voltage = raw * NANO_ADC_VREF / NANO_ADC_MAX`
-- `source_voltage = adc_voltage * CURRENT_SENSOR_DIVIDER_RATIO`
-- `current = source_voltage * CURRENT_SENSOR_MAX_CURRENT / CURRENT_SENSOR_MAX_VOLTAGE`
+- `current = adc_voltage * CURRENT_PER_ADC_VOLT`
 - `current = current * CURRENT_CALIBRATION_GAIN + CURRENT_CALIBRATION_OFFSET`
 
 Filtering and quality improvements:
