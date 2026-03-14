@@ -83,6 +83,7 @@ struct NanoTelemetryPayload {
 } __attribute__((packed));
 
 const uint8_t WELL_CURRENT_SAMPLES = 120;
+const uint8_t HOUSE_CURRENT_AVG_SAMPLES = 12;
 const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
 const unsigned long LEVEL_FILTER_MS_DEFAULT = 2000;
 const int LEVEL_THRESH_DEFAULT = 700;
@@ -193,7 +194,11 @@ float readWellCurrent() {
 }
 
 float readAuxAnalog() {
-  return (float)analogRead(PIN_CURRENT);
+  unsigned int sum = 0;
+  for (uint8_t i = 0; i < HOUSE_CURRENT_AVG_SAMPLES; i++) {
+    sum += (unsigned int)analogRead(PIN_CURRENT);
+  }
+  return (float)sum / HOUSE_CURRENT_AVG_SAMPLES;
 }
 
 float readWellPressureBar() {

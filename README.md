@@ -76,6 +76,31 @@ Frame structure:
 - Nano no longer handles RS-485/Modbus logic.
 - RS-485/Modbus is handled only by ESP32.
 
+
+## House Pump Current Measurement
+
+House pump current is measured through the **Nano analog path** (restored architecture from `Osnova.ino`):
+
+1. VFD analog output (0–10V, proportional to motor current) is wired to Nano `PIN_CURRENT` (`A0`) through a divider.
+2. Nano samples `A0` and sends averaged raw ADC value in telemetry field `analogAuxRaw`.
+3. ESP32 converts `analogAuxRaw` to amperes with explicit constants in `houseCurrentSense` and `convertNanoAnalogToCurrent(...)`.
+
+Conversion chain:
+- `adc_voltage = raw * NANO_ADC_VREF / NANO_ADC_MAX`
+- `source_voltage = adc_voltage * CURRENT_SENSOR_DIVIDER_RATIO`
+- `current = source_voltage * CURRENT_SENSOR_MAX_CURRENT / CURRENT_SENSOR_MAX_VOLTAGE`
+- `current = current * CURRENT_CALIBRATION_GAIN + CURRENT_CALIBRATION_OFFSET`
+
+Filtering and quality improvements:
+- Nano uses multi-sample averaging for `PIN_CURRENT`.
+- ESP32 applies smoothing for:
+  - `houseCurrentProtection` (faster, used by protections),
+  - `houseCurrentDisplay` (smoother, used by UI/JSON).
+- Near-zero clamp suppresses false tiny current readings.
+
+Important: **ESP32 no longer uses Modbus current feedback for house current**.
+RS-485/Modbus remains for VFD control/status only (run/stop/frequency/run-state where supported).
+
 ## Fail-safe behavior
 
 - ESP32 enforces safe-stop if Nano telemetry is stale/lost.
