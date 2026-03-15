@@ -340,7 +340,8 @@ constexpr uint8_t STATUS_RELAY_WELL_ACTIVE = 1 << 2;
 namespace nanoLink {
 constexpr unsigned long CMD_PERIOD_MS = 100UL;
 constexpr unsigned long RESPONSE_TIMEOUT_MS = 70UL;
-constexpr unsigned long STARTUP_GRACE_MS = 7000UL;
+constexpr unsigned long NANO_BOOT_WAIT_MS = 7000UL;
+constexpr uint8_t READY_STREAK_PACKETS = 3;
 constexpr float FREQ_EPS = 0.05f;
 constexpr uint8_t COMMAND_PAYLOAD_LEN = 12;
 constexpr uint8_t TELEMETRY_PAYLOAD_LEN = 10;
@@ -434,6 +435,17 @@ unsigned long lastTelemetryAgeMs = ULONG_MAX;
 unsigned long controllerBootMs = 0;
 bool linkHasTxErrors = false;
 bool startupInitDelayActive = false;
+
+enum class NanoSyncStage : uint8_t {
+  INIT_DELAY,
+  WAIT_NANO_BOOT,
+  READY,
+  FAILED
+};
+
+NanoSyncStage nanoSyncStage = NanoSyncStage::INIT_DELAY;
+unsigned long nanoBootWaitStartMs = 0;
+uint8_t nanoReadyPacketStreak = 0;
 
 struct Settings {
   WellConfig well;
@@ -796,9 +808,11 @@ bool canWellStartInWaitMode(unsigned long now, bool needPump) {
 
 const char* wellStartBlockReason(unsigned long now) {
   if (startupInitDelayActive) return "INIT_DELAY";
+  if (nanoSyncStage == NanoSyncStage::WAIT_NANO_BOOT) return "WAIT_NANO_BOOT";
+  if (nanoSyncStage == NanoSyncStage::FAILED && !hasEverReceivedTelemetry) return "NO_NANO_UART";
   if (st.wellMode == WellMode::STARTING) return "STARTING_IN_PROGRESS";
   if (st.wellManualMode == ManualMode::FORCE_OFF) return "FORCE_OFF";
-  if (!tm.valid) return "NO_TELEMETRY";
+  if (!tm.valid) return hasEverReceivedTelemetry ? "NO_TELEMETRY" : "NO_NANO_UART";
   if (st.wellBlocked) return "WELL_BLOCKED";
   if (st.pressureBlock) return "PRESSURE_BLOCK";
   if (st.wellAlarm || st.wellMode == WellMode::FAIL) return "WELL_ALARM";
@@ -1235,6 +1249,10 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   linkHealth.lastValidPacketMs = now;
   linkHealth.lastGoodRxMs = now;
   hasEverReceivedTelemetry = true;
+  if (nanoReadyPacketStreak < 255) nanoReadyPacketStreak++;
+  if (nanoReadyPacketStreak >= nanoLink::READY_STREAK_PACKETS) {
+    nanoSyncStage = NanoSyncStage::READY;
+  }
   return true;
 }
 
@@ -1274,6 +1292,7 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
     linkHealth.shortReadCount++;
     linkHealth.shortFrameCount++;
     appendLinkLogThrottled(String("Nano UART short frame: expected=") + String(nanoLink::TELEMETRY_FRAME_LEN) + ", actual=" + String(len), linkHealth.lastShortReadLogMs);
+    nanoReadyPacketStreak = 0;
     return false;
   }
 
@@ -1281,6 +1300,7 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
     linkHealth.invalidFrameCount++;
     linkHealth.badHeaderCount++;
     appendLinkLogThrottled("Nano UART invalid frame: bad header", linkHealth.lastInvalidFrameLogMs);
+    nanoReadyPacketStreak = 0;
     return false;
   }
 
@@ -1290,6 +1310,7 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
     linkHealth.invalidFrameCount++;
     linkHealth.badCrcCount++;
     appendLinkLogThrottled("Nano UART invalid frame: CRC mismatch", linkHealth.lastInvalidFrameLogMs);
+    nanoReadyPacketStreak = 0;
     return false;
   }
 
@@ -1311,16 +1332,22 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
   if (!rangesOk) {
     linkHealth.invalidFrameCount++;
     appendLinkLogThrottled("Nano UART invalid frame: telemetry out of range", linkHealth.lastInvalidFrameLogMs);
+    nanoReadyPacketStreak = 0;
     return false;
   }
 
   if (!decodeTelemetryPayload(payload, now)) {
     linkHealth.invalidFrameCount++;
     appendLinkLogThrottled("Nano UART invalid frame: payload rejected", linkHealth.lastInvalidFrameLogMs);
+    nanoReadyPacketStreak = 0;
     return false;
   }
 
   return true;
+}
+
+void resetNanoUartSessionState() {
+  while (nanoSerial.available()) (void)nanoSerial.read();
 }
 
 void readNanoUartResponse(unsigned long now, uint8_t expectedSeq) {
@@ -1349,6 +1376,7 @@ void readNanoUartResponse(unsigned long now, uint8_t expectedSeq) {
   }
 
   linkHealth.shortReadCount++;
+  nanoReadyPacketStreak = 0;
   appendLinkLogThrottled("Nano UART response timeout", linkHealth.lastShortReadLogMs);
 }
 
@@ -1394,7 +1422,7 @@ void sendNanoControlPacket(const NanoCommandPacket& packet) {
   uint16_t crc = calcCrc16(frame, nanoLink::COMMAND_FRAME_LEN - 2);
   writeU16LE(frame + nanoLink::COMMAND_FRAME_LEN - 2, crc);
 
-  while (nanoSerial.available()) (void)nanoSerial.read();
+  resetNanoUartSessionState();
   const size_t sent = nanoSerial.write(frame, nanoLink::COMMAND_FRAME_LEN);
   recordNanoTxResult(sent == nanoLink::COMMAND_FRAME_LEN, "command");
   if (sent == nanoLink::COMMAND_FRAME_LEN) {
@@ -1917,11 +1945,14 @@ String buildJsonState() {
   doc["house_current_protection"] = tm.houseCurrentProtection;
   doc["house_pressure"] = tm.housePressure;
   doc["last_work_sec"] = st.lastWorkSec;
+  doc["pause_config_ms"] = st.pauseMs;
   doc["pause_ms"] = st.pauseMs;
   doc["pause_elapsed_ms"] = pauseElapsed;
   doc["pause_remaining_ms"] = pauseRemaining;
+  doc["pause_active_remaining_ms"] = pauseRemaining;
   doc["pause_active"] = isWellPauseActive(now);
   doc["well_wait_reason"] = wellStartBlockReason(now);
+  doc["well_start_block_reason"] = wellStartBlockReason(now);
   doc["well_pause_countdown_active"] = isWellPauseCountdownActive(now);
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
@@ -1947,6 +1978,9 @@ String buildJsonState() {
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
+  doc["nano_sync_stage"] = (int)nanoSyncStage;
+  doc["nano_boot_wait_ms"] = nanoLink::NANO_BOOT_WAIT_MS;
+  doc["nano_ready_streak"] = nanoReadyPacketStreak;
   doc["link_last_valid_ms"] = linkHealth.lastValidPacketMs;
   doc["lastGoodRxMs"] = linkHealth.lastGoodRxMs;
   doc["link_alive"] = linkAlive;
@@ -2348,12 +2382,27 @@ void loop() {
   feedTaskWatchdog();
   unsigned long now = millis();
   static bool startupGraceLogged = false;
+  static NanoSyncStage prevNanoSyncStage = NanoSyncStage::INIT_DELAY;
   enum class LinkState : uint8_t { HEALTHY, DEGRADED, LOST };
   static LinkState prevLinkState = LinkState::HEALTHY;
 
-  const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
   startupInitDelayActive = startupInitActive;
+  if (startupInitActive) {
+    nanoSyncStage = NanoSyncStage::INIT_DELAY;
+    nanoBootWaitStartMs = 0;
+  } else if (!hasEverReceivedTelemetry) {
+    if (nanoBootWaitStartMs == 0) {
+      nanoBootWaitStartMs = now;
+      nanoSyncStage = NanoSyncStage::WAIT_NANO_BOOT;
+    } else if ((now - nanoBootWaitStartMs) < nanoLink::NANO_BOOT_WAIT_MS) {
+      nanoSyncStage = NanoSyncStage::WAIT_NANO_BOOT;
+    } else {
+      nanoSyncStage = NanoSyncStage::FAILED;
+    }
+  }
+
+  const bool startupBootWaitActive = nanoSyncStage == NanoSyncStage::WAIT_NANO_BOOT;
   const unsigned long telemetryAgeMs =
       hasEverReceivedTelemetry
           ? ((now >= linkHealth.lastValidPacketMs) ? (now - linkHealth.lastValidPacketMs) : 0UL)
@@ -2361,12 +2410,27 @@ void loop() {
   lastTelemetryAgeMs = hasEverReceivedTelemetry ? telemetryAgeMs : ULONG_MAX;
   const bool telemetryFresh = hasEverReceivedTelemetry && lastTelemetryAgeMs < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
-  const bool telemetryStale = !startupGraceActive && (!hasEverReceivedTelemetry || !telemetryFresh);
-  linkAlive = (startupGraceActive || telemetryFresh) && txHealthy;
+  const bool telemetryStale = !startupBootWaitActive && (!hasEverReceivedTelemetry || !telemetryFresh);
+  linkAlive = (startupBootWaitActive || telemetryFresh) && txHealthy;
   linkHasTxErrors = hasEverReceivedTelemetry && telemetryFresh && !txHealthy;
 
   if (telemetryStale) {
     tm.valid = false;
+  }
+
+
+  if (nanoSyncStage != prevNanoSyncStage) {
+    if (nanoSyncStage == NanoSyncStage::WAIT_NANO_BOOT) {
+      appendLog(st.logsWell, String("Nano bootstrap wait: ожидание валидной телеметрии до ") + String(nanoLink::NANO_BOOT_WAIT_MS) + " ms");
+      appendLog(st.logsHouse, String("Nano bootstrap wait: ожидание валидной телеметрии до ") + String(nanoLink::NANO_BOOT_WAIT_MS) + " ms");
+    } else if (nanoSyncStage == NanoSyncStage::READY) {
+      appendLog(st.logsWell, String("Nano UART synchronized: получено подряд валидных пакетов ") + String(nanoReadyPacketStreak));
+      appendLog(st.logsHouse, String("Nano UART synchronized: получено подряд валидных пакетов ") + String(nanoReadyPacketStreak));
+    } else if (nanoSyncStage == NanoSyncStage::FAILED) {
+      appendLog(st.logsWell, "Nano bootstrap failed: нет валидной телеметрии в окне ожидания");
+      appendLog(st.logsHouse, "Nano bootstrap failed: нет валидной телеметрии в окне ожидания");
+    }
+    prevNanoSyncStage = nanoSyncStage;
   }
 
   LinkState linkState = LinkState::HEALTHY;
@@ -2406,11 +2470,11 @@ void loop() {
     prevLinkState = linkState;
   }
 
-  if (startupGraceActive && !hasEverReceivedTelemetry && !startupGraceLogged && (now - controllerBootMs) > 1500UL) {
-    appendLog(st.logsWell, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
-    appendLog(st.logsHouse, "Ожидание телеметрии Nano при старте: защитный grace-период активен");
+  if (nanoSyncStage == NanoSyncStage::WAIT_NANO_BOOT && !startupGraceLogged) {
+    appendLog(st.logsWell, "Ожидание загрузки Nano: UART bootstrap-синхронизация активна");
+    appendLog(st.logsHouse, "Ожидание загрузки Nano: UART bootstrap-синхронизация активна");
     startupGraceLogged = true;
-  } else if (!startupGraceActive) {
+  } else if (nanoSyncStage != NanoSyncStage::WAIT_NANO_BOOT) {
     startupGraceLogged = false;
   }
 
