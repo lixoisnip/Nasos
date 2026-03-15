@@ -65,7 +65,9 @@
           <p>Давление: <b id="well_pressure">0 bar</b></p>
           <p>Работа: <b id="last_work_sec">0 s</b></p>
           <p>Пауза (настроено): <b id="pause_ms">0 ms</b></p>
+          <p>Пауза (настроено, мин): <b id="pause_minutes">0.0 min</b></p>
           <p>Осталось по паузе: <b id="pause_remaining_ms">0 ms</b></p>
+          <p>Осталось по паузе (мин): <b id="pause_remaining_minutes">0.0 min</b></p>
           <p>Причина ожидания: <b id="well_wait_reason">—</b></p>
           <p>Объём: <b id="total_liters">0 L</b></p>
           <p>Авария: <b id="well_alarm">Нет</b></p>
@@ -88,6 +90,13 @@
           <p>Авария: <b id="house_alarm">Нет</b></p>
           <p>Принудительный режим: <b id="house_force">OFF</b></p>
           <p>Режим автомата: <b id="house_mode_detail">—</b></p>
+          <p>Стартовый буст активен: <b id="house_startup_active">Нет</b></p>
+          <p>PID активен: <b id="house_pid_active">Нет</b></p>
+          <p>Подтверждение остановки: <b id="house_stop_confirm">Нет</b></p>
+          <p>До остановки: <b id="house_stop_confirm_remaining">0 ms</b></p>
+          <p>Целевая частота: <b id="house_target_freq">0.0 Hz</b></p>
+          <p>Текущая частота: <b id="house_actual_freq">0.0 Hz</b></p>
+          <p>Последняя причина остановки: <b id="house_last_stop_reason">NONE</b></p>
           <div class="d-flex gap-2 flex-wrap">
             <button class="btn btn-warning btn-sm" onclick="pumpAction('house','reset_alarm')">Сброс аварии</button>
             <button class="btn btn-success btn-sm" onclick="pumpAction('house','force_on')">Принудительно ВКЛ</button>
@@ -156,7 +165,9 @@
     cfgHouse: [
       ['setpointBar', 'Дом: уставка давления, bar', 'number', '0.01'],
       ['hystOn', 'Дом: нижний порог запуска, bar', 'number', '0.01'],
-      ['hystOff', 'Дом: верхний порог остановки, bar', 'number', '0.01'],
+      ['hystOff', 'Дом: порог подтверждения остановки, bar', 'number', '0.01'],
+      ['house_max_pressure', 'Дом: максимальное защитное давление, bar', 'number', '0.01'],
+      ['house_stop_confirm_ms', 'Дом: таймер подтверждения остановки, мс', 'number', '1'],
       ['minFreq', 'Дом: минимальная частота, Гц', 'number', '0.1'],
       ['maxFreq', 'Дом: максимальная частота, Гц', 'number', '0.1'],
       ['dryCurrent', 'Дом: ток сухого хода, A', 'number', '0.1'],
@@ -272,16 +283,28 @@
   function houseModeLabel(mode) {
     switch (Number(mode)) {
       case 0: return 'Ожидание воды';
-      case 1: return 'Запуск';
+      case 1: return 'BOOST_START';
       case 2: return 'Готов';
-      case 3: return 'Работа';
-      case 4: return 'Остановка';
+      case 3: return 'PID_RUN';
+      case 4: return 'STOP_CONFIRM';
       case 5: return 'Остановлен';
-      case 6: return 'Авария';
+      case 6: return 'PROTECT_MAX_PRESSURE';
+      case 7: return 'Авария';
       default: return 'Неизвестно';
     }
   }
 
+
+  function houseStopReasonLabel(reason) {
+    switch (Number(reason)) {
+      case 1: return 'STOP_CONFIRM';
+      case 2: return 'PROTECT_MAX_PRESSURE';
+      case 3: return 'FORCE_OFF';
+      case 4: return 'WAIT_WATER';
+      case 5: return 'FAULT';
+      default: return 'NONE';
+    }
+  }
 
   function waitReasonLabel(reason) {
     switch (String(reason || 'NONE')) {
@@ -317,6 +340,8 @@
     document.getElementById('last_work_sec').innerText = `${data.last_work_sec || 0} s`;
     document.getElementById('pause_ms').innerText = `${Math.round(data.pause_config_ms ?? data.pause_ms ?? 0)} ms`;
     document.getElementById('pause_remaining_ms').innerText = `${Math.max(0, Math.round(data.pause_active_remaining_ms ?? data.pause_remaining_ms ?? 0))} ms`;
+    document.getElementById('pause_minutes').innerText = `${((data.pause_config_minutes ?? ((data.pause_config_ms ?? data.pause_ms ?? 0) / 60000)) || 0).toFixed(1)} min`;
+    document.getElementById('pause_remaining_minutes').innerText = `${((data.pause_remaining_minutes ?? ((data.pause_active_remaining_ms ?? data.pause_remaining_ms ?? 0) / 60000)) || 0).toFixed(1)} min`;
     document.getElementById('well_wait_reason').innerText = waitReasonLabel(data.well_start_block_reason || data.well_wait_reason);
     document.getElementById('total_liters').innerText = `${Math.round(data.total_liters || 0)} L`;
     document.getElementById('well_alarm').innerText = data.well_alarm ? 'Да' : 'Нет';
@@ -330,6 +355,13 @@
     const houseMode = Number(data.house_mode ?? 0);
     const houseInRun = houseMode === 3;
     document.getElementById('house_mode_detail').innerText = houseModeLabel(houseMode);
+    document.getElementById('house_startup_active').innerText = data.house_startup_active ? 'Да' : 'Нет';
+    document.getElementById('house_pid_active').innerText = data.house_pid_active ? 'Да' : 'Нет';
+    document.getElementById('house_stop_confirm').innerText = data.house_stop_confirm_active ? 'Да' : 'Нет';
+    document.getElementById('house_stop_confirm_remaining').innerText = `${Math.max(0, Math.round(data.house_stop_confirm_remaining_ms ?? 0))} ms`;
+    document.getElementById('house_target_freq').innerText = `${(data.house_target_freq ?? 0).toFixed(1)} Hz`;
+    document.getElementById('house_actual_freq').innerText = `${(data.house_actual_freq ?? 0).toFixed(1)} Hz`;
+    document.getElementById('house_last_stop_reason').innerText = houseStopReasonLabel(data.house_last_stop_reason);
 
     if (data.well_alarm || data.well_blocked || data.pressure_block) {
       applyPumpState('wellCard', 'well_status', 'Авария', 'pump-alarm', true);
@@ -343,7 +375,7 @@
       applyPumpState('wellCard', 'well_status', 'Ждёт', 'pump-auto', false);
     }
 
-    if (data.house_alarm || data.house_blocked || houseMode === 6) {
+    if (data.house_alarm || data.house_blocked || houseMode === 7) {
       applyPumpState('houseCard', 'house_status', 'Авария', 'pump-alarm', true);
     } else if (houseManual === 1) {
       const manualStatus = houseMode === 1 ? 'Принудительный запуск' : 'Принудительно включен';
@@ -352,7 +384,7 @@
       applyPumpState('houseCard', 'house_status', 'Отключен', 'pump-force-off', false);
     } else if (houseInRun) {
       applyPumpState('houseCard', 'house_status', 'В работе авт.', 'pump-run-auto', false);
-    } else if (houseMode === 1 || houseMode === 4 || houseMode === 5 || houseMode === 0) {
+    } else if (houseMode === 1 || houseMode === 4 || houseMode === 5 || houseMode === 0 || houseMode === 6) {
       applyPumpState('houseCard', 'house_status', houseModeLabel(houseMode), 'pump-wait', false);
     } else {
       applyPumpState('houseCard', 'house_status', 'Готов', 'pump-auto', false);
