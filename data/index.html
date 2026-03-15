@@ -65,6 +65,7 @@
           <p>Давление: <b id="well_pressure">0 bar</b></p>
           <p>Работа: <b id="last_work_sec">0 s</b></p>
           <p>Пауза: <b id="pause_ms">0 ms</b></p>
+          <p>Осталось до запуска: <b id="pause_remaining_ms">0 ms</b></p>
           <p>Объём: <b id="total_liters">0 L</b></p>
           <p>Авария: <b id="well_alarm">Нет</b></p>
           <p>Принудительный режим: <b id="well_force">OFF</b></p>
@@ -73,6 +74,7 @@
             <button class="btn btn-success btn-sm" onclick="pumpAction('well','force_on')">Принудительно ВКЛ</button>
             <button class="btn btn-danger btn-sm" onclick="pumpAction('well','force_off')">Принудительно ВЫКЛ</button>
             <button class="btn btn-outline-primary btn-sm" onclick="pumpAction('well','auto')">Авто режим</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="pumpAction('well','reset_pause')">Сброс паузы</button>
           </div>
         </div>
       </div>
@@ -294,6 +296,7 @@
     document.getElementById('house_pressure').innerText = `${(data.house_pressure || 0).toFixed(2)} bar`;
     document.getElementById('last_work_sec').innerText = `${data.last_work_sec || 0} s`;
     document.getElementById('pause_ms').innerText = `${Math.round(data.pause_ms || 0)} ms`;
+    document.getElementById('pause_remaining_ms').innerText = `${Math.max(0, Math.round(data.pause_remaining_ms || 0))} ms`;
     document.getElementById('total_liters').innerText = `${Math.round(data.total_liters || 0)} L`;
     document.getElementById('well_alarm').innerText = data.well_alarm ? 'Да' : 'Нет';
     document.getElementById('house_alarm').innerText = data.house_alarm ? 'Да' : 'Нет';

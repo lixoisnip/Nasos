@@ -762,6 +762,35 @@ void resetWellTimersFull() {
   st.wellPauseStart = 0;
 }
 
+unsigned long wellPauseElapsedMs(unsigned long now) {
+  if (st.wellPauseStart == 0 || now <= st.wellPauseStart) return 0;
+  return now - st.wellPauseStart;
+}
+
+unsigned long wellPauseRemainingMs(unsigned long now) {
+  const unsigned long pauseMs = (unsigned long)max(0.0f, st.pauseMs);
+  if (!pauseMs || st.wellPauseStart == 0) return 0;
+  const unsigned long elapsed = wellPauseElapsedMs(now);
+  return elapsed >= pauseMs ? 0 : (pauseMs - elapsed);
+}
+
+bool isWellPauseActive(unsigned long now) {
+  if (st.wellMode != WellMode::WAIT || st.wellRelay || st.wellBlocked || st.pressureBlock || !tm.valid) return false;
+
+  const bool forceOn = st.wellManualMode == ManualMode::FORCE_ON;
+  const bool forceOff = st.wellManualMode == ManualMode::FORCE_OFF;
+  const bool needPump = forceOn || (!forceOff && st.needPump);
+  return needPump && wellPauseRemainingMs(now) > 0;
+}
+
+bool resetWellPauseTimer(const String& reason = "") {
+  const unsigned long now = millis();
+  const bool hadPause = st.wellPauseStart != 0 && wellPauseRemainingMs(now) > 0;
+  st.wellPauseStart = 0;
+  if (hadPause && reason.length()) appendLog(st.logsWell, reason);
+  return hadPause;
+}
+
 void updateWellPumpNeed() {
   bool L2 = tm.levels[1];
   bool L4 = tm.levels[3];
@@ -1850,6 +1879,9 @@ void runProtections(unsigned long now) {
 
 String buildJsonState() {
   StaticJsonDocument<3328> doc;
+  const unsigned long now = millis();
+  const unsigned long pauseElapsed = wellPauseElapsedMs(now);
+  const unsigned long pauseRemaining = wellPauseRemainingMs(now);
   doc["well_current"] = tm.wellCurrent;
   doc["well_pressure"] = tm.wellPressure;
   doc["house_current"] = tm.houseCurrentDisplay;
@@ -1858,6 +1890,9 @@ String buildJsonState() {
   doc["house_pressure"] = tm.housePressure;
   doc["last_work_sec"] = st.lastWorkSec;
   doc["pause_ms"] = st.pauseMs;
+  doc["pause_elapsed_ms"] = pauseElapsed;
+  doc["pause_remaining_ms"] = pauseRemaining;
+  doc["pause_active"] = isWellPauseActive(now);
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
   doc["well_mode"] = (int)st.wellMode;
@@ -2059,9 +2094,11 @@ void initWeb() {
         if (st.wellBlocked || st.pressureBlock) {
           appendLog(st.logsWell, "Скважина: принудительный запуск отклонен — активна аварийная блокировка");
         } else {
-          st.wellPauseStart = 0;
+          resetWellPauseTimer();
           appendLog(st.logsWell, "Скважина: включен принудительный режим");
         }
+      } else if (action == "reset_pause") {
+        resetWellPauseTimer("Скважина: пауза сброшена вручную");
       } else if (action == "force_off") {
         st.wellManualMode = ManualMode::FORCE_OFF;
         if (st.wellRelay) stopWellPump(millis(), "Скважина: принудительно выключен", st.intention, false);
@@ -2256,6 +2293,7 @@ void setup() {
 
   wellPrefs.begin(wellCtrl::PREF_NAMESPACE, false);
   loadWellState();
+  resetWellPauseTimer("Скважина: таймер паузы сброшен при старте ESP32");
 
   initWiFi();
 
