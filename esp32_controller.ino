@@ -276,6 +276,7 @@ constexpr unsigned long MIN_OFF_MS = 30000UL;
 constexpr unsigned long MIN_RUN_MS = 15000UL;
 constexpr unsigned long SLEEP_QUALIFY_MS = 30000UL;
 constexpr float PRESSURE_SLEEP_BAND = 0.10f;
+constexpr float PRESSURE_SLEEP_NEAR_SETPOINT_BAND = 0.03f;
 constexpr float SLEEP_DERIVATIVE_MAX = 0.02f;
 constexpr float SLEEP_FREQ_BAND = 1.0f;
 constexpr uint8_t AUTO_RESTART_MAX = 3;               // Intentional deviation: Osnova had no dedicated auto-restart counter for house faults; capped retries prevent endless cycling. Risk: repeated attempts can still stress motor during persistent fault.
@@ -432,6 +433,7 @@ bool hasEverReceivedTelemetry = false;
 unsigned long lastTelemetryAgeMs = ULONG_MAX;
 unsigned long controllerBootMs = 0;
 bool linkHasTxErrors = false;
+bool startupInitDelayActive = false;
 
 struct Settings {
   WellConfig well;
@@ -789,6 +791,23 @@ bool isWellPauseActive(unsigned long now) {
 
 bool canWellStartInWaitMode(unsigned long now, bool needPump) {
   return needPump && !isWellPauseCountdownActive(now);
+}
+
+
+const char* wellStartBlockReason(unsigned long now) {
+  if (startupInitDelayActive) return "INIT_DELAY";
+  if (st.wellMode == WellMode::STARTING) return "STARTING_IN_PROGRESS";
+  if (st.wellManualMode == ManualMode::FORCE_OFF) return "FORCE_OFF";
+  if (!tm.valid) return "NO_TELEMETRY";
+  if (st.wellBlocked) return "WELL_BLOCKED";
+  if (st.pressureBlock) return "PRESSURE_BLOCK";
+  if (st.wellAlarm || st.wellMode == WellMode::FAIL) return "WELL_ALARM";
+
+  const bool forceOn = st.wellManualMode == ManualMode::FORCE_ON;
+  const bool needPump = forceOn || st.needPump;
+  if (!needPump) return "NO_REQUEST";
+  if (isWellPauseCountdownActive(now)) return "PAUSE";
+  return "NONE";
 }
 
 bool resetWellPauseTimer(const String& reason = "") {
@@ -1650,8 +1669,9 @@ void runHouseLogic() {
     bool minRunDone = (now - st.houseStartAt) >= houseCtrl::MIN_RUN_MS;
     bool lowSpeed = st.vfdFreq <= (cfg.house.minFreq + houseCtrl::SLEEP_FREQ_BAND);
     bool pressureHigh = tm.housePressure >= (cfg.house.setpointBar + houseCtrl::PRESSURE_SLEEP_BAND);
+    bool pressureNearSetpoint = tm.housePressure >= (cfg.house.setpointBar - houseCtrl::PRESSURE_SLEEP_NEAR_SETPOINT_BAND);
     bool pressureStable = fabs(st.housePressureRate) <= houseCtrl::SLEEP_DERIVATIVE_MAX;
-    bool sleepCondition = minRunDone && lowSpeed && pressureHigh && pressureStable;
+    bool sleepCondition = minRunDone && lowSpeed && pressureStable && (pressureHigh || pressureNearSetpoint);
 
     if (sleepCondition && st.houseManualMode != ManualMode::FORCE_ON) {
       if (!st.houseSleepQualStartAt) st.houseSleepQualStartAt = now;
@@ -1901,6 +1921,8 @@ String buildJsonState() {
   doc["pause_elapsed_ms"] = pauseElapsed;
   doc["pause_remaining_ms"] = pauseRemaining;
   doc["pause_active"] = isWellPauseActive(now);
+  doc["well_wait_reason"] = wellStartBlockReason(now);
+  doc["well_pause_countdown_active"] = isWellPauseCountdownActive(now);
   doc["total_liters"] = st.totalLiters;
   doc["well_alarm"] = st.wellAlarm;
   doc["well_mode"] = (int)st.wellMode;
@@ -2093,6 +2115,7 @@ void initWeb() {
         st.pressureBlock = false;
         st.wellManualMode = ManualMode::AUTO;
         st.wellMode = WellMode::WAIT;
+        st.failedStartCount = 0;
         resetWellTimersFull();
         appendLog(st.logsWell, "Скважина: ручной сброс аварии");
         appendEventLog(eventLog::SRC_WELL, eventCode::WELL_RESET, 0, 0);
@@ -2167,6 +2190,7 @@ void initWeb() {
     st.pressureBlock = false;
     st.wellManualMode = ManualMode::AUTO;
     st.wellMode = WellMode::WAIT;
+    st.failedStartCount = 0;
     resetWellTimersFull();
     appendLog(st.logsWell, "Скважина: ручной сброс аварии и таймеров");
     saveWellState(true);
@@ -2329,6 +2353,7 @@ void loop() {
 
   const bool startupGraceActive = !hasEverReceivedTelemetry && (now - controllerBootMs < nanoLink::STARTUP_GRACE_MS);
   const bool startupInitActive = (now - controllerBootMs) < cfg.common.initDelayMs;
+  startupInitDelayActive = startupInitActive;
   const unsigned long telemetryAgeMs =
       hasEverReceivedTelemetry
           ? ((now >= linkHealth.lastValidPacketMs) ? (now - linkHealth.lastValidPacketMs) : 0UL)
