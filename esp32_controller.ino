@@ -31,11 +31,21 @@ enum class WellMode : uint8_t {
 
 enum class HouseMode : uint8_t {
   WAIT_WATER,
-  STARTING,
+  BOOST_START,
   READY,
-  RUNNING,
-  STOPPING,
+  PID_RUN,
+  STOP_CONFIRM,
   STOPPED,
+  PROTECT_MAX_PRESSURE,
+  FAULT
+};
+
+enum class HouseStopReason : uint8_t {
+  NONE,
+  STOP_CONFIRM,
+  PROTECT_MAX_PRESSURE,
+  FORCE_OFF,
+  NO_WATER,
   FAULT
 };
 
@@ -79,8 +89,10 @@ struct WellConfig {
 
 struct HouseConfig {
   float setpointBar;
-  float hystOn;
-  float hystOff;
+  float startPressure;
+  float stopPressure;
+  float maxPressure;
+  unsigned long stopConfirmMs;
   float minFreq;
   float maxFreq;
   float dryCurrent;
@@ -178,8 +190,10 @@ WELL (cfg):
 
 HOUSE (cfgHouse):
   SETPOINT_BAR(1.00) -> defaults::house.setpointBar(1.00)
-  HYST_ON(0.50) -> defaults::house.hystOn(0.50)
-  HYST_OFF(1.18) -> defaults::house.hystOff(1.18)
+  START_PRESSURE(0.50) -> defaults::house.startPressure(0.50)
+  STOP_PRESSURE(1.00) -> defaults::house.stopPressure(1.00)
+  MAX_PRESSURE(1.20) -> defaults::house.maxPressure(1.20)
+  STOP_CONFIRM_MS(15000) -> defaults::house.stopConfirmMs(15000)
   MIN_FREQ(28.0) -> defaults::house.minFreq(28.0)
   MAX_FREQ(50.0) -> defaults::house.maxFreq(50.0)
   CURRENT_DRY(0.4) -> defaults::house.dryCurrent(0.4)
@@ -210,9 +224,11 @@ const WellConfig well = {
 };
 
 const HouseConfig house = {
-  1.0f,
+  0.90f,
   0.50f,
-  1.18f,
+  1.00f,
+  1.20f,
+  15000UL,
   28.0f,
   50.0f,
   0.4f,
@@ -264,21 +280,15 @@ constexpr unsigned long PID_PERIOD = 300UL;
 constexpr float PID_KP = 18.0f;      // Intentional deviation: ESP32 PID is normalized for VFD Hz control (Osnova used PWM-like scale 260.0). Risk: reverting blindly can cause unstable pressure oscillation.
 constexpr float PID_KI = 2.8f;       // Intentional deviation: retuned integrator for 300ms loop and filtered telemetry. Risk: too low -> chronic undershoot, too high -> overshoot/hunting.
 constexpr float INTEGRAL_LIMIT = 6.0f; // Intentional deviation: narrower anti-windup than Osnova(18.0) for safer recovery after dry-run faults. Risk: may slow recovery under high demand.
-constexpr float FREQ_STEP = 1.5f;
-constexpr unsigned long FREQ_STEP_DELAY = 500UL;
+constexpr float PID_OUTPUT_SLEW_HZ_PER_S = 20.0f;
 
 constexpr float PRESSURE_RISE_THRESHOLD = 0.10f;
 constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;
 constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 15000UL;
 
 constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
-constexpr unsigned long MIN_OFF_MS = 30000UL;
-constexpr unsigned long MIN_RUN_MS = 15000UL;
-constexpr unsigned long SLEEP_QUALIFY_MS = 30000UL;
-constexpr float PRESSURE_SLEEP_BAND = 0.10f;
-constexpr float PRESSURE_SLEEP_NEAR_SETPOINT_BAND = 0.03f;
-constexpr float SLEEP_DERIVATIVE_MAX = 0.02f;
-constexpr float SLEEP_FREQ_BAND = 1.0f;
+constexpr float BOOST_FREQ = 50.0f;
+constexpr unsigned long BOOST_DURATION_MS = 3000UL;
 constexpr uint8_t AUTO_RESTART_MAX = 3;               // Intentional deviation: Osnova had no dedicated auto-restart counter for house faults; capped retries prevent endless cycling. Risk: repeated attempts can still stress motor during persistent fault.
 constexpr unsigned long AUTO_RESTART_DELAY_MS = 2000UL; // Intentional deviation: short cooldown to restore household pressure quickly after transient trips. Risk: if source fault persists, retries happen sooner.
 constexpr unsigned long RESTART_RESET_OK_MS = 10UL * 60UL * 1000UL;
@@ -479,14 +489,11 @@ struct Controller {
   unsigned long houseOverloadStart = 0;
   unsigned long houseStartAt = 0;
   unsigned long houseLastStopAt = 0;
-  unsigned long houseSleepQualStartAt = 0;
+  unsigned long houseBoostStartAt = 0;
+  unsigned long houseStopConfirmAt = 0;
   unsigned long housePidLastAt = 0;
-  unsigned long houseFreqLastStepAt = 0;
   unsigned long housePressureDryStartAt = 0;
   float houseInitialPressure = 0;
-  float housePrevPressure = 0;
-  float housePressureRate = 0;
-  bool housePressureRiseOk = false;
   float housePidIntegral = 0;
   float houseTargetFreq = 28.0f;
   uint8_t houseAutoRestartAttempts = 0;
@@ -495,6 +502,7 @@ struct Controller {
   bool houseAutoRestartPending = false;
   HouseAutoRestartReason houseAutoRestartReason = HouseAutoRestartReason::NONE;
   HouseMode houseMode = HouseMode::WAIT_WATER;
+  HouseStopReason houseLastStopReason = HouseStopReason::NONE;
 
   unsigned long lastWorkSec = 0;
   float pauseMs = 0;
@@ -517,6 +525,21 @@ struct Controller {
   String logsWell;
   String logsHouse;
 } st;
+
+
+const char* houseModeStateName(HouseMode mode) {
+  switch (mode) {
+    case HouseMode::WAIT_WATER: return "WAIT_WATER";
+    case HouseMode::BOOST_START: return "BOOST_START";
+    case HouseMode::READY: return "READY";
+    case HouseMode::PID_RUN: return "PID_RUN";
+    case HouseMode::STOP_CONFIRM: return "STOP_CONFIRM";
+    case HouseMode::STOPPED: return "STOPPED";
+    case HouseMode::PROTECT_MAX_PRESSURE: return "PROTECT_MAX_PRESSURE";
+    case HouseMode::FAULT: return "BLOCKED";
+  }
+  return "WAIT_WATER";
+}
 
 // -------- Optional ESP32 TFT display --------
 #ifndef ESP32_USE_TFT
@@ -555,11 +578,12 @@ const char* manualModeLabel(ManualMode mode) {
 const char* houseModeLabel(HouseMode mode) {
   switch (mode) {
     case HouseMode::WAIT_WATER: return "WAIT";
-    case HouseMode::STARTING: return "START";
+    case HouseMode::BOOST_START: return "BOOST_START";
     case HouseMode::READY: return "READY";
-    case HouseMode::RUNNING: return "RUN";
-    case HouseMode::STOPPING: return "STOPPING";
-    case HouseMode::STOPPED: return "STOP";
+    case HouseMode::PID_RUN: return "PID_RUN";
+    case HouseMode::STOP_CONFIRM: return "STOP_CONFIRM";
+    case HouseMode::STOPPED: return "STOPPED";
+    case HouseMode::PROTECT_MAX_PRESSURE: return "PROTECT_MAX";
     case HouseMode::FAULT: return "FAULT";
   }
   return "WAIT";
@@ -911,8 +935,10 @@ void saveSettingsToPrefs() {
   settingsPrefs.putFloat("w_lpm", cfg.well.litersPerMin);
 
   settingsPrefs.putFloat("h_set", cfg.house.setpointBar);
-  settingsPrefs.putFloat("h_on", cfg.house.hystOn);
-  settingsPrefs.putFloat("h_off", cfg.house.hystOff);
+  settingsPrefs.putFloat("h_start", cfg.house.startPressure);
+  settingsPrefs.putFloat("h_stop", cfg.house.stopPressure);
+  settingsPrefs.putFloat("h_maxp", cfg.house.maxPressure);
+  settingsPrefs.putULong("h_stop_ms", cfg.house.stopConfirmMs);
   settingsPrefs.putFloat("h_minf", cfg.house.minFreq);
   settingsPrefs.putFloat("h_maxf", cfg.house.maxFreq);
   settingsPrefs.putFloat("h_dry_cur", cfg.house.dryCurrent);
@@ -943,8 +969,10 @@ void loadSettingsFromPrefs() {
   cfg.well.litersPerMin = settingsPrefs.getFloat("w_lpm", cfg.well.litersPerMin);
 
   cfg.house.setpointBar = settingsPrefs.getFloat("h_set", cfg.house.setpointBar);
-  cfg.house.hystOn = settingsPrefs.getFloat("h_on", cfg.house.hystOn);
-  cfg.house.hystOff = settingsPrefs.getFloat("h_off", cfg.house.hystOff);
+  cfg.house.startPressure = settingsPrefs.getFloat("h_start", settingsPrefs.getFloat("h_on", cfg.house.startPressure));
+  cfg.house.stopPressure = settingsPrefs.getFloat("h_stop", settingsPrefs.getFloat("h_off", cfg.house.stopPressure));
+  cfg.house.maxPressure = settingsPrefs.getFloat("h_maxp", cfg.house.maxPressure);
+  cfg.house.stopConfirmMs = settingsPrefs.getULong("h_stop_ms", cfg.house.stopConfirmMs);
   cfg.house.minFreq = settingsPrefs.getFloat("h_minf", cfg.house.minFreq);
   cfg.house.maxFreq = settingsPrefs.getFloat("h_maxf", cfg.house.maxFreq);
   cfg.house.dryCurrent = settingsPrefs.getFloat("h_dry_cur", cfg.house.dryCurrent);
@@ -978,8 +1006,11 @@ bool applySingleSetting(const String& key, float value) {
   else if (key == "cfg.targetMinutes") cfg.well.targetMinutes = constrain(value, 0.1f, 60.0f);
   else if (key == "cfg.litersPerMin") cfg.well.litersPerMin = constrain(value, 0.1f, 300.0f);
 
-  else if (key == "cfgHouse.hystOn") cfg.house.hystOn = constrain(value, 0.1f, 4.0f);
-  else if (key == "cfgHouse.hystOff") cfg.house.hystOff = constrain(value, 0.1f, 4.0f);
+  else if (key == "cfgHouse.hystOn" || key == "house_start_pressure") cfg.house.startPressure = constrain(value, 0.1f, 4.0f);
+  else if (key == "cfgHouse.hystOff" || key == "house_stop_pressure") cfg.house.stopPressure = constrain(value, 0.1f, 4.0f);
+  else if (key == "house_setpoint_pressure" || key == "cfgHouse.house_setpoint_pressure") cfg.house.setpointBar = constrain(value, 0.1f, 4.0f);
+  else if (key == "house_max_pressure" || key == "cfgHouse.house_max_pressure") cfg.house.maxPressure = constrain(value, 0.1f, 5.0f);
+  else if (key == "house_stop_confirm_ms" || key == "cfgHouse.house_stop_confirm_ms") cfg.house.stopConfirmMs = (unsigned long)constrain(value, 1000.0f, 120000.0f);
   else if (key == "cfgHouse.minFreq") cfg.house.minFreq = constrain(value, 10.0f, 60.0f);
   else if (key == "cfgHouse.maxFreq") cfg.house.maxFreq = constrain(value, 10.0f, 60.0f);
   else if (key == "cfgHouse.dryCurrent") cfg.house.dryCurrent = constrain(value, 0.0f, 20.0f);
@@ -996,6 +1027,8 @@ bool applySingleSetting(const String& key, float value) {
   else return false;
 
   if (cfg.house.minFreq > cfg.house.maxFreq) cfg.house.maxFreq = cfg.house.minFreq;
+  if (cfg.house.startPressure > cfg.house.stopPressure) cfg.house.stopPressure = cfg.house.startPressure;
+  if (cfg.house.stopPressure > cfg.house.maxPressure) cfg.house.maxPressure = cfg.house.stopPressure;
   if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
   return true;
 }
@@ -1046,8 +1079,13 @@ String buildJsonSettings() {
 
   JsonObject c2 = doc.createNestedObject("cfgHouse");
   c2["setpointBar"] = cfg.house.setpointBar;
-  c2["hystOn"] = cfg.house.hystOn;
-  c2["hystOff"] = cfg.house.hystOff;
+  c2["hystOn"] = cfg.house.startPressure;
+  c2["hystOff"] = cfg.house.stopPressure;
+  c2["house_start_pressure"] = cfg.house.startPressure;
+  c2["house_setpoint_pressure"] = cfg.house.setpointBar;
+  c2["house_stop_pressure"] = cfg.house.stopPressure;
+  c2["house_max_pressure"] = cfg.house.maxPressure;
+  c2["house_stop_confirm_ms"] = cfg.house.stopConfirmMs;
   c2["minFreq"] = cfg.house.minFreq;
   c2["maxFreq"] = cfg.house.maxFreq;
   c2["dryCurrent"] = cfg.house.dryCurrent;
@@ -1525,26 +1563,14 @@ void runWellLogic(unsigned long now) {
 void runHouseLogic() {
   unsigned long now = millis();
 
-  if (!st.housePidLastAt) {
-    st.housePrevPressure = tm.housePressure;
-    st.housePressureRate = 0;
-  } else {
-    float dtPressure = (now - st.housePidLastAt) / 1000.0f;
-    if (dtPressure > 0.001f) {
-      st.housePressureRate = (tm.housePressure - st.housePrevPressure) / dtPressure;
-      st.housePrevPressure = tm.housePressure;
-    }
-  }
-
   if (!tm.valid || st.houseBlocked) {
     st.vfdRun = false;
     st.vfdFreq = cfg.house.minFreq;
     st.houseMode = st.houseBlocked ? HouseMode::FAULT : HouseMode::STOPPED;
-    st.housePressureDryStartAt = 0;
+    st.houseStopConfirmAt = 0;
     st.housePidLastAt = 0;
     st.houseStartAt = 0;
-    st.houseSleepQualStartAt = 0;
-    st.housePressureRiseOk = false;
+    st.houseBoostStartAt = 0;
     st.houseAutoRestartPending = false;
     st.houseAutoRestartAt = 0;
     st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
@@ -1560,24 +1586,21 @@ void runHouseLogic() {
       st.houseMode = HouseMode::WAIT_WATER;
       st.vfdRun = false;
       st.vfdFreq = cfg.house.minFreq;
-      st.housePressureDryStartAt = 0;
+      st.houseStopConfirmAt = 0;
       st.housePidLastAt = 0;
-      st.houseSleepQualStartAt = 0;
       st.houseAutoRestartPending = false;
       st.houseAutoRestartAt = 0;
       st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
+      st.houseLastStopReason = HouseStopReason::NO_WATER;
       return;
     }
-
     if (L1 && !L2) {
-      if (!st.vfdRun) {
-        st.houseMode = HouseMode::READY;
-      }
+      if (!st.vfdRun) st.houseMode = HouseMode::READY;
     } else {
-      st.houseMode = st.vfdRun ? HouseMode::RUNNING : HouseMode::READY;
+      st.houseMode = st.vfdRun ? HouseMode::PID_RUN : HouseMode::READY;
     }
   } else {
-    st.houseMode = st.vfdRun ? HouseMode::RUNNING : HouseMode::READY;
+    st.houseMode = st.vfdRun ? HouseMode::PID_RUN : HouseMode::READY;
   }
 
   if (st.houseManualMode != ManualMode::FORCE_ON && !fullWater && !st.vfdRun) {
@@ -1590,142 +1613,124 @@ void runHouseLogic() {
     st.vfdRun = false;
     st.vfdFreq = cfg.house.minFreq;
     st.houseMode = HouseMode::STOPPED;
-    st.housePressureDryStartAt = 0;
+    st.houseStopConfirmAt = 0;
     st.housePidLastAt = 0;
-    st.houseSleepQualStartAt = 0;
     st.houseLastStopAt = now;
+    st.houseLastStopReason = HouseStopReason::FORCE_OFF;
     st.houseAutoRestartPending = false;
     st.houseAutoRestartAt = 0;
     st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
     return;
   }
 
-  if (st.houseManualMode == ManualMode::FORCE_ON) {
-    if (!st.vfdRun) {
+  if (!st.vfdRun) {
+    bool shouldStart = (st.houseManualMode == ManualMode::FORCE_ON) || (tm.housePressure <= cfg.house.startPressure);
+    if (shouldStart) {
       st.vfdRun = true;
+      st.houseMode = HouseMode::BOOST_START;
       st.houseStartAt = now;
+      st.houseBoostStartAt = now;
       st.houseInitialPressure = tm.housePressure;
-      st.housePressureRiseOk = false;
-      st.housePidIntegral = 0;
-      st.houseTargetFreq = cfg.house.minFreq;
-      st.housePidLastAt = 0;
-      st.houseFreqLastStepAt = 0;
-      st.houseSleepQualStartAt = 0;
-      st.houseAutoRestartPending = false;
-      st.houseAutoRestartAt = 0;
-      st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
-    }
-    st.houseMode = HouseMode::RUNNING;
-  } else {
-    bool canStartByTime = (st.houseLastStopAt == 0) || ((now - st.houseLastStopAt) >= houseCtrl::MIN_OFF_MS);
-    if (!st.vfdRun && tm.housePressure <= cfg.house.hystOn && canStartByTime) {
-      st.vfdRun = true;
-      st.houseMode = HouseMode::STARTING;
-      st.houseStartAt = now;
-      st.houseInitialPressure = tm.housePressure;
-      st.housePressureRiseOk = false;
       st.housePressureDryStartAt = 0;
       st.housePidLastAt = 0;
-      st.houseFreqLastStepAt = 0;
-      st.houseSleepQualStartAt = 0;
       st.housePidIntegral = 0;
-      st.houseTargetFreq = cfg.house.minFreq;
+      st.houseTargetFreq = constrain(houseCtrl::BOOST_FREQ, cfg.house.minFreq, cfg.house.maxFreq);
+      st.vfdFreq = st.houseTargetFreq;
+      st.houseStopConfirmAt = 0;
       st.houseAutoRestartPending = false;
       st.houseAutoRestartAt = 0;
       st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
-      appendLog(st.logsHouse, "Дом: запуск насоса");
+      appendLog(st.logsHouse, "Дом: запуск насоса, буст 50 Гц на 3 с");
       appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_START, tm.housePressure, st.vfdFreq);
     }
   }
 
-  if (st.vfdRun) {
-    if (!st.houseStartAt) {
-      st.houseStartAt = now;
-      st.houseInitialPressure = tm.housePressure;
-      st.housePressureRiseOk = false;
-    }
+  if (!st.vfdRun) {
+    st.housePidLastAt = 0;
+    st.housePressureDryStartAt = 0;
+    st.houseStopConfirmAt = 0;
+    st.houseAutoRestartOkSince = 0;
+    return;
+  }
 
-    if (!st.housePidLastAt) st.housePidLastAt = now;
+  if (!st.houseStartAt) {
+    st.houseStartAt = now;
+    st.houseBoostStartAt = now;
+    st.houseInitialPressure = tm.housePressure;
+  }
 
-    if (st.houseMode == HouseMode::STARTING) {
-      st.vfdFreq = cfg.house.minFreq;
-      if (now - st.houseStartAt >= houseCtrl::DRY_PRESSURE_START_TIMEOUT) {
-        if (tm.housePressure > st.houseInitialPressure + houseCtrl::PRESSURE_RISE_THRESHOLD) {
-          st.housePressureRiseOk = true;
-          st.houseMode = HouseMode::RUNNING;
-          st.housePidLastAt = now;
-          appendLog(st.logsHouse, "Дом: старт успешен, переход в режим RUNNING");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_PI_START, tm.housePressure, st.vfdFreq);
-        }
-      }
-      return;
-    }
-
-    st.houseMode = HouseMode::RUNNING;
-
-    if (now - st.housePidLastAt >= houseCtrl::PID_PERIOD) {
-      float dt = (now - st.housePidLastAt) / 1000.0f;
+  if (st.houseMode == HouseMode::BOOST_START) {
+    st.vfdFreq = constrain(houseCtrl::BOOST_FREQ, cfg.house.minFreq, cfg.house.maxFreq);
+    if (now - st.houseBoostStartAt >= houseCtrl::BOOST_DURATION_MS) {
+      st.houseMode = HouseMode::PID_RUN;
       st.housePidLastAt = now;
-      float error = cfg.house.setpointBar - tm.housePressure;
-      st.housePidIntegral += error * dt;
-      st.housePidIntegral = constrain(st.housePidIntegral, -houseCtrl::INTEGRAL_LIMIT, houseCtrl::INTEGRAL_LIMIT);
-      st.houseTargetFreq = cfg.house.minFreq + houseCtrl::PID_KP * error + houseCtrl::PID_KI * st.housePidIntegral;
-      st.houseTargetFreq = constrain(st.houseTargetFreq, cfg.house.minFreq, cfg.house.maxFreq);
+      st.houseTargetFreq = st.vfdFreq;
+      appendLog(st.logsHouse, "Дом: завершен буст, переход в PID");
+      appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_PI_START, tm.housePressure, st.vfdFreq);
     }
+    return;
+  }
 
-    if (!st.houseFreqLastStepAt || now - st.houseFreqLastStepAt >= houseCtrl::FREQ_STEP_DELAY) {
-      st.houseFreqLastStepAt = now;
-      float delta = st.houseTargetFreq - st.vfdFreq;
-      if (fabs(delta) <= houseCtrl::FREQ_STEP) st.vfdFreq = st.houseTargetFreq;
-      else st.vfdFreq += delta > 0 ? houseCtrl::FREQ_STEP : -houseCtrl::FREQ_STEP;
-      st.vfdFreq = constrain(st.vfdFreq, cfg.house.minFreq, cfg.house.maxFreq);
-    }
+  if (st.houseMode != HouseMode::STOP_CONFIRM) st.houseMode = HouseMode::PID_RUN;
 
-    if (st.houseManualMode != ManualMode::FORCE_ON && tm.housePressure >= cfg.house.hystOff) {
-      st.houseMode = HouseMode::STOPPING;
+  if (!st.housePidLastAt) st.housePidLastAt = now;
+  if (now - st.housePidLastAt >= houseCtrl::PID_PERIOD) {
+    float dt = (now - st.housePidLastAt) / 1000.0f;
+    st.housePidLastAt = now;
+    float error = cfg.house.setpointBar - tm.housePressure;
+    st.housePidIntegral += error * dt;
+    st.housePidIntegral = constrain(st.housePidIntegral, -houseCtrl::INTEGRAL_LIMIT, houseCtrl::INTEGRAL_LIMIT);
+    float pidTarget = cfg.house.minFreq + houseCtrl::PID_KP * error + houseCtrl::PID_KI * st.housePidIntegral;
+    pidTarget = constrain(pidTarget, cfg.house.minFreq, cfg.house.maxFreq);
+
+    float maxDelta = houseCtrl::PID_OUTPUT_SLEW_HZ_PER_S * dt;
+    float delta = pidTarget - st.vfdFreq;
+    if (fabs(delta) > maxDelta) pidTarget = st.vfdFreq + (delta > 0 ? maxDelta : -maxDelta);
+
+    st.houseTargetFreq = constrain(pidTarget, cfg.house.minFreq, cfg.house.maxFreq);
+    st.vfdFreq = st.houseTargetFreq;
+  }
+
+  if (st.houseManualMode != ManualMode::FORCE_ON) {
+    if (tm.housePressure >= cfg.house.maxPressure) {
+      st.houseMode = HouseMode::PROTECT_MAX_PRESSURE;
       st.vfdRun = false;
       st.vfdFreq = cfg.house.minFreq;
       st.houseLastStopAt = now;
+      st.houseStopConfirmAt = 0;
       st.housePidLastAt = 0;
       st.housePidIntegral = 0;
       st.houseTargetFreq = cfg.house.minFreq;
-      st.houseSleepQualStartAt = 0;
-      appendLog(st.logsHouse, "Дом: остановка по верхнему порогу давления");
+      st.houseLastStopReason = HouseStopReason::PROTECT_MAX_PRESSURE;
+      appendLog(st.logsHouse, "Дом: защитная остановка по P_MAX");
       return;
     }
 
-    bool minRunDone = (now - st.houseStartAt) >= houseCtrl::MIN_RUN_MS;
-    bool lowSpeed = st.vfdFreq <= (cfg.house.minFreq + houseCtrl::SLEEP_FREQ_BAND);
-    bool pressureHigh = tm.housePressure >= (cfg.house.setpointBar + houseCtrl::PRESSURE_SLEEP_BAND);
-    bool pressureNearSetpoint = tm.housePressure >= (cfg.house.setpointBar - houseCtrl::PRESSURE_SLEEP_NEAR_SETPOINT_BAND);
-    bool pressureStable = fabs(st.housePressureRate) <= houseCtrl::SLEEP_DERIVATIVE_MAX;
-    bool sleepCondition = minRunDone && lowSpeed && pressureStable && (pressureHigh || pressureNearSetpoint);
-
-    if (sleepCondition && st.houseManualMode != ManualMode::FORCE_ON) {
-      if (!st.houseSleepQualStartAt) st.houseSleepQualStartAt = now;
-      if (now - st.houseSleepQualStartAt >= houseCtrl::SLEEP_QUALIFY_MS) {
-        st.houseMode = HouseMode::STOPPING;
+    if (tm.housePressure >= cfg.house.stopPressure) {
+      if (!st.houseStopConfirmAt) st.houseStopConfirmAt = now;
+      st.houseMode = HouseMode::STOP_CONFIRM;
+      if (now - st.houseStopConfirmAt >= cfg.house.stopConfirmMs) {
+        st.houseMode = HouseMode::STOPPED;
         st.vfdRun = false;
         st.vfdFreq = cfg.house.minFreq;
         st.houseLastStopAt = now;
         st.housePidLastAt = 0;
-        st.houseSleepQualStartAt = 0;
+        st.housePidIntegral = 0;
+        st.houseTargetFreq = cfg.house.minFreq;
+        st.houseStopConfirmAt = 0;
         st.houseAutoRestartAttempts = 0;
         st.houseAutoRestartOkSince = 0;
-        appendLog(st.logsHouse, "Дом: остановка по sleep-логике (нет расхода)");
+        st.houseLastStopReason = HouseStopReason::STOP_CONFIRM;
+        appendLog(st.logsHouse, "Дом: остановка — давление >= порога подтверждения");
+        return;
       }
     } else {
-      st.houseSleepQualStartAt = 0;
+      st.houseStopConfirmAt = 0;
+      if (st.houseMode == HouseMode::STOP_CONFIRM) st.houseMode = HouseMode::PID_RUN;
     }
-  } else {
-    if (st.houseMode == HouseMode::STOPPING) st.houseMode = HouseMode::READY;
-    st.housePidLastAt = 0;
-    st.housePressureDryStartAt = 0;
-    st.houseSleepQualStartAt = 0;
-    st.houseAutoRestartOkSince = 0;
   }
 
-  if (st.vfdRun && st.houseMode == HouseMode::RUNNING && !st.houseAlarm) {
+  if (st.vfdRun && (st.houseMode == HouseMode::PID_RUN || st.houseMode == HouseMode::STOP_CONFIRM) && !st.houseAlarm) {
     if (!st.houseAutoRestartOkSince) st.houseAutoRestartOkSince = now;
     if (st.houseAutoRestartAttempts > 0 && (now - st.houseAutoRestartOkSince) >= houseCtrl::RESTART_RESET_OK_MS) {
       st.houseAutoRestartAttempts = 0;
@@ -1747,18 +1752,17 @@ void runHouseAutoRestart(unsigned long now) {
   st.houseAutoRestartPending = false;
   st.houseAutoRestartAt = 0;
   st.houseAlarm = false;
-  st.houseMode = HouseMode::STARTING;
+  st.houseMode = HouseMode::BOOST_START;
   st.vfdRun = true;
-  st.vfdFreq = cfg.house.minFreq;
   st.houseStartAt = now;
+  st.houseBoostStartAt = now;
   st.houseInitialPressure = tm.housePressure;
-  st.housePressureRiseOk = false;
   st.housePressureDryStartAt = 0;
+  st.houseStopConfirmAt = 0;
   st.housePidLastAt = 0;
-  st.houseFreqLastStepAt = 0;
-  st.houseSleepQualStartAt = 0;
   st.housePidIntegral = 0;
-  st.houseTargetFreq = cfg.house.minFreq;
+  st.houseTargetFreq = constrain(houseCtrl::BOOST_FREQ, cfg.house.minFreq, cfg.house.maxFreq);
+  st.vfdFreq = st.houseTargetFreq;
   st.houseOverloadStart = 0;
   st.houseDryStart = 0;
 
@@ -1812,6 +1816,7 @@ void runProtections(unsigned long now) {
       st.vfdRun = false;
       st.houseManualMode = ManualMode::AUTO;
       st.houseMode = HouseMode::FAULT;
+      st.houseLastStopReason = HouseStopReason::FAULT;
       appendLog(st.logsHouse, "Дом: авария — аварийная перегрузка по току");
     }
 
@@ -1822,11 +1827,12 @@ void runProtections(unsigned long now) {
         st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::STOPPED;
         st.houseAlarm = true;
+        st.houseLastStopReason = HouseStopReason::FAULT;
+        st.houseLastStopReason = HouseStopReason::FAULT;
         st.houseOverloadStart = 0;
         st.houseDryStart = 0;
         st.housePressureDryStartAt = 0;
         st.houseStartAt = 0;
-        st.housePressureRiseOk = false;
         st.houseAutoRestartReason = HouseAutoRestartReason::OVERLOAD;
         if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
           st.houseAutoRestartAttempts++;
@@ -1858,7 +1864,6 @@ void runProtections(unsigned long now) {
         st.houseDryStart = 0;
         st.housePressureDryStartAt = 0;
         st.houseStartAt = 0;
-        st.housePressureRiseOk = false;
         st.houseAutoRestartReason = HouseAutoRestartReason::DRY_RUN;
         if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
           st.houseAutoRestartAttempts++;
@@ -1879,46 +1884,14 @@ void runProtections(unsigned long now) {
       }
     } else st.houseDryStart = 0;
 
-    if (!st.housePressureRiseOk && st.houseStartAt) {
-      if (tm.housePressure > st.houseInitialPressure + houseCtrl::PRESSURE_RISE_THRESHOLD) {
-        st.housePressureRiseOk = true;
-      } else if (now - st.houseStartAt >= houseCtrl::DRY_PRESSURE_START_TIMEOUT) {
-        st.vfdRun = false;
-        st.houseManualMode = ManualMode::AUTO;
-        st.houseMode = HouseMode::STOPPED;
-        st.houseAlarm = true;
-        st.houseOverloadStart = 0;
-        st.houseDryStart = 0;
-        st.housePressureDryStartAt = 0;
-        st.houseStartAt = 0;
-        st.housePressureRiseOk = false;
-        st.houseAutoRestartReason = HouseAutoRestartReason::DRY_RUN;
-        if (st.houseAutoRestartAttempts < houseCtrl::AUTO_RESTART_MAX) {
-          st.houseAutoRestartAttempts++;
-          st.houseAutoRestartPending = true;
-          st.houseAutoRestartAt = now + houseCtrl::AUTO_RESTART_DELAY_MS;
-          appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 8 с после старта");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_DRY, tm.housePressure, st.houseAutoRestartAttempts);
-        } else {
-          st.houseBlocked = true;
-          st.houseMode = HouseMode::FAULT;
-          st.houseAutoRestartPending = false;
-          st.houseAutoRestartAt = 0;
-          st.houseAutoRestartReason = HouseAutoRestartReason::NONE;
-          appendLog(st.logsHouse, "Дом: блокировка после 3 автоперезапусков");
-          appendEventLog(eventLog::SRC_HOUSE, eventCode::HOUSE_BLOCKED, st.houseAutoRestartAttempts,
-                         static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
-        }
-      }
-    }
-
-    if (tm.housePressure <= cfg.house.hystOn) {
+    if (tm.housePressure <= cfg.house.startPressure) {
       if (!st.housePressureDryStartAt) st.housePressureDryStartAt = now;
       if (now - st.housePressureDryStartAt > houseCtrl::DRY_PRESSURE_WORK_TIMEOUT) {
         st.houseBlocked = st.houseAlarm = true;
         st.vfdRun = false;
         st.houseManualMode = ManualMode::AUTO;
         st.houseMode = HouseMode::FAULT;
+        st.houseLastStopReason = HouseStopReason::FAULT;
         appendLog(st.logsHouse, "Дом: сухой ход — давление не выросло за 10 с");
       }
     } else {
@@ -1929,12 +1902,11 @@ void runProtections(unsigned long now) {
     st.houseDryStart = 0;
     st.housePressureDryStartAt = 0;
     st.houseStartAt = 0;
-    st.housePressureRiseOk = false;
   }
 }
 
 String buildJsonState() {
-  StaticJsonDocument<3328> doc;
+  StaticJsonDocument<4096> doc;
   const unsigned long now = millis();
   const unsigned long pauseElapsed = wellPauseElapsedMs(now);
   const unsigned long pauseRemaining = wellPauseRemainingMs(now);
@@ -1950,6 +1922,8 @@ String buildJsonState() {
   doc["pause_elapsed_ms"] = pauseElapsed;
   doc["pause_remaining_ms"] = pauseRemaining;
   doc["pause_active_remaining_ms"] = pauseRemaining;
+  doc["pause_config_minutes"] = st.pauseMs / 60000.0f;
+  doc["pause_remaining_minutes"] = pauseRemaining / 60000.0f;
   doc["pause_active"] = isWellPauseActive(now);
   doc["well_wait_reason"] = wellStartBlockReason(now);
   doc["well_start_block_reason"] = wellStartBlockReason(now);
@@ -1975,6 +1949,27 @@ String buildJsonState() {
   doc["house_auto_restart_pending"] = st.houseAutoRestartPending;
   doc["house_auto_restart_at"] = st.houseAutoRestartAt;
   doc["house_auto_restart_reason"] = (int)st.houseAutoRestartReason;
+  const bool houseStartupActive = st.vfdRun && st.houseMode == HouseMode::BOOST_START;
+  const bool houseStopConfirmActive = st.vfdRun && st.houseStopConfirmAt > 0 && st.houseManualMode != ManualMode::FORCE_ON;
+  unsigned long houseStopConfirmRemaining = 0;
+  if (houseStopConfirmActive) {
+    const unsigned long elapsed = now - st.houseStopConfirmAt;
+    houseStopConfirmRemaining = elapsed >= cfg.house.stopConfirmMs ? 0 : (cfg.house.stopConfirmMs - elapsed);
+  }
+  doc["house_mode_label"] = houseModeStateName(st.houseMode);
+  doc["house_state"] = houseModeStateName(st.houseMode);
+  doc["house_startup_active"] = houseStartupActive;
+  doc["house_pid_active"] = st.vfdRun && (st.houseMode == HouseMode::PID_RUN || st.houseMode == HouseMode::STOP_CONFIRM);
+  doc["house_stop_confirm_active"] = houseStopConfirmActive;
+  doc["house_stop_confirm_remaining_ms"] = houseStopConfirmRemaining;
+  doc["house_target_freq"] = st.houseTargetFreq;
+  doc["house_actual_freq"] = st.vfdFreq;
+  doc["house_last_stop_reason"] = (int)st.houseLastStopReason;
+  doc["house_start_pressure"] = cfg.house.startPressure;
+  doc["house_setpoint_pressure"] = cfg.house.setpointBar;
+  doc["house_stop_pressure"] = cfg.house.stopPressure;
+  doc["house_max_pressure"] = cfg.house.maxPressure;
+  doc["house_stop_confirm_ms"] = cfg.house.stopConfirmMs;
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
@@ -2110,7 +2105,7 @@ void initWeb() {
       return;
     }
 
-    StaticJsonDocument<3328> doc;
+    StaticJsonDocument<4096> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
       server.send(400, "text/plain", "Bad JSON");
