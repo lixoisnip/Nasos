@@ -774,18 +774,26 @@ unsigned long wellPauseRemainingMs(unsigned long now) {
   return elapsed >= pauseMs ? 0 : (pauseMs - elapsed);
 }
 
+bool isWellPauseCountdownActive(unsigned long now) {
+  return st.wellPauseStart != 0 && wellPauseRemainingMs(now) > 0;
+}
+
 bool isWellPauseActive(unsigned long now) {
   if (st.wellMode != WellMode::WAIT || st.wellRelay || st.wellBlocked || st.pressureBlock || !tm.valid) return false;
 
   const bool forceOn = st.wellManualMode == ManualMode::FORCE_ON;
   const bool forceOff = st.wellManualMode == ManualMode::FORCE_OFF;
   const bool needPump = forceOn || (!forceOff && st.needPump);
-  return needPump && wellPauseRemainingMs(now) > 0;
+  return needPump && isWellPauseCountdownActive(now);
+}
+
+bool canWellStartInWaitMode(unsigned long now, bool needPump) {
+  return needPump && !isWellPauseCountdownActive(now);
 }
 
 bool resetWellPauseTimer(const String& reason = "") {
   const unsigned long now = millis();
-  const bool hadPause = st.wellPauseStart != 0 && wellPauseRemainingMs(now) > 0;
+  const bool hadPause = isWellPauseCountdownActive(now);
   st.wellPauseStart = 0;
   if (hadPause && reason.length()) appendLog(st.logsWell, reason);
   return hadPause;
@@ -1401,7 +1409,7 @@ void runWellLogic(unsigned long now) {
   bool forceOff = st.wellManualMode == ManualMode::FORCE_OFF;
   bool needPump = forceOn || (!forceOff && st.needPump);
 
-  if (st.wellMode == WellMode::WAIT && needPump && !st.wellRelay && (now - st.wellPauseStart >= (unsigned long)st.pauseMs)) {
+  if (st.wellMode == WellMode::WAIT && !st.wellRelay && canWellStartInWaitMode(now, needPump)) {
     st.wellRelay = true;
     st.wellStartAttempt = now;
     st.startCurrentOk = false;
