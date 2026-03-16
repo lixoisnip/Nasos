@@ -63,11 +63,9 @@
           <h5>Скважинный насос — <span class="pump-state" id="well_status">Ждёт</span></h5>
           <p>Ток: <b id="well_current">0 A</b></p>
           <p>Давление: <b id="well_pressure">0 bar</b></p>
-          <p>Работа: <b id="last_work_sec">0 s</b></p>
-          <p>Пауза (настроено): <b id="pause_ms">0 ms</b></p>
-          <p>Пауза (настроено, мин): <b id="pause_minutes">0.0 min</b></p>
-          <p>Осталось по паузе: <b id="pause_remaining_ms">0 ms</b></p>
-          <p>Осталось по паузе (мин): <b id="pause_remaining_minutes">0.0 min</b></p>
+          <p>Время работы: <b id="well_run_minutes">0.0 min</b></p>
+          <p>Пауза: <b id="pause_minutes">0.0 min</b></p>
+          <p>Осталось по паузе: <b id="pause_remaining_minutes">0.0 min</b></p>
           <p>Причина ожидания: <b id="well_wait_reason">—</b></p>
           <p>Объём: <b id="total_liters">0 L</b></p>
           <p>Авария: <b id="well_alarm">Нет</b></p>
@@ -181,7 +179,10 @@
       ['pauseMaxMs', 'Общее: максимальная пауза, мс', 'number', '1'],
       ['LEVEL_FILTER_MS', 'Общее: LEVEL_FILTER_MS', 'number', '1'],
       ['INIT_DELAY_MS', 'Общее: INIT_DELAY_MS', 'number', '1'],
-      ['THRESH', 'Общее: THRESH', 'number', '0.01']
+      ['THRESH', 'Общее: THRESH', 'number', '0.01'],
+      ['filter_pressure_min', 'Фильтр: минимальное давление, bar', 'number', '0.01'],
+      ['filter_pressure_warn', 'Фильтр: предупреждение по давлению, bar', 'number', '0.01'],
+      ['filter_pressure_max', 'Фильтр: максимальное давление, bar', 'number', '0.01']
     ],
     network: [
       ['wifiSsid', 'WiFi STA: имя сети', 'text', ''],
@@ -337,11 +338,12 @@
     document.getElementById('well_pressure').innerText = `${(data.well_pressure || 0).toFixed(2)} bar`;
     document.getElementById('house_current').innerText = `${(data.house_current || 0).toFixed(1)} A`;
     document.getElementById('house_pressure').innerText = `${(data.house_pressure || 0).toFixed(2)} bar`;
-    document.getElementById('last_work_sec').innerText = `${data.last_work_sec || 0} s`;
-    document.getElementById('pause_ms').innerText = `${Math.round(data.pause_config_ms ?? data.pause_ms ?? 0)} ms`;
-    document.getElementById('pause_remaining_ms').innerText = `${Math.max(0, Math.round(data.pause_active_remaining_ms ?? data.pause_remaining_ms ?? 0))} ms`;
     document.getElementById('pause_minutes').innerText = `${((data.pause_config_minutes ?? ((data.pause_config_ms ?? data.pause_ms ?? 0) / 60000)) || 0).toFixed(1)} min`;
     document.getElementById('pause_remaining_minutes').innerText = `${((data.pause_remaining_minutes ?? ((data.pause_active_remaining_ms ?? data.pause_remaining_ms ?? 0) / 60000)) || 0).toFixed(1)} min`;
+    const wellRunMinutes = Number(data.well_mode) === 2
+      ? Number(data.well_run_minutes ?? ((data.well_run_ms_current_cycle ?? 0) / 60000))
+      : Number(data.well_last_run_minutes ?? ((data.last_work_sec ?? 0) / 60));
+    document.getElementById('well_run_minutes').innerText = `${(wellRunMinutes || 0).toFixed(1)} min`;
     document.getElementById('well_wait_reason').innerText = waitReasonLabel(data.well_start_block_reason || data.well_wait_reason);
     document.getElementById('total_liters').innerText = `${Math.round(data.total_liters || 0)} L`;
     document.getElementById('well_alarm').innerText = data.well_alarm ? 'Да' : 'Нет';

@@ -108,6 +108,9 @@ struct CommonConfig {
   unsigned long levelFilterMs;
   unsigned long initDelayMs;
   float thresh;
+  float filterPressureMin;
+  float filterPressureWarn;
+  float filterPressureMax;
 };
 
 struct NetworkConfig {
@@ -224,12 +227,12 @@ const WellConfig well = {
 };
 
 const HouseConfig house = {
-  0.90f,
-  0.50f,
-  1.00f,
+  0.70f,
+  0.30f,
+  0.85f,
   1.20f,
-  15000UL,
-  28.0f,
+  5000UL,
+  37.0f,
   50.0f,
   0.4f,
   1.3f,
@@ -243,7 +246,10 @@ const CommonConfig common = {
   5400000.0f,
   2000UL,
   6000UL,
-  0.10f
+  0.10f,
+  0.30f,
+  1.20f,
+  1.50f
 };
 
 const NetworkConfig network = {
@@ -468,7 +474,7 @@ struct Settings {
 struct Controller {
   bool wellRelay = false;
   bool vfdRun = false;
-  float vfdFreq = 28.0f;
+  float vfdFreq = 37.0f;
 
   bool wellBlocked = false;
   bool wellAlarm = false;
@@ -495,7 +501,7 @@ struct Controller {
   unsigned long housePressureDryStartAt = 0;
   float houseInitialPressure = 0;
   float housePidIntegral = 0;
-  float houseTargetFreq = 28.0f;
+  float houseTargetFreq = 37.0f;
   uint8_t houseAutoRestartAttempts = 0;
   unsigned long houseAutoRestartOkSince = 0;
   unsigned long houseAutoRestartAt = 0;
@@ -952,6 +958,9 @@ void saveSettingsToPrefs() {
   settingsPrefs.putULong("c_lvl_ms", cfg.common.levelFilterMs);
   settingsPrefs.putULong("c_init_ms", cfg.common.initDelayMs);
   settingsPrefs.putFloat("c_thresh", cfg.common.thresh);
+  settingsPrefs.putFloat("c_fmin", cfg.common.filterPressureMin);
+  settingsPrefs.putFloat("c_fwarn", cfg.common.filterPressureWarn);
+  settingsPrefs.putFloat("c_fmax", cfg.common.filterPressureMax);
 
   settingsPrefs.putString("n_sta_ssid", cfg.network.wifiSsid);
   settingsPrefs.putString("n_sta_pass", cfg.network.wifiPass);
@@ -986,9 +995,17 @@ void loadSettingsFromPrefs() {
   cfg.common.levelFilterMs = settingsPrefs.getULong("c_lvl_ms", cfg.common.levelFilterMs);
   cfg.common.initDelayMs = settingsPrefs.getULong("c_init_ms", cfg.common.initDelayMs);
   cfg.common.thresh = settingsPrefs.getFloat("c_thresh", cfg.common.thresh);
+  cfg.common.filterPressureMin = settingsPrefs.getFloat("c_fmin", cfg.common.filterPressureMin);
+  cfg.common.filterPressureWarn = settingsPrefs.getFloat("c_fwarn", cfg.common.filterPressureWarn);
+  cfg.common.filterPressureMax = settingsPrefs.getFloat("c_fmax", cfg.common.filterPressureMax);
   cfg.common.pauseMinMs = constrain(cfg.common.pauseMinMs, 600000.0f, 7200000.0f);
   cfg.common.pauseMaxMs = constrain(cfg.common.pauseMaxMs, 600000.0f, 10800000.0f);
+  cfg.common.filterPressureMin = constrain(cfg.common.filterPressureMin, 0.0f, 10.0f);
+  cfg.common.filterPressureWarn = constrain(cfg.common.filterPressureWarn, 0.0f, 10.0f);
+  cfg.common.filterPressureMax = constrain(cfg.common.filterPressureMax, 0.0f, 10.0f);
   if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
+  if (cfg.common.filterPressureWarn < cfg.common.filterPressureMin) cfg.common.filterPressureWarn = cfg.common.filterPressureMin;
+  if (cfg.common.filterPressureMax < cfg.common.filterPressureWarn) cfg.common.filterPressureMax = cfg.common.filterPressureWarn;
 
   cfg.network.wifiSsid = settingsPrefs.getString("n_sta_ssid", cfg.network.wifiSsid);
   cfg.network.wifiPass = settingsPrefs.getString("n_sta_pass", cfg.network.wifiPass);
@@ -1024,12 +1041,17 @@ bool applySingleSetting(const String& key, float value) {
   else if (key == "LEVEL_FILTER_MS" || key == "common.LEVEL_FILTER_MS") cfg.common.levelFilterMs = (unsigned long)constrain(value, 0.0f, 30000.0f);
   else if (key == "INIT_DELAY_MS" || key == "common.INIT_DELAY_MS") cfg.common.initDelayMs = (unsigned long)constrain(value, 0.0f, 60000.0f);
   else if (key == "THRESH" || key == "common.THRESH") cfg.common.thresh = constrain(value, 0.0f, 5.0f);
+  else if (key == "filter_pressure_min" || key == "common.filter_pressure_min") cfg.common.filterPressureMin = constrain(value, 0.0f, 10.0f);
+  else if (key == "filter_pressure_warn" || key == "common.filter_pressure_warn") cfg.common.filterPressureWarn = constrain(value, 0.0f, 10.0f);
+  else if (key == "filter_pressure_max" || key == "common.filter_pressure_max") cfg.common.filterPressureMax = constrain(value, 0.0f, 10.0f);
   else return false;
 
   if (cfg.house.minFreq > cfg.house.maxFreq) cfg.house.maxFreq = cfg.house.minFreq;
   if (cfg.house.startPressure > cfg.house.stopPressure) cfg.house.stopPressure = cfg.house.startPressure;
   if (cfg.house.stopPressure > cfg.house.maxPressure) cfg.house.maxPressure = cfg.house.stopPressure;
   if (cfg.common.pauseMinMs > cfg.common.pauseMaxMs) cfg.common.pauseMaxMs = cfg.common.pauseMinMs;
+  if (cfg.common.filterPressureWarn < cfg.common.filterPressureMin) cfg.common.filterPressureWarn = cfg.common.filterPressureMin;
+  if (cfg.common.filterPressureMax < cfg.common.filterPressureWarn) cfg.common.filterPressureMax = cfg.common.filterPressureWarn;
   return true;
 }
 
@@ -1067,7 +1089,7 @@ bool tryParseStrictFloat(const String& raw, float& outValue, String& reason) {
 }
 
 String buildJsonSettings() {
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<3072> doc;
   JsonObject c1 = doc.createNestedObject("cfg");
   c1["dryCurrent"] = cfg.well.dryCurrent;
   c1["overloadCurrent"] = cfg.well.overloadCurrent;
@@ -1100,6 +1122,9 @@ String buildJsonSettings() {
   c3["LEVEL_FILTER_MS"] = cfg.common.levelFilterMs;
   c3["INIT_DELAY_MS"] = cfg.common.initDelayMs;
   c3["THRESH"] = cfg.common.thresh;
+  c3["filter_pressure_min"] = cfg.common.filterPressureMin;
+  c3["filter_pressure_warn"] = cfg.common.filterPressureWarn;
+  c3["filter_pressure_max"] = cfg.common.filterPressureMax;
 
   JsonObject net = doc.createNestedObject("network");
   net["wifiSsid"] = cfg.network.wifiSsid;
@@ -1772,8 +1797,8 @@ void runHouseAutoRestart(unsigned long now) {
 }
 
 void runProtections(unsigned long now) {
-  st.filterWarning = tm.wellPressure >= wellCtrl::PRESSURE_WARNING;
-  if (tm.wellPressure >= wellCtrl::PRESSURE_BLOCK) {
+  st.filterWarning = tm.wellPressure >= cfg.common.filterPressureWarn;
+  if (tm.wellPressure >= cfg.common.filterPressureMax) {
     st.pressureBlock = true;
     st.wellAlarm = true;
     stopWellPump(now, "Скважина: авария — давление выше порога, работа запрещена", st.intention, false);
@@ -1916,7 +1941,13 @@ String buildJsonState() {
   doc["house_current_display"] = tm.houseCurrentDisplay;
   doc["house_current_protection"] = tm.houseCurrentProtection;
   doc["house_pressure"] = tm.housePressure;
+  const unsigned long wellRunMsCurrentCycle = st.wellRelay && st.wellRunStart ? (now - st.wellRunStart) : 0;
+  const float wellRunMinutes = wellRunMsCurrentCycle / 60000.0f;
+  const float wellLastRunMinutes = st.lastWorkSec / 60.0f;
   doc["last_work_sec"] = st.lastWorkSec;
+  doc["well_run_ms_current_cycle"] = wellRunMsCurrentCycle;
+  doc["well_run_minutes"] = wellRunMinutes;
+  doc["well_last_run_minutes"] = wellLastRunMinutes;
   doc["pause_config_ms"] = st.pauseMs;
   doc["pause_ms"] = st.pauseMs;
   doc["pause_elapsed_ms"] = pauseElapsed;
@@ -1970,6 +2001,9 @@ String buildJsonState() {
   doc["house_stop_pressure"] = cfg.house.stopPressure;
   doc["house_max_pressure"] = cfg.house.maxPressure;
   doc["house_stop_confirm_ms"] = cfg.house.stopConfirmMs;
+  doc["filter_pressure_min"] = cfg.common.filterPressureMin;
+  doc["filter_pressure_warn"] = cfg.common.filterPressureWarn;
+  doc["filter_pressure_max"] = cfg.common.filterPressureMax;
   doc["wifi_sta_connected"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_sta_ip"] = WiFi.localIP().toString();
   doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
