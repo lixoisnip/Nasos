@@ -365,7 +365,8 @@ constexpr uint8_t HEADER_LEN = 6;
 constexpr uint8_t CRC_LEN = 2;
 constexpr uint8_t COMMAND_FRAME_LEN = HEADER_LEN + COMMAND_PAYLOAD_LEN + CRC_LEN;
 constexpr uint8_t TELEMETRY_FRAME_LEN = HEADER_LEN + TELEMETRY_PAYLOAD_LEN + CRC_LEN;
-constexpr unsigned long TELEMETRY_STALE_MS = 2000UL;
+constexpr unsigned long COMM_LOSS_HOLD_MS = 2000UL;
+constexpr unsigned long COMM_LOSS_DETECT_GAP_MS = CMD_PERIOD_MS + RESPONSE_TIMEOUT_MS;
 constexpr unsigned long LOG_THROTTLE_MS = 5000UL;
 }
 
@@ -451,6 +452,9 @@ unsigned long lastTelemetryAgeMs = ULONG_MAX;
 unsigned long controllerBootMs = 0;
 bool linkHasTxErrors = false;
 bool startupInitDelayActive = false;
+bool commLossHoldActive = false;
+unsigned long commLossHoldRemainingMs = 0;
+bool telemetryStale = false;
 
 enum class NanoSyncStage : uint8_t {
   INIT_DELAY,
@@ -842,6 +846,7 @@ const char* wellStartBlockReason(unsigned long now) {
   if (nanoSyncStage == NanoSyncStage::FAILED && !hasEverReceivedTelemetry) return "NO_NANO_UART";
   if (st.wellMode == WellMode::STARTING) return "STARTING_IN_PROGRESS";
   if (st.wellManualMode == ManualMode::FORCE_OFF) return "FORCE_OFF";
+  if (commLossHoldActive) return "COMM_HOLD";
   if (!tm.valid) return hasEverReceivedTelemetry ? "NO_TELEMETRY" : "NO_NANO_UART";
   if (st.wellBlocked) return "WELL_BLOCKED";
   if (st.pressureBlock) return "PRESSURE_BLOCK";
@@ -2022,6 +2027,11 @@ String buildJsonState() {
   doc["link_bad_header"] = linkHealth.badHeaderCount;
   doc["link_bad_crc"] = linkHealth.badCrcCount;
   doc["lastTelemetryAgeMs"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
+  doc["telemetry_last_valid_age_ms"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
+  doc["telemetry_stale"] = telemetryStale;
+  doc["comm_loss_hold_active"] = commLossHoldActive;
+  doc["comm_loss_hold_remaining_ms"] = commLossHoldRemainingMs;
+  doc["comm_state"] = telemetryStale ? "NO_TELEMETRY" : (commLossHoldActive ? "COMM_HOLD" : "OK");
   doc["link_seq_gaps"] = linkHealth.seqGapCount;
   doc["link_tx_error_burst"] = linkHealth.txErrorBurstActive;
   doc["link_has_tx_errors"] = linkHasTxErrors;
@@ -2437,11 +2447,15 @@ void loop() {
           ? ((now >= linkHealth.lastValidPacketMs) ? (now - linkHealth.lastValidPacketMs) : 0UL)
           : 0UL;
   lastTelemetryAgeMs = hasEverReceivedTelemetry ? telemetryAgeMs : ULONG_MAX;
-  const bool telemetryFresh = hasEverReceivedTelemetry && lastTelemetryAgeMs < nanoLink::TELEMETRY_STALE_MS;
   const bool txHealthy = !linkHealth.txErrorBurstActive;
-  const bool telemetryStale = !startupBootWaitActive && (!hasEverReceivedTelemetry || !telemetryFresh);
-  linkAlive = (startupBootWaitActive || telemetryFresh) && txHealthy;
-  linkHasTxErrors = hasEverReceivedTelemetry && telemetryFresh && !txHealthy;
+  const bool commLossDetected = !startupBootWaitActive && (hasEverReceivedTelemetry ? (telemetryAgeMs >= nanoLink::COMM_LOSS_DETECT_GAP_MS)
+                                                                                     : (nanoSyncStage == NanoSyncStage::FAILED));
+  commLossHoldActive = hasEverReceivedTelemetry && commLossDetected && telemetryAgeMs <= nanoLink::COMM_LOSS_HOLD_MS;
+  commLossHoldRemainingMs = commLossHoldActive ? (nanoLink::COMM_LOSS_HOLD_MS - telemetryAgeMs) : 0UL;
+  telemetryStale = commLossDetected && !commLossHoldActive;
+  const bool telemetryAccepted = !commLossDetected || commLossHoldActive;
+  linkAlive = (startupBootWaitActive || telemetryAccepted) && txHealthy;
+  linkHasTxErrors = hasEverReceivedTelemetry && telemetryAccepted && !txHealthy;
 
   if (telemetryStale) {
     tm.valid = false;
@@ -2465,7 +2479,7 @@ void loop() {
   LinkState linkState = LinkState::HEALTHY;
   if (linkHasTxErrors) {
     linkState = LinkState::DEGRADED;
-  } else if (telemetryStale || !txHealthy) {
+  } else if (telemetryStale || (!commLossHoldActive && !txHealthy)) {
     linkState = LinkState::LOST;
   }
 
