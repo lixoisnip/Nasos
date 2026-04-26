@@ -1,51 +1,64 @@
-# Nasos: Arduino Nano + ESP32
+# Автоматика на Arduino / Arduino Pump Automation
 
-## Обновлённая архитектура
+## RU
 
-1. **`esp32_controller.ino` (ESP32)**
-   - основная логика насосов и защит;
-   - веб-интерфейс (LittleFS + REST);
-   - **Modbus RTU / RS‑485 для VFD** через `UART2` + `MAX485`.
+Проект автоматизирует работу **скважинного** и **домашнего (через VFD)** насосов.
 
-2. **`v1.ino` (Arduino Nano)**
-   - только локальный I/O:
-     - уровни бака;
-     - аналоговые датчики (ток/давление);
-     - управление реле скважинного насоса;
-   - обмен с ESP32 по **I2C**.
+### Архитектура
+- **Arduino Nano (`v1.ino`)**: сбор уровней, токов, давления; управление реле скважинного насоса; I²C‑обмен с ESP32.
+- **ESP32 (`esp32_controller.ino` + модули)**: управляющая логика, защиты, Modbus RTU для VFD, веб‑интерфейс.
 
-## Подключение MAX485 к ESP32
+### Модули ESP32
+- `telemetry.{h,cpp}` — опрос Nano и VFD.
+- `settings.{h,cpp}` — загрузка/сохранение/валидация настроек и Wi‑Fi в LittleFS (`/settings.json`).
+- `control.{h,cpp}` — `runWellLogic`, `runHouseLogic`, защиты, антиспам команд VFD.
+- `web_server.{h,cpp}` — Async API, JSON состояния, сохранение настроек.
+- `modbus.{h,cpp}` — CRC, `vfdReadReg`/`vfdWriteReg`, таймауты.
+- `logging.{h,cpp}` — файловые логи, ротация, очистка/скачивание.
 
-- `ESP32 GPIO17 (TX2)` → `DI` (MAX485)
-- `ESP32 GPIO16 (RX2)` ← `RO` (MAX485) **через делитель**:
-  - `RO` → `10k` → `ESP32 RX`
-  - `ESP32 RX` → `20k` → `GND`
-- `RE` и `DE` объединены и подключены к `ESP32 GPIO27`
-  - `LOW` = приём
-  - `HIGH` = передача
-- Питание MAX485: `5V`
+### Подключение (основное)
+- ESP32 ↔ Nano (I²C): GPIO21(SDA), GPIO22(SCL), GND, адрес `0x10`.
+- ESP32 ↔ MAX485: TX2=GPIO17, RX2=GPIO16, DE/RE=GPIO27.
+- MAX485 ↔ VFD: RS‑485 A/B согласно документации VFD.
 
-## Связь ESP32 ↔ Nano (новая)
+### Требования
+- Arduino IDE 2.x или PlatformIO.
+- Для ESP32: библиотеки `ESPAsyncWebServer`, `AsyncTCP`, `ArduinoJson`.
+- Файловая система LittleFS.
 
-Используется I2C (Nano как slave):
+### Прошивка
+1. Прошить Nano скетчем `v1.ino`.
+2. Загрузить веб‑файлы из `data/` в LittleFS ESP32.
+3. Прошить ESP32 (все `.ino/.h/.cpp` в корне проекта).
 
-- `ESP32 GPIO21 (SDA)` ↔ `Nano A4 (SDA)`
-- `ESP32 GPIO22 (SCL)` ↔ `Nano A5 (SCL)`
-- общий `GND`
-- адрес Nano: `0x10`
+### Настройка Wi‑Fi
+- Параметры хранятся в `/settings.json`.
+- Если файла нет, создаются дефолты и поднимается AP `Nasos-ESP32`.
+- Изменение Wi‑Fi доступно через `/settings` в веб‑панели.
 
-Nano больше **не управляет VFD** и не содержит RS‑485/Modbus кода.
-
-## API ESP32
-
-- `GET /` — веб-интерфейс
-- `GET /state` — текущее состояние
-- `POST /set?param=SETPOINT_BAR&value=...` — уставка давления
+### API (кратко)
+- `GET /state`
+- `GET /settings`, `POST /settings`
+- `POST /pump` (`unit`, `action`)
 - `GET /logs_well`, `GET /logs_house`
-- `POST /emergency?value=1|0` — аварийный стоп/сброс
+- `POST /clear_logs_well`, `POST /clear_logs_house`
+- `GET /download_logs_well`, `GET /download_logs_house`
 
-## Примечания по стабильности
+---
 
-- Управление VFD и чтение обратной связи собраны в ESP32, что убирает двойную логику между контроллерами.
-- На Nano оставлен только детерминированный I/O-слой.
-- Основные защиты (сухой ход, перегрузка, отсутствие тока после старта, защита по давлению и аварийный стоп) сохранены в ESP32.
+## EN
+
+Automation project for **well pump** and **house pump via VFD**.
+
+### Components
+- **Arduino Nano**: sensor sampling + relay output + I²C slave.
+- **ESP32**: control/protection logic, VFD Modbus RTU, async web UI/API.
+
+### Build/Flash
+1. Flash `v1.ino` to Nano.
+2. Upload `data/` into ESP32 LittleFS.
+3. Flash ESP32 firmware from root sources.
+
+### Wi‑Fi
+Wi‑Fi credentials are stored in LittleFS (`/settings.json`) and editable via web API/UI.
+
