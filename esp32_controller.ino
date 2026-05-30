@@ -455,6 +455,7 @@ bool startupInitDelayActive = false;
 bool commLossHoldActive = false;
 unsigned long commLossHoldRemainingMs = 0;
 bool telemetryStale = false;
+bool commHardLossActive = false;
 
 enum class NanoSyncStage : uint8_t {
   INIT_DELAY,
@@ -839,6 +840,13 @@ bool canWellStartInWaitMode(unsigned long now, bool needPump) {
   return needPump && !isWellPauseCountdownActive(now);
 }
 
+bool isWellForceOnMode() {
+  return st.wellManualMode == ManualMode::FORCE_ON;
+}
+
+bool canWellForceOnIgnoreSoftCommHold() {
+  return isWellForceOnMode() && commLossHoldActive && !commHardLossActive && tm.valid;
+}
 
 const char* wellStartBlockReason(unsigned long now) {
   if (startupInitDelayActive) return "INIT_DELAY";
@@ -846,8 +854,10 @@ const char* wellStartBlockReason(unsigned long now) {
   if (nanoSyncStage == NanoSyncStage::FAILED && !hasEverReceivedTelemetry) return "NO_NANO_UART";
   if (st.wellMode == WellMode::STARTING) return "STARTING_IN_PROGRESS";
   if (st.wellManualMode == ManualMode::FORCE_OFF) return "FORCE_OFF";
-  if (commLossHoldActive) return "COMM_HOLD";
-  if (!tm.valid) return hasEverReceivedTelemetry ? "NO_TELEMETRY" : "NO_NANO_UART";
+  if (!tm.valid || commHardLossActive) return hasEverReceivedTelemetry ? "NO_TELEMETRY" : "NO_NANO_UART";
+  // COMM_HOLD is a soft UART gap: in FORCE_ON the last valid telemetry remains usable
+  // until the hard loss timeout expires, so the forced run is not reported as blocked.
+  if (commLossHoldActive && !canWellForceOnIgnoreSoftCommHold()) return "COMM_HOLD";
   if (st.wellBlocked) return "WELL_BLOCKED";
   if (st.pressureBlock) return "PRESSURE_BLOCK";
   if (st.wellAlarm || st.wellMode == WellMode::FAIL) return "WELL_ALARM";
@@ -2029,6 +2039,7 @@ String buildJsonState() {
   doc["lastTelemetryAgeMs"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
   doc["telemetry_last_valid_age_ms"] = lastTelemetryAgeMs == ULONG_MAX ? -1 : (long)lastTelemetryAgeMs;
   doc["telemetry_stale"] = telemetryStale;
+  doc["comm_hard_loss_active"] = commHardLossActive;
   doc["comm_loss_hold_active"] = commLossHoldActive;
   doc["comm_loss_hold_remaining_ms"] = commLossHoldRemainingMs;
   doc["comm_state"] = telemetryStale ? "NO_TELEMETRY" : (commLossHoldActive ? "COMM_HOLD" : "OK");
@@ -2450,9 +2461,13 @@ void loop() {
   const bool txHealthy = !linkHealth.txErrorBurstActive;
   const bool commLossDetected = !startupBootWaitActive && (hasEverReceivedTelemetry ? (telemetryAgeMs >= nanoLink::COMM_LOSS_DETECT_GAP_MS)
                                                                                      : (nanoSyncStage == NanoSyncStage::FAILED));
+  // Split a short communication hold from a hard communication loss. FORCE_ON may
+  // continue through the soft hold using the latest telemetry, but the hard loss
+  // below still stops outputs fail-safe when Nano is silent beyond COMM_LOSS_HOLD_MS.
   commLossHoldActive = hasEverReceivedTelemetry && commLossDetected && telemetryAgeMs <= nanoLink::COMM_LOSS_HOLD_MS;
   commLossHoldRemainingMs = commLossHoldActive ? (nanoLink::COMM_LOSS_HOLD_MS - telemetryAgeMs) : 0UL;
-  telemetryStale = commLossDetected && !commLossHoldActive;
+  commHardLossActive = commLossDetected && !commLossHoldActive;
+  telemetryStale = commHardLossActive;
   const bool telemetryAccepted = !commLossDetected || commLossHoldActive;
   linkAlive = (startupBootWaitActive || telemetryAccepted) && txHealthy;
   linkHasTxErrors = hasEverReceivedTelemetry && telemetryAccepted && !txHealthy;
@@ -2484,13 +2499,17 @@ void loop() {
   }
 
   if (linkState != LinkState::HEALTHY) {
-    tm.valid = false;
+    const bool wellForceOnSoftCommWindow = isWellForceOnMode() && linkState == LinkState::DEGRADED &&
+                                           hasEverReceivedTelemetry && !commHardLossActive && tm.valid;
+    if (!wellForceOnSoftCommWindow) {
+      tm.valid = false;
+    }
     st.vfdRun = false;
     st.houseMode = HouseMode::STOPPED;
 
-    if (st.wellRelay) {
+    if (st.wellRelay && !wellForceOnSoftCommWindow) {
       stopWellPump(now, "Скважина: остановка — потеря связи с Nano (fail-safe)", st.intention, false);
-    } else if (!st.wellBlocked && !st.pressureBlock && st.wellMode != WellMode::STARTING) {
+    } else if (!wellForceOnSoftCommWindow && !st.wellBlocked && !st.pressureBlock && st.wellMode != WellMode::STARTING) {
       st.wellMode = WellMode::WAIT;
       resetWellRuntimeTimers();
     }
