@@ -312,8 +312,12 @@ constexpr float ZERO_CUTOFF_A = 0.10f;
 }
 
 namespace houseCurrentSense {
+// NOTE: must match the physical divider on Nano A0 documented in CODEX_FIX_REPORT.md
+// (VFD 0..10V output through 20k top / 10k bottom -> ADC node max ~3.33V).
+// The old assumption of a 0..5V ADC node (NANO_ADC_VREF = 5.0) halved the reconstructed
+// voltage and made the ESP32 effectively blind to real house pump current.
 constexpr float NANO_ADC_MAX = 1023.0f;
-constexpr float NANO_ADC_VREF = 5.0f;
+constexpr float NANO_ADC_VREF = 3.33f;                 // ADC node voltage at full-scale VFD output (divider 20k/10k vs 10V)
 constexpr float CURRENT_PER_ADC_VOLT = 2.0f;           // legacy Osnova mapping: current(A) = adcVoltage(V) * 2.0
 constexpr float CURRENT_CALIBRATION_GAIN = 1.0f;
 constexpr float CURRENT_CALIBRATION_OFFSET = 0.0f;
@@ -421,6 +425,7 @@ struct Telemetry {
   bool vfdRunFeedback = false;
   bool cmdStale = false;
   bool linkOk = false;
+  bool houseCurrentSensorFault = false;
   float vfdFreqFeedback = 0;
   bool valid = false;
 } tm;
@@ -1402,9 +1407,27 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
   NanoTelemetryPayload payload;
   memcpy(&payload, frame + nanoLink::HEADER_LEN, sizeof(payload));
 
+  // LOGIC BUG FIX: analogAuxRaw must NOT be a hard frame-rejection criterion.
+  // If the house-current sensor on Nano A0 is disconnected/faulty and reports raw ADC
+  // values above 1023 (or negative), every telemetry frame used to be discarded here.
+  // That blocked UART sync entirely (nanoReadyPacketStreak never reached READY) and made
+  // the ESP32 permanently "blind" to the house pump current — pressure/levels/current all
+  // showed zero even though the link itself was healthy.
+  // Now such frames are accepted; an out-of-range raw field is clamped for conversion and
+  // flagged via houseCurrentSensorFault for diagnostics.
+  bool auxOutOfRange = false;
+  if (payload.analogAuxRaw < 0 || payload.analogAuxRaw > 1023) {
+    auxOutOfRange = true;
+    static unsigned long lastAuxRangeWarnMs = 0;
+    if (now - lastAuxRangeWarnMs >= nanoLink::LOG_THROTTLE_MS) {
+      lastAuxRangeWarnMs = now;
+      Serial.println(String("[TELEM] analogAuxRaw out of ADC range: ") + String(payload.analogAuxRaw) + " (clamped)");
+    }
+    payload.analogAuxRaw = (int16_t)constrain((int)payload.analogAuxRaw, 0, 1023);
+  }
+
   const bool rangesOk =
       abs((int)payload.wellCurrentCentiA) <= 5000 &&
-      payload.analogAuxRaw >= 0 && payload.analogAuxRaw <= 1023 &&
       payload.wellPressureCentiBar >= -100 && payload.wellPressureCentiBar <= 1000 &&
       payload.housePressureCentiBar >= -100 && payload.housePressureCentiBar <= 1000;
   if (!rangesOk) {
@@ -1413,6 +1436,8 @@ bool parseNanoTelemetryFrame(const uint8_t* frame, size_t len, unsigned long now
     nanoReadyPacketStreak = 0;
     return false;
   }
+
+  tm.houseCurrentSensorFault = auxOutOfRange;
 
   if (!decodeTelemetryPayload(payload, now)) {
     linkHealth.invalidFrameCount++;
@@ -1955,6 +1980,7 @@ String buildJsonState() {
   doc["house_current"] = tm.houseCurrentDisplay;
   doc["house_current_display"] = tm.houseCurrentDisplay;
   doc["house_current_protection"] = tm.houseCurrentProtection;
+  doc["house_current_sensor_fault"] = tm.houseCurrentSensorFault;
   doc["house_pressure"] = tm.housePressure;
   const unsigned long wellRunMsCurrentCycle = st.wellRelay && st.wellRunStart ? (now - st.wellRunStart) : 0;
   const float wellRunMinutes = wellRunMsCurrentCycle / 60000.0f;
