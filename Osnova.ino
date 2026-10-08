@@ -15,7 +15,10 @@
 #define RELAY_WELL     3
 #define PIN_RS485_DE_RE 7
 #define ACS_PIN       A1    // Ток скважинного насоса
-#define PIN_CURRENT   A0    // Ток домашнего насоса
+// Домашний насос: датчик тока ACS712-30A вместо делителя 0-10В (тот же пин A0)
+#define HOUSE_ACS_PIN         A0      // Выход ACS712-30A домашнего насоса (был делитель 0-10В)
+#define HOUSE_ACS_SENSITIVITY 0.066f  // Чувствительность ACS712-30A, В/А
+#define HOUSE_ACS_ZERO_WINDOW 100     // Макс. отклонение нуля от 512 после калибровки (в единицах АЦП)
 #define PRESSURE_PIN  A2    // Давление скважинного насоса
 #define PIN_PRESSURE  A3    // Давление домашнего насоса
 #define L1            A4
@@ -121,7 +124,8 @@ enum class PumpIntention : uint8_t {
 };
 
 // Глобальные
-float currentZeroOffset = 512.0f;
+float currentZeroOffset = 512.0f;         // Ноль ACS712 скважинного насоса (A1)
+float houseCurrentZeroOffset = 512.0f;    // Ноль ACS712-30A домашнего насоса (A0)
 constexpr unsigned long LEVEL_FILTER_MS = 2000UL;
 constexpr unsigned long INIT_DELAY_MS   = 6000UL;
 
@@ -336,10 +340,14 @@ void readHouseSensors() {
   for (int i = 0; i < hs.SMOOTHING; i++) sum += hs.pressureBuffer[i];
   hs.pressureBar = sum / hs.SMOOTHING;
   
-  // Ток двигателя
-  raw = analogRead(PIN_CURRENT);
-  voltage = raw * 5.0f / 1023.0f;
-  hs.current = voltage * 2.0f;
+  // Ток двигателя (ACS712-30A, RMS по выборке вокруг нуля; вместо делителя 0-10В)
+  long sumSq = 0;
+  for (int i = 0; i < 120; i++) {
+    int diff = analogRead(HOUSE_ACS_PIN) - (int)houseCurrentZeroOffset;
+    sumSq += (long)diff * diff;
+  }
+  float rmsVolts = sqrt(sumSq / 120.0f) * 5.0f / 1023.0f;
+  hs.current = rmsVolts / HOUSE_ACS_SENSITIVITY;
   if (hs.current < 0.1f) hs.current = 0.0f;
 }
 
@@ -1003,6 +1011,12 @@ void setup() {
   for (int i = 0; i < 600; i++) { sum += analogRead(ACS_PIN); delay(2); }
   currentZeroOffset = sum / 600.0f;
   if (currentZeroOffset < 400 || currentZeroOffset > 600) currentZeroOffset = 512.0f;
+
+  // Калибровка нуля ACS712-30A домашнего насоса (пин A0, без тока ~ VCC/2)
+  sum = 0;
+  for (int i = 0; i < 600; i++) { sum += analogRead(HOUSE_ACS_PIN); delay(2); }
+  houseCurrentZeroOffset = sum / 600.0f;
+  if (fabs(houseCurrentZeroOffset - 512.0f) > HOUSE_ACS_ZERO_WINDOW) houseCurrentZeroOffset = 512.0f;
 
   // Инициализация домашнего насоса
   for (int i = 0; i < hs.SMOOTHING; i++) hs.pressureBuffer[i] = 0.0f;

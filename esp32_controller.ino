@@ -312,15 +312,18 @@ constexpr float ZERO_CUTOFF_A = 0.10f;
 }
 
 namespace houseCurrentSense {
+// Домашний насос: датчик тока ACS712-30A (пин A0 на Nano без изменений),
+// вместо аналогового выхода 0-10В через делитель.
 constexpr float NANO_ADC_MAX = 1023.0f;
 constexpr float NANO_ADC_VREF = 5.0f;
-constexpr float CURRENT_PER_ADC_VOLT = 2.0f;           // legacy Osnova mapping: current(A) = adcVoltage(V) * 2.0
+constexpr float ACS712_30A_SENSITIVITY_V_PER_A = 0.066f;  // Чувствительность ACS712-30A, В/А
+constexpr float CURRENT_PER_ADC_VOLT = 1.0f / ACS712_30A_SENSITIVITY_V_PER_A;  // current(A) = adcVoltage(V) / 0.066
 constexpr float CURRENT_CALIBRATION_GAIN = 1.0f;
 constexpr float CURRENT_CALIBRATION_OFFSET = 0.0f;
 constexpr float NEAR_ZERO_CLAMP_A = 0.08f;
 constexpr float PROTECTION_FILTER_ALPHA = 0.45f;
 constexpr float DISPLAY_FILTER_ALPHA = 0.20f;
-constexpr float MAX_SANE_CURRENT_A = 20.0f;
+constexpr float MAX_SANE_CURRENT_A = 30.0f;  // ACS712-30A: диапазон до 30 А
 }
 
 float normalizeTelemetryCurrent(float amps, float gain) {
