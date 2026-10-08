@@ -12,7 +12,10 @@
 // Original project pins (unchanged wiring)
 #define RELAY_WELL        3
 #define ACS_PIN           A1
-#define PIN_CURRENT       A0
+// Домашний насос: датчик тока ACS712-30A вместо делителя 0-10В (тот же пин A0)
+#define PIN_CURRENT       A0      // Выход ACS712-30A домашнего насоса (был делитель 0-10В)
+#define HOUSE_ACS_SENSITIVITY 0.066f  // Чувствительность ACS712-30A, В/А
+#define HOUSE_ACS_ZERO_WINDOW   100   // Макс. отклонение нуля от 512 после калибровки (в единицах АЦП)
 #define PRESSURE_PIN      A2
 #define PIN_PRESSURE      A3
 #define L1                4
@@ -110,6 +113,7 @@ struct NanoState {
 
   // Runtime
   float currentZeroOffset = 512.0f;
+  float houseCurrentZeroOffset = 512.0f;
   unsigned long levelFilterMs = LEVEL_FILTER_MS_DEFAULT;
   int levelThresh = LEVEL_THRESH_DEFAULT;
   unsigned long lastTelemetry = 0;
@@ -193,12 +197,18 @@ float readWellCurrent() {
   return amps < 0.10f ? 0.0f : amps;
 }
 
+// Домашний насос: ACS712-30A на PIN_CURRENT (A0) — RMS тока вокруг нуля датчика.
+// Формула подобрана так, чтобы значение, передаваемое в поле analogAuxRaw,
+// проходило через НЕИЗМЕННУЮ конвертацию ESP32 (V*2.0) и давало реальные амперы:
+// amps = rmsVoltage / 0.066;  analogAuxRaw = amps * 0.066 * 1023 / 5.0 (= "эквивалентное напряжение" АЦП)
 float readAuxAnalog() {
-  unsigned int sum = 0;
+  long sumSq = 0;
   for (uint8_t i = 0; i < HOUSE_CURRENT_AVG_SAMPLES; i++) {
-    sum += (unsigned int)analogRead(PIN_CURRENT);
+    float delta = analogRead(PIN_CURRENT) - ns.houseCurrentZeroOffset;
+    sumSq += (long)(delta * delta);
   }
-  return (float)sum / HOUSE_CURRENT_AVG_SAMPLES;
+  float rmsRaw = sqrt((float)sumSq / HOUSE_CURRENT_AVG_SAMPLES);
+  return constrain(rmsRaw, 0.0f, 1023.0f);
 }
 
 float readWellPressureBar() {
@@ -534,6 +544,19 @@ void setup() {
   if (ns.currentZeroOffset < 400 || ns.currentZeroOffset > 600) ns.currentZeroOffset = 512.0f;
   Serial.print(F("[BOOT] Current zero offset="));
   Serial.println(ns.currentZeroOffset);
+
+  // Калибровка нуля ACS712-30A домашнего насоса (PIN_CURRENT, без тока ~ VCC/2)
+  Serial.println(F("[BOOT] Calibrating house ACS712-30A zero offset (600 samples)..."));
+  sum = 0;
+  for (int i = 0; i < 600; i++) {
+    sum += analogRead(PIN_CURRENT);
+    if ((i % 50) == 0) feedWatchdog();
+    delay(2);
+  }
+  ns.houseCurrentZeroOffset = sum / 600.0f;
+  if (fabs(ns.houseCurrentZeroOffset - 512.0f) > HOUSE_ACS_ZERO_WINDOW) ns.houseCurrentZeroOffset = 512.0f;
+  Serial.print(F("[BOOT] House current zero offset="));
+  Serial.println(ns.houseCurrentZeroOffset);
 
   wdt_enable(WDTO_4S);
   feedWatchdog();
