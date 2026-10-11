@@ -86,7 +86,20 @@ struct NanoTelemetryPayload {
 } __attribute__((packed));
 
 const uint8_t WELL_CURRENT_SAMPLES = 120;
-const uint8_t HOUSE_CURRENT_AVG_SAMPLES = 12;
+// Домашний ток (ACS712-30A, пин A0): RMS считается окном по ВРЕМЕНИ,
+// покрывающим целое число периодов сети 50 Гц (2 периода), иначе окно из
+// нескольких отсчётов АЦП (~1.25 мс = 1/16 периода) даёт показание
+// 0.16..1.41 от истинного RMS в зависимости от фазы выборки.
+const unsigned long HOUSE_CURRENT_WINDOW_US = 40000UL;      // 40 мс = 2 периода 50 Гц
+const float HOUSE_CURRENT_EMA_ALPHA = 0.30f;                // EMA между окнами RMS
+const unsigned long HOUSE_ZERO_RECALIB_REST_MS = 5000UL;    // непрерывный "без тока" режим для подстройки нуля
+const float HOUSE_ZERO_ADAPT_ALPHA = 0.02f;                 // шаг подстройки нуля
+// Коды HouseMode со стороны ESP32 (esp32_controller.ino):
+// WAIT_WATER=0, READY=2, STOPPED=5, FAULT=7 — режимы, в которых насос обесточен.
+const uint8_t HOUSE_MODE_WAIT_WATER = 0;
+const uint8_t HOUSE_MODE_READY = 2;
+const uint8_t HOUSE_MODE_STOPPED = 5;
+const uint8_t HOUSE_MODE_FAULT = 7;
 const uint8_t HOUSE_PRESSURE_AVG_SAMPLES = 6;
 const unsigned long LEVEL_FILTER_MS_DEFAULT = 2000;
 const int LEVEL_THRESH_DEFAULT = 700;
@@ -132,6 +145,10 @@ struct NanoState {
   bool houseBlocked = false;
   bool statusFromEsp = false;
   unsigned long statusUpdatedAt = 0;
+
+  // Подстройка нуля ACS712 домашнего насоса: время непрерывного пребывания
+  // в режиме без тока (WAIT_WATER/READY/STOPPED/FAULT)
+  unsigned long houseRestSince = 0;
 } ns;
 
 const unsigned long ESP_STATUS_TIMEOUT_MS = 5000;
@@ -198,17 +215,53 @@ float readWellCurrent() {
 }
 
 // Домашний насос: ACS712-30A на PIN_CURRENT (A0) — RMS тока вокруг нуля датчика.
+// ОКНО ПО ВРЕМЕНИ ~40 мс (2 периода 50 Гц, ~380 отсчётов АЦП): короткое окно из
+// 12 отсчётов (~1.25 мс = 1/16 периода) давало показание 0.16..1.41 от истинного
+// RMS в зависимости от фазы выборки и при телеметрии каждые 100 мс (5 периодов)
+// систематически завышало ток на бусте (50 Гц) ~в 1.4 раза -> ложные аварии.
 // Формула подобрана так, чтобы значение, передаваемое в поле analogAuxRaw,
 // проходило через НЕИЗМЕННУЮ конвертацию ESP32 (V*2.0) и давало реальные амперы:
 // amps = rmsVoltage / 0.066;  analogAuxRaw = amps * 0.066 * 1023 / 5.0 (= "эквивалентное напряжение" АЦП)
-float readAuxAnalog() {
-  long sumSq = 0;
-  for (uint8_t i = 0; i < HOUSE_CURRENT_AVG_SAMPLES; i++) {
-    float delta = analogRead(PIN_CURRENT) - ns.houseCurrentZeroOffset;
-    sumSq += (long)(delta * delta);
+float readAuxAnalog(unsigned long now) {
+  const unsigned long t0 = micros();
+  float sumSq = 0.0f;
+  float sumRaw = 0.0f;
+  uint16_t n = 0;
+
+  // Набор отсчётов окном по времени: ~380 шт за 40 мс = ровно 2 периода 50 Гц,
+  // поэтому среднее по квадратам не зависит от фазы выборки.
+  while ((unsigned long)(micros() - t0) < HOUSE_CURRENT_WINDOW_US) {
+    const float raw = analogRead(PIN_CURRENT);
+    const float delta = raw - ns.houseCurrentZeroOffset;
+    sumSq += delta * delta;
+    sumRaw += raw;
+    n++;
+    feedWatchdog();
   }
-  float rmsRaw = sqrt((float)sumSq / HOUSE_CURRENT_AVG_SAMPLES);
-  return constrain(rmsRaw, 0.0f, 1023.0f);
+
+  if (n == 0) return constrain(ns.houseCurrent, 0.0f, 1023.0f);
+
+  // Подстройка дрейфа нуля: если ESP32 непрерывно >=5 с держит режим без тока
+  // (WAIT_WATER/READY/STOPPED/FAULT), среднее отсчётов за окно = смещение нуля.
+  const bool restMode = (ns.houseMode == HOUSE_MODE_WAIT_WATER ||
+                         ns.houseMode == HOUSE_MODE_READY ||
+                         ns.houseMode == HOUSE_MODE_STOPPED ||
+                         ns.houseMode == HOUSE_MODE_FAULT);
+  if (restMode) {
+    if (ns.houseRestSince == 0) ns.houseRestSince = now;
+    if ((now - ns.houseRestSince) >= HOUSE_ZERO_RECALIB_REST_MS) {
+      const float meanRaw = sumRaw / (float)n;
+      ns.houseCurrentZeroOffset += HOUSE_ZERO_ADAPT_ALPHA * (meanRaw - ns.houseCurrentZeroOffset);
+    }
+  } else {
+    ns.houseRestSince = 0;
+  }
+
+  const float rmsRaw = sqrt(sumSq / (float)n);
+  // EMA между окнами: сглаживает одиночные выбросы, не искажая установившийся RMS.
+  ns.houseCurrent = HOUSE_CURRENT_EMA_ALPHA * rmsRaw +
+                    (1.0f - HOUSE_CURRENT_EMA_ALPHA) * ns.houseCurrent;
+  return constrain(ns.houseCurrent, 0.0f, 1023.0f);
 }
 
 float readWellPressureBar() {
@@ -261,7 +314,7 @@ bool readLevelFiltered(uint8_t idx, uint8_t pin, unsigned long now) {
 
 void readInputs(unsigned long now) {
   ns.wellCurrent = readWellCurrent();
-  ns.houseCurrent = readAuxAnalog();
+  ns.houseCurrent = readAuxAnalog(now);
   ns.wellPressureBar = readWellPressureBar();
   ns.housePressureBar = readHousePressureBar();
 

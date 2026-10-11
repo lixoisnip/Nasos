@@ -292,7 +292,9 @@ constexpr float PRESSURE_RISE_THRESHOLD = 0.10f;
 constexpr unsigned long DRY_PRESSURE_START_TIMEOUT = 10000UL;
 constexpr unsigned long DRY_PRESSURE_WORK_TIMEOUT = 15000UL;
 
-constexpr unsigned long START_CURRENT_IGNORE_MS = 2500UL;
+constexpr unsigned long START_CURRENT_IGNORE_MS = 4000UL; // покрывает весь буст 3 с + запас (было 2500 < BOOST_DURATION_MS=3000)
+constexpr unsigned long EMERGENCY_CONFIRM_MS = 250UL;      // выдержка для аварийной ветки без явного КЗ
+constexpr float EMERGENCY_START_HARD_LIMIT_MULT = 2.0f;    // ток >= 2*порога = правдоподобное КЗ даже на старте
 constexpr float BOOST_FREQ = 50.0f;
 constexpr unsigned long BOOST_DURATION_MS = 3000UL;
 constexpr uint8_t AUTO_RESTART_MAX = 3;               // Intentional deviation: Osnova had no dedicated auto-restart counter for house faults; capped retries prevent endless cycling. Risk: repeated attempts can still stress motor during persistent fault.
@@ -320,8 +322,8 @@ constexpr float ACS712_30A_SENSITIVITY_V_PER_A = 0.066f;  // Чувствите�
 constexpr float CURRENT_PER_ADC_VOLT = 1.0f / ACS712_30A_SENSITIVITY_V_PER_A;  // current(A) = adcVoltage(V) / 0.066
 constexpr float CURRENT_CALIBRATION_GAIN = 1.0f;
 constexpr float CURRENT_CALIBRATION_OFFSET = 0.0f;
-constexpr float NEAR_ZERO_CLAMP_A = 0.08f;
-constexpr float PROTECTION_FILTER_ALPHA = 0.45f;
+constexpr float NEAR_ZERO_CLAMP_A = 0.25f;  // шумовой пол ACS712-30A без тока ~0.15..0.2 А (было 0.08 — не резал шум)
+constexpr float PROTECTION_FILTER_ALPHA = 0.20f;  // более сильное сглаживание EMA защиты (было 0.45 — пропускало одиночные выбросы)
 constexpr float DISPLAY_FILTER_ALPHA = 0.20f;
 constexpr float MAX_SANE_CURRENT_A = 30.0f;  // ACS712-30A: диапазон до 30 А
 }
@@ -419,6 +421,10 @@ struct Telemetry {
   float houseCurrent = 0;
   float houseCurrentDisplay = 0;
   float houseCurrentProtection = 0;
+  // Медианный фильтр из 3 последних сырых показаний тока дома (до EMA):
+  // режет одиночные выбросы, которые раньше проходили через EMA защиты.
+  float houseCurrentRawHist[2] = {0, 0};
+  float houseCurrentRawLast = 0;
   float housePressure = 0;
   bool levels[4] = {false, false, false, false};
   bool vfdRunFeedback = false;
@@ -501,6 +507,7 @@ struct Controller {
   unsigned long wellOverloadStart = 0;
   unsigned long houseDryStart = 0;
   unsigned long houseOverloadStart = 0;
+  unsigned long houseEmergencyStart = 0;  // время непрерывного превышения аварийного порога (выдержка EMERGENCY_CONFIRM_MS)
   unsigned long houseStartAt = 0;
   unsigned long houseLastStopAt = 0;
   unsigned long houseBoostStartAt = 0;
@@ -1312,8 +1319,19 @@ bool decodeTelemetryPayload(const NanoTelemetryPayload& payload, unsigned long n
   tm.wellCurrent = normalizeTelemetryCurrent(payload.wellCurrentCentiA / 100.0f, telemetryCurrent::WELL_GAIN);
   tm.wellPressure = payload.wellPressureCentiBar / 100.0f;
   const float houseCurrentRaw = convertNanoAnalogToCurrent((uint16_t)max(0, (int)payload.analogAuxRaw));
-  tm.houseCurrentProtection += houseCurrentSense::PROTECTION_FILTER_ALPHA * (houseCurrentRaw - tm.houseCurrentProtection);
-  tm.houseCurrentDisplay += houseCurrentSense::DISPLAY_FILTER_ALPHA * (houseCurrentRaw - tm.houseCurrentDisplay);
+  // Медиана из 3 последних сырых показаний (hist[0], hist[1], raw): одиночный
+  // выброс не попадает ни в EMA защиты, ни в EMA дисплея.
+  float med = houseCurrentRaw;
+  float lo = tm.houseCurrentRawHist[0];
+  float hi = tm.houseCurrentRawHist[1];
+  if (lo > hi) { const float t = lo; lo = hi; hi = t; }
+  if (med < lo) med = lo;
+  else if (med > hi) med = hi;
+  tm.houseCurrentRawHist[0] = tm.houseCurrentRawHist[1];
+  tm.houseCurrentRawHist[1] = houseCurrentRaw;
+  tm.houseCurrentRawLast = houseCurrentRaw;
+  tm.houseCurrentProtection += houseCurrentSense::PROTECTION_FILTER_ALPHA * (med - tm.houseCurrentProtection);
+  tm.houseCurrentDisplay += houseCurrentSense::DISPLAY_FILTER_ALPHA * (med - tm.houseCurrentDisplay);
   if (tm.houseCurrentProtection < houseCurrentSense::NEAR_ZERO_CLAMP_A) tm.houseCurrentProtection = 0.0f;
   if (tm.houseCurrentDisplay < houseCurrentSense::NEAR_ZERO_CLAMP_A) tm.houseCurrentDisplay = 0.0f;
   tm.houseCurrent = tm.houseCurrentProtection;
@@ -1807,6 +1825,7 @@ void runHouseAutoRestart(unsigned long now) {
   st.houseTargetFreq = constrain(houseCtrl::BOOST_FREQ, cfg.house.minFreq, cfg.house.maxFreq);
   st.vfdFreq = st.houseTargetFreq;
   st.houseOverloadStart = 0;
+  st.houseEmergencyStart = 0;
   st.houseDryStart = 0;
 
   appendLog(st.logsHouse, "Дом: автоперезапуск " + String(st.houseAutoRestartAttempts) + "/" + String(houseCtrl::AUTO_RESTART_MAX));
@@ -1855,12 +1874,23 @@ void runProtections(unsigned long now) {
     bool ignoreStartCurrent = st.houseStartAt && (now - st.houseStartAt < houseCtrl::START_CURRENT_IGNORE_MS);
 
     if (tm.houseCurrent >= cfg.house.emergencyCurrent) {
-      st.houseBlocked = st.houseAlarm = true;
-      st.vfdRun = false;
-      st.houseManualMode = ManualMode::AUTO;
-      st.houseMode = HouseMode::FAULT;
-      st.houseLastStopReason = HouseStopReason::FAULT;
-      appendLog(st.logsHouse, "Дом: авария — аварийная перегрузка по току");
+      // Аварийная ветка: трип НЕ мгновенный. Одиночные выбросы (см. медиану и EMA выше)
+      // и завышение на стартовом бусте не должны блокировать насос.
+      if (!st.houseEmergencyStart) st.houseEmergencyStart = now;
+      // "Жёсткое КЗ": сырое показание >= 2*порога — правдоподобно даже во время старта,
+      // такие токи маскировке старта не подлежат.
+      const bool hardShort = (tm.houseCurrentRawLast >= houseCtrl::EMERGENCY_START_HARD_LIMIT_MULT * cfg.house.emergencyCurrent);
+      const bool confirmed = (hardShort || (now - st.houseEmergencyStart) >= houseCtrl::EMERGENCY_CONFIRM_MS);
+      if ((!ignoreStartCurrent || hardShort) && confirmed) {
+        st.houseBlocked = st.houseAlarm = true;
+        st.vfdRun = false;
+        st.houseManualMode = ManualMode::AUTO;
+        st.houseMode = HouseMode::FAULT;
+        st.houseLastStopReason = HouseStopReason::FAULT;
+        appendLog(st.logsHouse, "Дом: авария — аварийная перегрузка по току");
+      }
+    } else {
+      st.houseEmergencyStart = 0;
     }
 
     if (!ignoreStartCurrent && tm.houseCurrent >= cfg.house.overloadCurrent) {
@@ -1872,7 +1902,9 @@ void runProtections(unsigned long now) {
         st.houseAlarm = true;
         st.houseLastStopReason = HouseStopReason::FAULT;
         st.houseLastStopReason = HouseStopReason::FAULT;
+        st.houseEmergencyStart = 0;
         st.houseOverloadStart = 0;
+        st.houseEmergencyStart = 0;
         st.houseDryStart = 0;
         st.housePressureDryStartAt = 0;
         st.houseStartAt = 0;
@@ -1894,7 +1926,10 @@ void runProtections(unsigned long now) {
                          static_cast<float>(static_cast<uint8_t>(st.houseAutoRestartReason)));
         }
       }
-    } else st.houseOverloadStart = 0;
+    } else {
+      st.houseOverloadStart = 0;
+      st.houseEmergencyStart = 0;
+    }
 
     if (!ignoreStartCurrent && tm.houseCurrent < cfg.house.dryCurrent) {
       if (!st.houseDryStart) st.houseDryStart = now;
@@ -1904,6 +1939,7 @@ void runProtections(unsigned long now) {
         st.houseMode = HouseMode::STOPPED;
         st.houseAlarm = true;
         st.houseOverloadStart = 0;
+        st.houseEmergencyStart = 0;
         st.houseDryStart = 0;
         st.housePressureDryStartAt = 0;
         st.houseStartAt = 0;
@@ -1942,6 +1978,7 @@ void runProtections(unsigned long now) {
     }
   } else {
     st.houseOverloadStart = 0;
+    st.houseEmergencyStart = 0;
     st.houseDryStart = 0;
     st.housePressureDryStartAt = 0;
     st.houseStartAt = 0;
